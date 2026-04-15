@@ -9,10 +9,10 @@ except Exception as e:
     exit(1)
 
 try:
-    from src.core.executive import ExecutiveAgent
-    print("✓ ExecutiveAgent imported successfully")
+    from src.core.orchestrator import Orchestrator
+    print("✓ Orchestrator imported successfully")
 except Exception as e:
-    print(f"✗ Failed to import ExecutiveAgent: {e}")
+    print(f"✗ Failed to import Orchestrator: {e}")
     exit(1)
 
 try:
