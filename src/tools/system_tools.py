@@ -76,6 +76,24 @@ SYSTEM_TOOLS_SCHEMA = [
             },
             "required": ["query"]
         }
+    },
+    {
+        "name": "ask_admin_for_guidance",
+        "description": "Pauses the current execution and asks the Admin for strategic input or guidance when facing ambiguity or when requested by the Critic node.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "context_summary": {
+                    "type": "string",
+                    "description": "A summary of the current situation and why guidance is needed."
+                },
+                "specific_question": {
+                    "type": "string",
+                    "description": "The specific question to ask the Admin."
+                }
+            },
+            "required": ["context_summary", "specific_question"]
+        }
     }
 ]
 
@@ -160,3 +178,11 @@ async def search_archival_memory(query: str) -> str:
     logger.info(f"search_archival_memory called with query: {query}")
     result = await asyncio.to_thread(_sync_search_archival_memory, query)
     return result
+
+async def ask_admin_for_guidance(context_summary: str, specific_question: str) -> str:
+    """
+    Dummy tool for ask_admin_for_guidance.
+    The real interruption logic happens in llm_router.py by raising RequiresHITLError.
+    """
+    logger.info(f"ask_admin_for_guidance called. Summary: {context_summary}, Question: {specific_question}")
+    return f"Guidance requested: {specific_question}"
