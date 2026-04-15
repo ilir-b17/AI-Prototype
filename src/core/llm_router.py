@@ -13,7 +13,7 @@ from typing import Optional, Dict, Any, List
 import google.generativeai as genai
 import ollama
 
-from src.tools.system_tools import SYSTEM_TOOLS_SCHEMA, update_ledger, request_core_update
+from src.tools.system_tools import SYSTEM_TOOLS_SCHEMA, update_ledger, request_core_update, update_core_memory, search_archival_memory
 
 class RequiresMFAError(Exception):
     """Exception raised when a tool call requires MFA."""
@@ -58,6 +58,17 @@ class CognitiveRouter:
                     proposed_change=arguments.get("proposed_change", "")
                 )
                 return result
+            elif tool_name == "update_core_memory":
+                result = await update_core_memory(
+                    key=arguments.get("key", ""),
+                    value=arguments.get("value", "")
+                )
+                return result
+            elif tool_name == "search_archival_memory":
+                result = await search_archival_memory(
+                    query=arguments.get("query", "")
+                )
+                return result
             else:
                 return f"Error: Unknown tool {tool_name}."
         except Exception as e:
@@ -83,7 +94,8 @@ class CognitiveRouter:
 
     async def route_to_system_1(
         self,
-        messages: List[Dict[str, str]]
+        messages: List[Dict[str, str]],
+        allowed_tools: Optional[List[str]] = None
     ) -> str:
         """
         Route to System 1 (Local Model) - Fast, pattern-based responses.
@@ -93,6 +105,7 @@ class CognitiveRouter:
         Args:
             messages: List of message dictionaries, formatted for chat.
                 e.g., [{"role": "system", "content": "..."}, {"role": "user", "content": "..."}]
+            allowed_tools: Optional list of tool names allowed for this call.
 
         Returns:
             str: The model's response.
@@ -105,6 +118,8 @@ class CognitiveRouter:
             # Format tools for Ollama
             ollama_tools = []
             for tool in SYSTEM_TOOLS_SCHEMA:
+                if allowed_tools is not None and tool["name"] not in allowed_tools:
+                    continue
                 # Ollama format requires 'type': 'function' and 'function': {schema}
                 ollama_tools.append({
                     "type": "function",
@@ -118,7 +133,7 @@ class CognitiveRouter:
             response = await client.chat(
                 model='gemma4',
                 messages=messages,
-                tools=ollama_tools
+                tools=ollama_tools if ollama_tools else None
             )
 
             # Check for tool calls

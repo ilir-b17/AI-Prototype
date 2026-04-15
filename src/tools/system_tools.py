@@ -4,6 +4,9 @@ from src.memory.ledger_db import LedgerMemory
 
 logger = logging.getLogger(__name__)
 
+from src.memory.core_memory import CoreMemory
+from src.memory.vector_db import VectorMemory
+
 # Define schemas for the tools
 SYSTEM_TOOLS_SCHEMA = [
     {
@@ -40,6 +43,38 @@ SYSTEM_TOOLS_SCHEMA = [
                 }
             },
             "required": ["component", "proposed_change"]
+        }
+    },
+    {
+        "name": "update_core_memory",
+        "description": "Updates a specific key in the Core Working Memory (short-term RAM) like 'current_focus' or 'user_preferences'.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "key": {
+                    "type": "string",
+                    "description": "The key to update in core memory."
+                },
+                "value": {
+                    "type": "string",
+                    "description": "The new value for the key."
+                }
+            },
+            "required": ["key", "value"]
+        }
+    },
+    {
+        "name": "search_archival_memory",
+        "description": "Searches the Archival Memory (ChromaDB) for relevant historical context.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "query": {
+                    "type": "string",
+                    "description": "The search query to look up in archival memory."
+                }
+            },
+            "required": ["query"]
         }
     }
 ]
@@ -88,3 +123,40 @@ async def request_core_update(component: str, proposed_change: str) -> str:
         return "Success: MFA authorized. Core update request has been securely logged to the ledger for admin review."
     else:
         return f"Error: Failed to log core update - {result}"
+
+def _sync_update_core_memory(key: str, value: str) -> str:
+    """Synchronous internal function for core memory."""
+    try:
+        mem = CoreMemory()
+        mem.update(key, value)
+        return f"Success: Core memory key '{key}' updated."
+    except Exception as e:
+        return f"Error: Could not update core memory due to [{str(e)}]."
+
+async def update_core_memory(key: str, value: str) -> str:
+    """Asynchronously updates a core memory key."""
+    logger.info(f"update_core_memory called with key: {key}, value: {value}")
+    result = await asyncio.to_thread(_sync_update_core_memory, key, value)
+    return result
+
+def _sync_search_archival_memory(query: str) -> str:
+    """Synchronous internal function for archival search."""
+    vector_memory = None
+    try:
+        vector_memory = VectorMemory()
+        results = vector_memory.query_memory(query, n_results=3)
+        if not results:
+            return "No relevant archival memory found."
+
+        response = "Archival Results:\n"
+        for i, res in enumerate(results, 1):
+            response += f"{i}. {res['document']}\n"
+        return response
+    except Exception as e:
+        return f"Error: Could not search archival memory due to [{str(e)}]."
+
+async def search_archival_memory(query: str) -> str:
+    """Asynchronously searches archival memory."""
+    logger.info(f"search_archival_memory called with query: {query}")
+    result = await asyncio.to_thread(_sync_search_archival_memory, query)
+    return result

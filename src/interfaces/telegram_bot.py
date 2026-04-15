@@ -12,7 +12,7 @@ import logging
 from dotenv import load_dotenv
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
-from src.core.executive import ExecutiveAgent
+from src.core.orchestrator import Orchestrator
 
 # Load environment variables
 load_dotenv()
@@ -38,8 +38,8 @@ if not TELEGRAM_BOT_TOKEN:
 if ADMIN_USER_ID == 0:
     raise ValueError("ADMIN_USER_ID environment variable not set")
 
-# Initialize the ExecutiveAgent (will be instantiated in main())
-executive_agent: ExecutiveAgent = None
+# Initialize the Orchestrator (will be instantiated in main())
+orchestrator: Orchestrator = None
 
 
 def is_authorized(user_id: int) -> bool:
@@ -76,16 +76,16 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """
-    Handle text messages and process them through the ExecutiveAgent.
+    Handle text messages and process them through the Orchestrator.
 
-    Routes messages to the cognitive router for intelligent processing
+    Routes messages to the state graph for intelligent processing
     based on memory context and message complexity.
 
     Args:
         update: The update from Telegram.
         context: The context for the message.
     """
-    global executive_agent
+    global orchestrator
 
     user_id = update.effective_user.id
 
@@ -104,14 +104,14 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             action="typing"
         )
 
-        # Process the message through the ExecutiveAgent
-        if executive_agent is None:
-            logger.error("Executive Agent not initialized")
+        # Process the message through the Orchestrator
+        if orchestrator is None:
+            logger.error("Orchestrator not initialized")
             await update.message.reply_text("System error: Service temporarily unavailable.")
             return
 
         # Process message (may call external APIs - handle timeouts)
-        ai_response = await executive_agent.process_message(user_message, str(user_id))
+        ai_response = await orchestrator.process_message(user_message, str(user_id))
 
         # Send the response back to the user
         await update.message.reply_text(ai_response)
@@ -130,18 +130,18 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
 def main() -> None:
     """
-    Initialize and run the Telegram bot with the ExecutiveAgent.
+    Initialize and run the Telegram bot with the Orchestrator.
     """
-    global executive_agent
+    global orchestrator
 
     try:
-        # Initialize the ExecutiveAgent (Prefrontal Cortex)
-        logger.info("Initializing Executive Agent...")
-        executive_agent = ExecutiveAgent()
-        logger.info("Executive Agent initialized successfully")
+        # Initialize the Orchestrator (State Graph)
+        logger.info("Initializing Orchestrator...")
+        orchestrator = Orchestrator()
+        logger.info("Orchestrator initialized successfully")
 
     except Exception as e:
-        logger.error(f"Failed to initialize Executive Agent: {e}", exc_info=True)
+        logger.error(f"Failed to initialize Orchestrator: {e}", exc_info=True)
         raise
 
     try:
@@ -163,9 +163,9 @@ def main() -> None:
         logger.error(f"Bot error: {e}", exc_info=True)
     finally:
         # Cleanup
-        if executive_agent:
-            logger.info("Shutting down ExecutiveAgent...")
-            executive_agent.close()
+        if orchestrator:
+            logger.info("Shutting down Orchestrator...")
+            orchestrator.close()
 
 
 
