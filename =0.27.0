@@ -1,0 +1,8 @@
+Requirement already satisfied: httpx in /home/jules/.local/share/pipx/venvs/pytest/lib/python3.12/site-packages (0.25.2)
+Requirement already satisfied: anyio in /home/jules/.local/share/pipx/venvs/pytest/lib/python3.12/site-packages (from httpx) (4.13.0)
+Requirement already satisfied: certifi in /home/jules/.local/share/pipx/venvs/pytest/lib/python3.12/site-packages (from httpx) (2026.2.25)
+Requirement already satisfied: httpcore==1.* in /home/jules/.local/share/pipx/venvs/pytest/lib/python3.12/site-packages (from httpx) (1.0.9)
+Requirement already satisfied: idna in /home/jules/.local/share/pipx/venvs/pytest/lib/python3.12/site-packages (from httpx) (3.11)
+Requirement already satisfied: sniffio in /home/jules/.local/share/pipx/venvs/pytest/lib/python3.12/site-packages (from httpx) (1.3.1)
+Requirement already satisfied: h11>=0.16 in /home/jules/.local/share/pipx/venvs/pytest/lib/python3.12/site-packages (from httpcore==1.*->httpx) (0.16.0)
+Requirement already satisfied: typing_extensions>=4.5 in /home/jules/.local/share/pipx/venvs/pytest/lib/python3.12/site-packages (from anyio->httpx) (4.15.0)

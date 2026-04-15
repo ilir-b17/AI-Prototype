@@ -112,7 +112,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             return
 
         # Process message (may call external APIs - handle timeouts)
-        ai_response = await executive_agent.process_message(user_message)
+        ai_response = await executive_agent.process_message(user_message, str(user_id))
 
         # Send the response back to the user
         await update.message.reply_text(ai_response)
