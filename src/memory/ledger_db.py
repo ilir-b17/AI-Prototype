@@ -33,6 +33,11 @@ class TaskStatus(Enum):
     CANCELLED = "CANCELLED"
 
 
+# Pre-calculate status values for performance optimization
+VALID_TASK_STATUSES = {s.value for s in TaskStatus}
+VALID_TASK_STATUSES_LIST = [s.value for s in TaskStatus]
+
+
 class LedgerMemory:
     """
     A SQLite-backed ledger for short-term memory and task management.
@@ -150,8 +155,8 @@ class LedgerMemory:
         if not 1 <= priority <= 10:
             raise ValueError("Priority must be between 1 and 10")
 
-        if status not in [s.value for s in TaskStatus]:
-            raise ValueError(f"Status must be one of {[s.value for s in TaskStatus]}")
+        if status not in VALID_TASK_STATUSES:
+            raise ValueError(f"Status must be one of {VALID_TASK_STATUSES_LIST}")
 
         cursor = self.connection.cursor()
 
@@ -234,8 +239,8 @@ class LedgerMemory:
             ValueError: If new_status is invalid.
             sqlite3.Error: If update fails.
         """
-        if new_status not in [s.value for s in TaskStatus]:
-            raise ValueError(f"Status must be one of {[s.value for s in TaskStatus]}")
+        if new_status not in VALID_TASK_STATUSES:
+            raise ValueError(f"Status must be one of {VALID_TASK_STATUSES_LIST}")
 
         cursor = self.connection.cursor()
 
