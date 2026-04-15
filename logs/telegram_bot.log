@@ -1,0 +1,907 @@
+2026-04-14 22:10:29,760 - src.interfaces.telegram_bot - INFO - Telegram bot initialized and starting polling...
+2026-04-14 22:10:32,917 - httpx - INFO - HTTP Request: POST https://api.telegram.org/bot8069214468:AAHVVL4vdqq7B7C-5w7tGEHB_5FkkU6zxdc/getMe "HTTP/1.1 200 OK"
+2026-04-14 22:10:32,943 - httpx - INFO - HTTP Request: POST https://api.telegram.org/bot8069214468:AAHVVL4vdqq7B7C-5w7tGEHB_5FkkU6zxdc/deleteWebhook "HTTP/1.1 200 OK"
+2026-04-14 22:10:32,946 - telegram.ext.Application - INFO - Application started
+2026-04-14 22:10:43,026 - httpx - INFO - HTTP Request: POST https://api.telegram.org/bot8069214468:AAHVVL4vdqq7B7C-5w7tGEHB_5FkkU6zxdc/getUpdates "HTTP/1.1 200 OK"
+2026-04-14 22:10:53,067 - httpx - INFO - HTTP Request: POST https://api.telegram.org/bot8069214468:AAHVVL4vdqq7B7C-5w7tGEHB_5FkkU6zxdc/getUpdates "HTTP/1.1 200 OK"
+2026-04-14 22:11:03,166 - httpx - INFO - HTTP Request: POST https://api.telegram.org/bot8069214468:AAHVVL4vdqq7B7C-5w7tGEHB_5FkkU6zxdc/getUpdates "HTTP/1.1 200 OK"
+2026-04-14 22:11:13,193 - httpx - INFO - HTTP Request: POST https://api.telegram.org/bot8069214468:AAHVVL4vdqq7B7C-5w7tGEHB_5FkkU6zxdc/getUpdates "HTTP/1.1 200 OK"
+2026-04-14 22:11:23,222 - httpx - INFO - HTTP Request: POST https://api.telegram.org/bot8069214468:AAHVVL4vdqq7B7C-5w7tGEHB_5FkkU6zxdc/getUpdates "HTTP/1.1 200 OK"
+2026-04-14 22:11:33,248 - httpx - INFO - HTTP Request: POST https://api.telegram.org/bot8069214468:AAHVVL4vdqq7B7C-5w7tGEHB_5FkkU6zxdc/getUpdates "HTTP/1.1 200 OK"
+2026-04-14 22:11:43,273 - httpx - INFO - HTTP Request: POST https://api.telegram.org/bot8069214468:AAHVVL4vdqq7B7C-5w7tGEHB_5FkkU6zxdc/getUpdates "HTTP/1.1 200 OK"
+2026-04-14 22:11:53,306 - httpx - INFO - HTTP Request: POST https://api.telegram.org/bot8069214468:AAHVVL4vdqq7B7C-5w7tGEHB_5FkkU6zxdc/getUpdates "HTTP/1.1 200 OK"
+2026-04-14 22:12:03,334 - httpx - INFO - HTTP Request: POST https://api.telegram.org/bot8069214468:AAHVVL4vdqq7B7C-5w7tGEHB_5FkkU6zxdc/getUpdates "HTTP/1.1 200 OK"
+2026-04-14 22:12:13,359 - httpx - INFO - HTTP Request: POST https://api.telegram.org/bot8069214468:AAHVVL4vdqq7B7C-5w7tGEHB_5FkkU6zxdc/getUpdates "HTTP/1.1 200 OK"
+2026-04-14 22:12:23,386 - httpx - INFO - HTTP Request: POST https://api.telegram.org/bot8069214468:AAHVVL4vdqq7B7C-5w7tGEHB_5FkkU6zxdc/getUpdates "HTTP/1.1 200 OK"
+2026-04-14 22:12:33,413 - httpx - INFO - HTTP Request: POST https://api.telegram.org/bot8069214468:AAHVVL4vdqq7B7C-5w7tGEHB_5FkkU6zxdc/getUpdates "HTTP/1.1 200 OK"
+2026-04-14 22:12:43,437 - httpx - INFO - HTTP Request: POST https://api.telegram.org/bot8069214468:AAHVVL4vdqq7B7C-5w7tGEHB_5FkkU6zxdc/getUpdates "HTTP/1.1 200 OK"
+2026-04-14 22:12:53,465 - httpx - INFO - HTTP Request: POST https://api.telegram.org/bot8069214468:AAHVVL4vdqq7B7C-5w7tGEHB_5FkkU6zxdc/getUpdates "HTTP/1.1 200 OK"
+2026-04-14 22:13:03,492 - httpx - INFO - HTTP Request: POST https://api.telegram.org/bot8069214468:AAHVVL4vdqq7B7C-5w7tGEHB_5FkkU6zxdc/getUpdates "HTTP/1.1 200 OK"
+2026-04-14 22:13:13,517 - httpx - INFO - HTTP Request: POST https://api.telegram.org/bot8069214468:AAHVVL4vdqq7B7C-5w7tGEHB_5FkkU6zxdc/getUpdates "HTTP/1.1 200 OK"
+2026-04-14 22:13:23,543 - httpx - INFO - HTTP Request: POST https://api.telegram.org/bot8069214468:AAHVVL4vdqq7B7C-5w7tGEHB_5FkkU6zxdc/getUpdates "HTTP/1.1 200 OK"
+2026-04-14 22:13:33,568 - httpx - INFO - HTTP Request: POST https://api.telegram.org/bot8069214468:AAHVVL4vdqq7B7C-5w7tGEHB_5FkkU6zxdc/getUpdates "HTTP/1.1 200 OK"
+2026-04-14 22:13:43,592 - httpx - INFO - HTTP Request: POST https://api.telegram.org/bot8069214468:AAHVVL4vdqq7B7C-5w7tGEHB_5FkkU6zxdc/getUpdates "HTTP/1.1 200 OK"
+2026-04-14 22:13:53,618 - httpx - INFO - HTTP Request: POST https://api.telegram.org/bot8069214468:AAHVVL4vdqq7B7C-5w7tGEHB_5FkkU6zxdc/getUpdates "HTTP/1.1 200 OK"
+2026-04-14 22:14:03,644 - httpx - INFO - HTTP Request: POST https://api.telegram.org/bot8069214468:AAHVVL4vdqq7B7C-5w7tGEHB_5FkkU6zxdc/getUpdates "HTTP/1.1 200 OK"
+2026-04-14 22:14:10,666 - httpx - INFO - HTTP Request: POST https://api.telegram.org/bot8069214468:AAHVVL4vdqq7B7C-5w7tGEHB_5FkkU6zxdc/getUpdates "HTTP/1.1 200 OK"
+2026-04-14 22:14:10,667 - src.interfaces.telegram_bot - INFO - Start command received from authorized user 8769582575
+2026-04-14 22:14:10,783 - httpx - INFO - HTTP Request: POST https://api.telegram.org/bot8069214468:AAHVVL4vdqq7B7C-5w7tGEHB_5FkkU6zxdc/sendMessage "HTTP/1.1 200 OK"
+2026-04-14 22:14:13,779 - httpx - INFO - HTTP Request: POST https://api.telegram.org/bot8069214468:AAHVVL4vdqq7B7C-5w7tGEHB_5FkkU6zxdc/getUpdates "HTTP/1.1 200 OK"
+2026-04-14 22:14:13,781 - src.interfaces.telegram_bot - INFO - Message received from user 8769582575: Hi
+2026-04-14 22:14:13,847 - httpx - INFO - HTTP Request: POST https://api.telegram.org/bot8069214468:AAHVVL4vdqq7B7C-5w7tGEHB_5FkkU6zxdc/sendMessage "HTTP/1.1 200 OK"
+2026-04-14 22:14:18,543 - httpx - INFO - HTTP Request: POST https://api.telegram.org/bot8069214468:AAHVVL4vdqq7B7C-5w7tGEHB_5FkkU6zxdc/getUpdates "HTTP/1.1 200 OK"
+2026-04-14 22:14:18,545 - src.interfaces.telegram_bot - INFO - Message received from user 8769582575: hello
+2026-04-14 22:14:18,606 - httpx - INFO - HTTP Request: POST https://api.telegram.org/bot8069214468:AAHVVL4vdqq7B7C-5w7tGEHB_5FkkU6zxdc/sendMessage "HTTP/1.1 200 OK"
+2026-04-14 22:14:28,570 - httpx - INFO - HTTP Request: POST https://api.telegram.org/bot8069214468:AAHVVL4vdqq7B7C-5w7tGEHB_5FkkU6zxdc/getUpdates "HTTP/1.1 200 OK"
+2026-04-14 22:14:38,593 - httpx - INFO - HTTP Request: POST https://api.telegram.org/bot8069214468:AAHVVL4vdqq7B7C-5w7tGEHB_5FkkU6zxdc/getUpdates "HTTP/1.1 200 OK"
+2026-04-14 22:14:48,618 - httpx - INFO - HTTP Request: POST https://api.telegram.org/bot8069214468:AAHVVL4vdqq7B7C-5w7tGEHB_5FkkU6zxdc/getUpdates "HTTP/1.1 200 OK"
+2026-04-14 22:14:58,663 - httpx - INFO - HTTP Request: POST https://api.telegram.org/bot8069214468:AAHVVL4vdqq7B7C-5w7tGEHB_5FkkU6zxdc/getUpdates "HTTP/1.1 200 OK"
+2026-04-14 22:15:08,694 - httpx - INFO - HTTP Request: POST https://api.telegram.org/bot8069214468:AAHVVL4vdqq7B7C-5w7tGEHB_5FkkU6zxdc/getUpdates "HTTP/1.1 200 OK"
+2026-04-14 22:15:18,725 - httpx - INFO - HTTP Request: POST https://api.telegram.org/bot8069214468:AAHVVL4vdqq7B7C-5w7tGEHB_5FkkU6zxdc/getUpdates "HTTP/1.1 200 OK"
+2026-04-14 22:15:22,718 - httpx - INFO - HTTP Request: POST https://api.telegram.org/bot8069214468:AAHVVL4vdqq7B7C-5w7tGEHB_5FkkU6zxdc/getUpdates "HTTP/1.1 200 OK"
+2026-04-14 22:15:22,719 - telegram.ext.Application - INFO - Application is stopping. This might take a moment.
+2026-04-14 22:15:22,719 - telegram.ext.Application - INFO - Application.stop() complete
+2026-04-14 23:56:39,703 - src.interfaces.telegram_bot - INFO - Initializing Executive Agent...
+2026-04-14 23:56:39,704 - src.core.executive - INFO - Initializing ExecutiveAgent (Prefrontal Cortex)
+2026-04-14 23:56:40,791 - chromadb.telemetry.product.posthog - ERROR - Failed to send telemetry event ClientStartEvent: capture() takes 1 positional argument but 3 were given
+2026-04-14 23:56:40,793 - chromadb.telemetry.product.posthog - ERROR - Failed to send telemetry event ClientCreateCollectionEvent: capture() takes 1 positional argument but 3 were given
+2026-04-14 23:56:40,796 - src.memory.vector_db - INFO - VectorMemory initialized with persistence at data/chroma_storage
+2026-04-14 23:56:40,799 - src.memory.ledger_db - INFO - LedgerMemory initialized with database at data/ledger.db
+2026-04-14 23:56:40,799 - src.core.llm_router - WARNING - GEMINI_API_KEY not set. System 2 will not be available.
+2026-04-14 23:56:40,800 - src.core.llm_router - INFO - CognitiveRouter initialized with model: gemini-pro
+2026-04-14 23:56:40,801 - src.core.executive - INFO - ExecutiveAgent initialized successfully
+2026-04-14 23:56:40,914 - src.interfaces.telegram_bot - INFO - Executive Agent initialized successfully
+2026-04-14 23:56:41,488 - src.interfaces.telegram_bot - INFO - Telegram bot initialized and starting polling...
+2026-04-14 23:56:41,588 - httpx - INFO - HTTP Request: POST https://api.telegram.org/bot8069214468:AAHVVL4vdqq7B7C-5w7tGEHB_5FkkU6zxdc/getMe "HTTP/1.1 200 OK"
+2026-04-14 23:56:41,614 - httpx - INFO - HTTP Request: POST https://api.telegram.org/bot8069214468:AAHVVL4vdqq7B7C-5w7tGEHB_5FkkU6zxdc/deleteWebhook "HTTP/1.1 200 OK"
+2026-04-14 23:56:41,616 - telegram.ext.Application - INFO - Application started
+2026-04-14 23:56:51,695 - httpx - INFO - HTTP Request: POST https://api.telegram.org/bot8069214468:AAHVVL4vdqq7B7C-5w7tGEHB_5FkkU6zxdc/getUpdates "HTTP/1.1 200 OK"
+2026-04-14 23:56:58,750 - httpx - INFO - HTTP Request: POST https://api.telegram.org/bot8069214468:AAHVVL4vdqq7B7C-5w7tGEHB_5FkkU6zxdc/getUpdates "HTTP/1.1 200 OK"
+2026-04-14 23:56:58,752 - src.interfaces.telegram_bot - INFO - Message received from user 8769582575: Hi
+2026-04-14 23:56:58,752 - telegram.ext.Application - ERROR - No error handlers are registered, logging exception.
+Traceback (most recent call last):
+  File "C:\Users\iboci\Live-Trading-bot\AI_Prototype\.venv\Lib\site-packages\telegram\ext\_application.py", line 1234, in process_update
+    await coroutine
+  File "C:\Users\iboci\Live-Trading-bot\AI_Prototype\.venv\Lib\site-packages\telegram\ext\_basehandler.py", line 157, in handle_update
+    return await self.callback(update, context)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\iboci\Live-Trading-bot\AI_Prototype\src\interfaces\telegram_bot.py", line 101, in handle_message
+    await update.chat_action(action="typing")
+          ^^^^^^^^^^^^^^^^^^
+AttributeError: 'Update' object has no attribute 'chat_action'
+2026-04-14 23:57:08,908 - httpx - INFO - HTTP Request: POST https://api.telegram.org/bot8069214468:AAHVVL4vdqq7B7C-5w7tGEHB_5FkkU6zxdc/getUpdates "HTTP/1.1 200 OK"
+2026-04-14 23:57:18,935 - httpx - INFO - HTTP Request: POST https://api.telegram.org/bot8069214468:AAHVVL4vdqq7B7C-5w7tGEHB_5FkkU6zxdc/getUpdates "HTTP/1.1 200 OK"
+2026-04-14 23:57:29,088 - httpx - INFO - HTTP Request: POST https://api.telegram.org/bot8069214468:AAHVVL4vdqq7B7C-5w7tGEHB_5FkkU6zxdc/getUpdates "HTTP/1.1 200 OK"
+2026-04-14 23:57:39,116 - httpx - INFO - HTTP Request: POST https://api.telegram.org/bot8069214468:AAHVVL4vdqq7B7C-5w7tGEHB_5FkkU6zxdc/getUpdates "HTTP/1.1 200 OK"
+2026-04-14 23:57:45,037 - httpx - INFO - HTTP Request: POST https://api.telegram.org/bot8069214468:AAHVVL4vdqq7B7C-5w7tGEHB_5FkkU6zxdc/getUpdates "HTTP/1.1 200 OK"
+2026-04-14 23:57:45,038 - telegram.ext.Application - INFO - Application is stopping. This might take a moment.
+2026-04-14 23:57:45,039 - telegram.ext.Application - INFO - Application.stop() complete
+2026-04-14 23:57:45,040 - src.interfaces.telegram_bot - INFO - Shutting down ExecutiveAgent...
+2026-04-14 23:57:45,041 - src.core.executive - INFO - Closing ExecutiveAgent
+2026-04-14 23:57:45,041 - src.memory.ledger_db - INFO - LedgerMemory connection closed
+2026-04-14 23:58:09,982 - src.interfaces.telegram_bot - INFO - Initializing Executive Agent...
+2026-04-14 23:58:09,983 - src.core.executive - INFO - Initializing ExecutiveAgent (Prefrontal Cortex)
+2026-04-14 23:58:10,098 - chromadb.telemetry.product.posthog - ERROR - Failed to send telemetry event ClientStartEvent: capture() takes 1 positional argument but 3 were given
+2026-04-14 23:58:10,099 - chromadb.telemetry.product.posthog - ERROR - Failed to send telemetry event ClientCreateCollectionEvent: capture() takes 1 positional argument but 3 were given
+2026-04-14 23:58:10,100 - src.memory.vector_db - INFO - VectorMemory initialized with persistence at data/chroma_storage
+2026-04-14 23:58:10,102 - src.memory.ledger_db - INFO - LedgerMemory initialized with database at data/ledger.db
+2026-04-14 23:58:10,102 - src.core.llm_router - WARNING - GEMINI_API_KEY not set. System 2 will not be available.
+2026-04-14 23:58:10,102 - src.core.llm_router - INFO - CognitiveRouter initialized with model: gemini-pro
+2026-04-14 23:58:10,102 - src.core.executive - INFO - ExecutiveAgent initialized successfully
+2026-04-14 23:58:10,111 - src.interfaces.telegram_bot - INFO - Executive Agent initialized successfully
+2026-04-14 23:58:10,584 - src.interfaces.telegram_bot - INFO - Telegram bot initialized and starting polling...
+2026-04-14 23:58:10,682 - httpx - INFO - HTTP Request: POST https://api.telegram.org/bot8069214468:AAHVVL4vdqq7B7C-5w7tGEHB_5FkkU6zxdc/getMe "HTTP/1.1 200 OK"
+2026-04-14 23:58:10,708 - httpx - INFO - HTTP Request: POST https://api.telegram.org/bot8069214468:AAHVVL4vdqq7B7C-5w7tGEHB_5FkkU6zxdc/deleteWebhook "HTTP/1.1 200 OK"
+2026-04-14 23:58:10,712 - telegram.ext.Application - INFO - Application started
+2026-04-14 23:58:20,790 - httpx - INFO - HTTP Request: POST https://api.telegram.org/bot8069214468:AAHVVL4vdqq7B7C-5w7tGEHB_5FkkU6zxdc/getUpdates "HTTP/1.1 200 OK"
+2026-04-14 23:58:30,816 - httpx - INFO - HTTP Request: POST https://api.telegram.org/bot8069214468:AAHVVL4vdqq7B7C-5w7tGEHB_5FkkU6zxdc/getUpdates "HTTP/1.1 200 OK"
+2026-04-14 23:58:40,847 - httpx - INFO - HTTP Request: POST https://api.telegram.org/bot8069214468:AAHVVL4vdqq7B7C-5w7tGEHB_5FkkU6zxdc/getUpdates "HTTP/1.1 200 OK"
+2026-04-14 23:59:17,920 - src.interfaces.telegram_bot - INFO - Initializing Executive Agent...
+2026-04-14 23:59:17,920 - src.core.executive - INFO - Initializing ExecutiveAgent (Prefrontal Cortex)
+2026-04-14 23:59:17,999 - chromadb.telemetry.product.posthog - ERROR - Failed to send telemetry event ClientStartEvent: capture() takes 1 positional argument but 3 were given
+2026-04-14 23:59:18,001 - chromadb.telemetry.product.posthog - ERROR - Failed to send telemetry event ClientCreateCollectionEvent: capture() takes 1 positional argument but 3 were given
+2026-04-14 23:59:18,001 - src.memory.vector_db - INFO - VectorMemory initialized with persistence at data/chroma_storage
+2026-04-14 23:59:18,003 - src.memory.ledger_db - INFO - LedgerMemory initialized with database at data/ledger.db
+2026-04-14 23:59:18,003 - src.core.llm_router - WARNING - GEMINI_API_KEY not set. System 2 will not be available.
+2026-04-14 23:59:18,004 - src.core.llm_router - INFO - CognitiveRouter initialized with model: gemini-pro
+2026-04-14 23:59:18,004 - src.core.executive - INFO - ExecutiveAgent initialized successfully
+2026-04-14 23:59:18,015 - src.interfaces.telegram_bot - INFO - Executive Agent initialized successfully
+2026-04-14 23:59:18,365 - src.interfaces.telegram_bot - INFO - Telegram bot initialized and starting polling...
+2026-04-14 23:59:18,459 - httpx - INFO - HTTP Request: POST https://api.telegram.org/bot8069214468:AAHVVL4vdqq7B7C-5w7tGEHB_5FkkU6zxdc/getMe "HTTP/1.1 200 OK"
+2026-04-14 23:59:18,483 - httpx - INFO - HTTP Request: POST https://api.telegram.org/bot8069214468:AAHVVL4vdqq7B7C-5w7tGEHB_5FkkU6zxdc/deleteWebhook "HTTP/1.1 200 OK"
+2026-04-14 23:59:18,485 - telegram.ext.Application - INFO - Application started
+2026-04-14 23:59:28,691 - httpx - INFO - HTTP Request: POST https://api.telegram.org/bot8069214468:AAHVVL4vdqq7B7C-5w7tGEHB_5FkkU6zxdc/getUpdates "HTTP/1.1 200 OK"
+2026-04-14 23:59:30,608 - httpx - INFO - HTTP Request: POST https://api.telegram.org/bot8069214468:AAHVVL4vdqq7B7C-5w7tGEHB_5FkkU6zxdc/getUpdates "HTTP/1.1 200 OK"
+2026-04-14 23:59:30,610 - src.interfaces.telegram_bot - INFO - Message received from user 8769582575: Hi
+2026-04-14 23:59:30,701 - httpx - INFO - HTTP Request: POST https://api.telegram.org/bot8069214468:AAHVVL4vdqq7B7C-5w7tGEHB_5FkkU6zxdc/sendChatAction "HTTP/1.1 200 OK"
+2026-04-14 23:59:30,702 - src.core.executive - INFO - Processing message: Hi...
+2026-04-14 23:59:31,005 - src.memory.vector_db - ERROR - Failed to query memory: 
+2026-04-14 23:59:31,009 - src.core.executive - ERROR - Failed to retrieve context: 
+2026-04-14 23:59:31,012 - src.core.llm_router - INFO - Routing to System 1 (Local Model)
+2026-04-14 23:59:31,014 - src.core.executive - INFO - Response generated (42 chars)
+2026-04-14 23:59:31,060 - src.memory.vector_db - ERROR - Failed to add memory: 
+2026-04-14 23:59:31,063 - src.core.executive - WARNING - Failed to store response in memory: 
+2026-04-14 23:59:31,161 - httpx - INFO - HTTP Request: POST https://api.telegram.org/bot8069214468:AAHVVL4vdqq7B7C-5w7tGEHB_5FkkU6zxdc/sendMessage "HTTP/1.1 200 OK"
+2026-04-14 23:59:31,163 - src.interfaces.telegram_bot - INFO - Response sent to user 8769582575
+2026-04-14 23:59:40,099 - httpx - INFO - HTTP Request: POST https://api.telegram.org/bot8069214468:AAHVVL4vdqq7B7C-5w7tGEHB_5FkkU6zxdc/getUpdates "HTTP/1.1 200 OK"
+2026-04-14 23:59:40,102 - src.interfaces.telegram_bot - INFO - Message received from user 8769582575: Can you reply
+2026-04-14 23:59:40,217 - httpx - INFO - HTTP Request: POST https://api.telegram.org/bot8069214468:AAHVVL4vdqq7B7C-5w7tGEHB_5FkkU6zxdc/sendChatAction "HTTP/1.1 200 OK"
+2026-04-14 23:59:40,218 - src.core.executive - INFO - Processing message: Can you reply...
+2026-04-14 23:59:40,260 - src.memory.vector_db - ERROR - Failed to query memory: 
+2026-04-14 23:59:40,270 - src.core.executive - ERROR - Failed to retrieve context: 
+2026-04-14 23:59:40,271 - src.core.llm_router - INFO - Routing to System 1 (Local Model)
+2026-04-14 23:59:40,272 - src.core.executive - INFO - Response generated (53 chars)
+2026-04-14 23:59:40,290 - src.memory.vector_db - ERROR - Failed to add memory: 
+2026-04-14 23:59:40,300 - src.core.executive - WARNING - Failed to store response in memory: 
+2026-04-14 23:59:40,381 - httpx - INFO - HTTP Request: POST https://api.telegram.org/bot8069214468:AAHVVL4vdqq7B7C-5w7tGEHB_5FkkU6zxdc/sendMessage "HTTP/1.1 200 OK"
+2026-04-14 23:59:40,382 - src.interfaces.telegram_bot - INFO - Response sent to user 8769582575
+2026-04-14 23:59:50,095 - httpx - INFO - HTTP Request: POST https://api.telegram.org/bot8069214468:AAHVVL4vdqq7B7C-5w7tGEHB_5FkkU6zxdc/getUpdates "HTTP/1.1 200 OK"
+2026-04-14 23:59:50,098 - src.interfaces.telegram_bot - INFO - Message received from user 8769582575: You are just echoing
+2026-04-14 23:59:50,191 - httpx - INFO - HTTP Request: POST https://api.telegram.org/bot8069214468:AAHVVL4vdqq7B7C-5w7tGEHB_5FkkU6zxdc/sendChatAction "HTTP/1.1 200 OK"
+2026-04-14 23:59:50,192 - src.core.executive - INFO - Processing message: You are just echoing...
+2026-04-14 23:59:50,236 - src.memory.vector_db - ERROR - Failed to query memory: 
+2026-04-14 23:59:50,236 - src.core.executive - ERROR - Failed to retrieve context: 
+2026-04-14 23:59:50,237 - src.core.llm_router - INFO - Routing to System 1 (Local Model)
+2026-04-14 23:59:50,237 - src.core.executive - INFO - Response generated (60 chars)
+2026-04-14 23:59:50,257 - src.memory.vector_db - ERROR - Failed to add memory: 
+2026-04-14 23:59:50,259 - src.core.executive - WARNING - Failed to store response in memory: 
+2026-04-14 23:59:50,369 - httpx - INFO - HTTP Request: POST https://api.telegram.org/bot8069214468:AAHVVL4vdqq7B7C-5w7tGEHB_5FkkU6zxdc/sendMessage "HTTP/1.1 200 OK"
+2026-04-14 23:59:50,370 - src.interfaces.telegram_bot - INFO - Response sent to user 8769582575
+2026-04-15 00:00:00,129 - httpx - INFO - HTTP Request: POST https://api.telegram.org/bot8069214468:AAHVVL4vdqq7B7C-5w7tGEHB_5FkkU6zxdc/getUpdates "HTTP/1.1 200 OK"
+2026-04-15 00:00:10,156 - httpx - INFO - HTTP Request: POST https://api.telegram.org/bot8069214468:AAHVVL4vdqq7B7C-5w7tGEHB_5FkkU6zxdc/getUpdates "HTTP/1.1 200 OK"
+2026-04-15 00:00:20,298 - httpx - INFO - HTTP Request: POST https://api.telegram.org/bot8069214468:AAHVVL4vdqq7B7C-5w7tGEHB_5FkkU6zxdc/getUpdates "HTTP/1.1 200 OK"
+2026-04-15 00:00:30,324 - httpx - INFO - HTTP Request: POST https://api.telegram.org/bot8069214468:AAHVVL4vdqq7B7C-5w7tGEHB_5FkkU6zxdc/getUpdates "HTTP/1.1 200 OK"
+2026-04-15 00:00:40,349 - httpx - INFO - HTTP Request: POST https://api.telegram.org/bot8069214468:AAHVVL4vdqq7B7C-5w7tGEHB_5FkkU6zxdc/getUpdates "HTTP/1.1 200 OK"
+2026-04-15 00:00:50,378 - httpx - INFO - HTTP Request: POST https://api.telegram.org/bot8069214468:AAHVVL4vdqq7B7C-5w7tGEHB_5FkkU6zxdc/getUpdates "HTTP/1.1 200 OK"
+2026-04-15 00:01:00,404 - httpx - INFO - HTTP Request: POST https://api.telegram.org/bot8069214468:AAHVVL4vdqq7B7C-5w7tGEHB_5FkkU6zxdc/getUpdates "HTTP/1.1 200 OK"
+2026-04-15 00:01:10,434 - httpx - INFO - HTTP Request: POST https://api.telegram.org/bot8069214468:AAHVVL4vdqq7B7C-5w7tGEHB_5FkkU6zxdc/getUpdates "HTTP/1.1 200 OK"
+2026-04-15 00:01:20,469 - httpx - INFO - HTTP Request: POST https://api.telegram.org/bot8069214468:AAHVVL4vdqq7B7C-5w7tGEHB_5FkkU6zxdc/getUpdates "HTTP/1.1 200 OK"
+2026-04-15 00:01:30,502 - httpx - INFO - HTTP Request: POST https://api.telegram.org/bot8069214468:AAHVVL4vdqq7B7C-5w7tGEHB_5FkkU6zxdc/getUpdates "HTTP/1.1 200 OK"
+2026-04-15 00:01:40,528 - httpx - INFO - HTTP Request: POST https://api.telegram.org/bot8069214468:AAHVVL4vdqq7B7C-5w7tGEHB_5FkkU6zxdc/getUpdates "HTTP/1.1 200 OK"
+2026-04-15 00:01:50,556 - httpx - INFO - HTTP Request: POST https://api.telegram.org/bot8069214468:AAHVVL4vdqq7B7C-5w7tGEHB_5FkkU6zxdc/getUpdates "HTTP/1.1 200 OK"
+2026-04-15 00:02:00,582 - httpx - INFO - HTTP Request: POST https://api.telegram.org/bot8069214468:AAHVVL4vdqq7B7C-5w7tGEHB_5FkkU6zxdc/getUpdates "HTTP/1.1 200 OK"
+2026-04-15 00:02:06,091 - httpx - INFO - HTTP Request: POST https://api.telegram.org/bot8069214468:AAHVVL4vdqq7B7C-5w7tGEHB_5FkkU6zxdc/getUpdates "HTTP/1.1 200 OK"
+2026-04-15 00:02:06,092 - telegram.ext.Application - INFO - Application is stopping. This might take a moment.
+2026-04-15 00:02:06,093 - telegram.ext.Application - INFO - Application.stop() complete
+2026-04-15 00:02:06,095 - src.interfaces.telegram_bot - INFO - Shutting down ExecutiveAgent...
+2026-04-15 00:02:06,096 - src.core.executive - INFO - Closing ExecutiveAgent
+2026-04-15 00:02:06,096 - src.memory.ledger_db - INFO - LedgerMemory connection closed
+2026-04-15 00:02:06,097 - src.core.executive - INFO - ExecutiveAgent shutdown complete
+2026-04-15 00:02:35,506 - src.interfaces.telegram_bot - INFO - Initializing Executive Agent...
+2026-04-15 00:02:35,507 - src.core.executive - INFO - Initializing ExecutiveAgent (Prefrontal Cortex)
+2026-04-15 00:02:35,590 - chromadb.telemetry.product.posthog - ERROR - Failed to send telemetry event ClientStartEvent: capture() takes 1 positional argument but 3 were given
+2026-04-15 00:02:35,592 - chromadb.telemetry.product.posthog - ERROR - Failed to send telemetry event ClientCreateCollectionEvent: capture() takes 1 positional argument but 3 were given
+2026-04-15 00:02:35,592 - src.memory.vector_db - INFO - VectorMemory initialized with persistence at data/chroma_storage
+2026-04-15 00:02:35,594 - src.memory.ledger_db - INFO - LedgerMemory initialized with database at data/ledger.db
+2026-04-15 00:02:35,594 - src.core.llm_router - WARNING - GEMINI_API_KEY not set. System 2 will not be available.
+2026-04-15 00:02:35,594 - src.core.llm_router - INFO - CognitiveRouter initialized with model: gemini-pro
+2026-04-15 00:02:35,595 - src.core.executive - INFO - ExecutiveAgent initialized successfully
+2026-04-15 00:02:35,721 - src.interfaces.telegram_bot - INFO - Executive Agent initialized successfully
+2026-04-15 00:02:36,095 - src.interfaces.telegram_bot - INFO - Telegram bot initialized and starting polling...
+2026-04-15 00:02:36,173 - httpx - INFO - HTTP Request: POST https://api.telegram.org/bot8069214468:AAHVVL4vdqq7B7C-5w7tGEHB_5FkkU6zxdc/getMe "HTTP/1.1 200 OK"
+2026-04-15 00:02:36,196 - httpx - INFO - HTTP Request: POST https://api.telegram.org/bot8069214468:AAHVVL4vdqq7B7C-5w7tGEHB_5FkkU6zxdc/deleteWebhook "HTTP/1.1 200 OK"
+2026-04-15 00:02:36,199 - telegram.ext.Application - INFO - Application started
+2026-04-15 00:02:46,271 - httpx - INFO - HTTP Request: POST https://api.telegram.org/bot8069214468:AAHVVL4vdqq7B7C-5w7tGEHB_5FkkU6zxdc/getUpdates "HTTP/1.1 200 OK"
+2026-04-15 00:02:56,298 - httpx - INFO - HTTP Request: POST https://api.telegram.org/bot8069214468:AAHVVL4vdqq7B7C-5w7tGEHB_5FkkU6zxdc/getUpdates "HTTP/1.1 200 OK"
+2026-04-15 00:02:58,165 - httpx - INFO - HTTP Request: POST https://api.telegram.org/bot8069214468:AAHVVL4vdqq7B7C-5w7tGEHB_5FkkU6zxdc/getUpdates "HTTP/1.1 200 OK"
+2026-04-15 00:02:58,168 - src.interfaces.telegram_bot - INFO - Message received from user 8769582575: Can you do a test and code a application?
+2026-04-15 00:02:58,260 - httpx - INFO - HTTP Request: POST https://api.telegram.org/bot8069214468:AAHVVL4vdqq7B7C-5w7tGEHB_5FkkU6zxdc/sendChatAction "HTTP/1.1 200 OK"
+2026-04-15 00:02:58,260 - src.core.executive - INFO - Processing message: Can you do a test and code a application?...
+2026-04-15 00:02:58,639 - src.memory.vector_db - ERROR - Failed to query memory: 
+2026-04-15 00:02:58,650 - src.core.executive - ERROR - Failed to retrieve context: 
+2026-04-15 00:02:58,652 - src.core.llm_router - INFO - Routing to System 1 (Local Model)
+2026-04-15 00:02:58,658 - src.core.executive - INFO - Response generated (81 chars)
+2026-04-15 00:02:58,689 - src.memory.vector_db - ERROR - Failed to add memory: 
+2026-04-15 00:02:58,692 - src.core.executive - WARNING - Failed to store response in memory: 
+2026-04-15 00:02:58,771 - httpx - INFO - HTTP Request: POST https://api.telegram.org/bot8069214468:AAHVVL4vdqq7B7C-5w7tGEHB_5FkkU6zxdc/sendMessage "HTTP/1.1 200 OK"
+2026-04-15 00:02:58,773 - src.interfaces.telegram_bot - INFO - Response sent to user 8769582575
+2026-04-15 00:03:08,196 - httpx - INFO - HTTP Request: POST https://api.telegram.org/bot8069214468:AAHVVL4vdqq7B7C-5w7tGEHB_5FkkU6zxdc/getUpdates "HTTP/1.1 200 OK"
+2026-04-15 00:03:16,519 - httpx - INFO - HTTP Request: POST https://api.telegram.org/bot8069214468:AAHVVL4vdqq7B7C-5w7tGEHB_5FkkU6zxdc/getUpdates "HTTP/1.1 200 OK"
+2026-04-15 00:03:16,521 - telegram.ext.Application - INFO - Application is stopping. This might take a moment.
+2026-04-15 00:03:16,522 - telegram.ext.Application - INFO - Application.stop() complete
+2026-04-15 00:03:16,523 - src.interfaces.telegram_bot - INFO - Shutting down ExecutiveAgent...
+2026-04-15 00:03:16,524 - src.core.executive - INFO - Closing ExecutiveAgent
+2026-04-15 00:03:16,524 - src.memory.ledger_db - INFO - LedgerMemory connection closed
+2026-04-15 00:03:16,524 - src.core.executive - INFO - ExecutiveAgent shutdown complete
+2026-04-15 00:04:16,931 - src.interfaces.telegram_bot - INFO - Initializing Executive Agent...
+2026-04-15 00:04:16,931 - src.core.executive - INFO - Initializing ExecutiveAgent (Prefrontal Cortex)
+2026-04-15 00:04:17,054 - chromadb.telemetry.product.posthog - ERROR - Failed to send telemetry event ClientStartEvent: capture() takes 1 positional argument but 3 were given
+2026-04-15 00:04:17,055 - chromadb.telemetry.product.posthog - ERROR - Failed to send telemetry event ClientCreateCollectionEvent: capture() takes 1 positional argument but 3 were given
+2026-04-15 00:04:17,055 - src.memory.vector_db - INFO - VectorMemory initialized with persistence at data/chroma_storage
+2026-04-15 00:04:17,057 - src.memory.ledger_db - INFO - LedgerMemory initialized with database at data/ledger.db
+2026-04-15 00:04:17,057 - src.core.llm_router - WARNING - GEMINI_API_KEY not set. System 2 will not be available.
+2026-04-15 00:04:17,057 - src.core.llm_router - INFO - CognitiveRouter initialized with model: gemini-pro
+2026-04-15 00:04:17,057 - src.core.executive - INFO - ExecutiveAgent initialized successfully
+2026-04-15 00:04:17,143 - src.interfaces.telegram_bot - INFO - Executive Agent initialized successfully
+2026-04-15 00:04:17,770 - src.interfaces.telegram_bot - INFO - Telegram bot initialized and starting polling...
+2026-04-15 00:04:17,866 - httpx - INFO - HTTP Request: POST https://api.telegram.org/bot8069214468:AAHVVL4vdqq7B7C-5w7tGEHB_5FkkU6zxdc/getMe "HTTP/1.1 200 OK"
+2026-04-15 00:04:17,894 - httpx - INFO - HTTP Request: POST https://api.telegram.org/bot8069214468:AAHVVL4vdqq7B7C-5w7tGEHB_5FkkU6zxdc/deleteWebhook "HTTP/1.1 200 OK"
+2026-04-15 00:04:17,895 - telegram.ext.Application - INFO - Application started
+2026-04-15 00:04:27,968 - httpx - INFO - HTTP Request: POST https://api.telegram.org/bot8069214468:AAHVVL4vdqq7B7C-5w7tGEHB_5FkkU6zxdc/getUpdates "HTTP/1.1 200 OK"
+2026-04-15 00:04:37,994 - httpx - INFO - HTTP Request: POST https://api.telegram.org/bot8069214468:AAHVVL4vdqq7B7C-5w7tGEHB_5FkkU6zxdc/getUpdates "HTTP/1.1 200 OK"
+2026-04-15 00:04:48,018 - httpx - INFO - HTTP Request: POST https://api.telegram.org/bot8069214468:AAHVVL4vdqq7B7C-5w7tGEHB_5FkkU6zxdc/getUpdates "HTTP/1.1 200 OK"
+2026-04-15 00:05:01,856 - src.interfaces.telegram_bot - INFO - Initializing Executive Agent...
+2026-04-15 00:05:01,856 - src.core.executive - INFO - Initializing ExecutiveAgent (Prefrontal Cortex)
+2026-04-15 00:05:02,010 - chromadb.telemetry.product.posthog - ERROR - Failed to send telemetry event ClientStartEvent: capture() takes 1 positional argument but 3 were given
+2026-04-15 00:05:02,012 - chromadb.telemetry.product.posthog - ERROR - Failed to send telemetry event ClientCreateCollectionEvent: capture() takes 1 positional argument but 3 were given
+2026-04-15 00:05:02,012 - src.memory.vector_db - INFO - VectorMemory initialized with persistence at data/chroma_storage
+2026-04-15 00:05:02,015 - src.memory.ledger_db - INFO - LedgerMemory initialized with database at data/ledger.db
+2026-04-15 00:05:02,016 - src.core.llm_router - INFO - CognitiveRouter initialized with model: gemini-pro
+2026-04-15 00:05:02,016 - src.core.executive - INFO - ExecutiveAgent initialized successfully
+2026-04-15 00:05:02,040 - src.interfaces.telegram_bot - INFO - Executive Agent initialized successfully
+2026-04-15 00:05:02,554 - src.interfaces.telegram_bot - INFO - Telegram bot initialized and starting polling...
+2026-04-15 00:05:02,647 - httpx - INFO - HTTP Request: POST https://api.telegram.org/bot8069214468:AAHVVL4vdqq7B7C-5w7tGEHB_5FkkU6zxdc/getMe "HTTP/1.1 200 OK"
+2026-04-15 00:05:02,671 - httpx - INFO - HTTP Request: POST https://api.telegram.org/bot8069214468:AAHVVL4vdqq7B7C-5w7tGEHB_5FkkU6zxdc/deleteWebhook "HTTP/1.1 200 OK"
+2026-04-15 00:05:02,672 - telegram.ext.Application - INFO - Application started
+2026-04-15 00:05:12,748 - httpx - INFO - HTTP Request: POST https://api.telegram.org/bot8069214468:AAHVVL4vdqq7B7C-5w7tGEHB_5FkkU6zxdc/getUpdates "HTTP/1.1 200 OK"
+2026-04-15 00:05:22,776 - httpx - INFO - HTTP Request: POST https://api.telegram.org/bot8069214468:AAHVVL4vdqq7B7C-5w7tGEHB_5FkkU6zxdc/getUpdates "HTTP/1.1 200 OK"
+2026-04-15 00:05:32,824 - httpx - INFO - HTTP Request: POST https://api.telegram.org/bot8069214468:AAHVVL4vdqq7B7C-5w7tGEHB_5FkkU6zxdc/getUpdates "HTTP/1.1 200 OK"
+2026-04-15 00:05:42,854 - httpx - INFO - HTTP Request: POST https://api.telegram.org/bot8069214468:AAHVVL4vdqq7B7C-5w7tGEHB_5FkkU6zxdc/getUpdates "HTTP/1.1 200 OK"
+2026-04-15 00:05:52,880 - httpx - INFO - HTTP Request: POST https://api.telegram.org/bot8069214468:AAHVVL4vdqq7B7C-5w7tGEHB_5FkkU6zxdc/getUpdates "HTTP/1.1 200 OK"
+2026-04-15 00:05:53,146 - src.interfaces.telegram_bot - INFO - Initializing Executive Agent...
+2026-04-15 00:05:53,146 - src.core.executive - INFO - Initializing ExecutiveAgent (Prefrontal Cortex)
+2026-04-15 00:05:53,241 - chromadb.telemetry.product.posthog - ERROR - Failed to send telemetry event ClientStartEvent: capture() takes 1 positional argument but 3 were given
+2026-04-15 00:05:53,243 - chromadb.telemetry.product.posthog - ERROR - Failed to send telemetry event ClientCreateCollectionEvent: capture() takes 1 positional argument but 3 were given
+2026-04-15 00:05:53,243 - src.memory.vector_db - INFO - VectorMemory initialized with persistence at data/chroma_storage
+2026-04-15 00:05:53,245 - src.memory.ledger_db - INFO - LedgerMemory initialized with database at data/ledger.db
+2026-04-15 00:05:53,246 - src.core.llm_router - INFO - CognitiveRouter initialized with model: gemini-pro
+2026-04-15 00:05:53,246 - src.core.executive - INFO - ExecutiveAgent initialized successfully
+2026-04-15 00:05:53,311 - src.interfaces.telegram_bot - INFO - Executive Agent initialized successfully
+2026-04-15 00:05:53,765 - src.interfaces.telegram_bot - INFO - Telegram bot initialized and starting polling...
+2026-04-15 00:05:53,858 - httpx - INFO - HTTP Request: POST https://api.telegram.org/bot8069214468:AAHVVL4vdqq7B7C-5w7tGEHB_5FkkU6zxdc/getMe "HTTP/1.1 200 OK"
+2026-04-15 00:05:53,885 - httpx - INFO - HTTP Request: POST https://api.telegram.org/bot8069214468:AAHVVL4vdqq7B7C-5w7tGEHB_5FkkU6zxdc/deleteWebhook "HTTP/1.1 200 OK"
+2026-04-15 00:05:53,887 - telegram.ext.Application - INFO - Application started
+2026-04-15 00:05:53,961 - httpx - INFO - HTTP Request: POST https://api.telegram.org/bot8069214468:AAHVVL4vdqq7B7C-5w7tGEHB_5FkkU6zxdc/getUpdates "HTTP/1.1 409 Conflict"
+2026-04-15 00:05:53,962 - telegram.ext.Updater - ERROR - Error while getting Updates: Conflict: terminated by other getUpdates request; make sure that only one bot instance is running
+2026-04-15 00:05:53,962 - telegram.ext.Application - ERROR - No error handlers are registered, logging exception.
+Traceback (most recent call last):
+  File "C:\Users\iboci\AppData\Local\Packages\PythonSoftwareFoundation.Python.3.11_qbz5n2kfra8p0\LocalCache\local-packages\Python311\site-packages\telegram\ext\_updater.py", line 688, in _network_loop_retry
+    if not await action_cb():
+           ^^^^^^^^^^^^^^^^^
+  File "C:\Users\iboci\AppData\Local\Packages\PythonSoftwareFoundation.Python.3.11_qbz5n2kfra8p0\LocalCache\local-packages\Python311\site-packages\telegram\ext\_updater.py", line 384, in polling_action_cb
+    raise exc
+  File "C:\Users\iboci\AppData\Local\Packages\PythonSoftwareFoundation.Python.3.11_qbz5n2kfra8p0\LocalCache\local-packages\Python311\site-packages\telegram\ext\_updater.py", line 373, in polling_action_cb
+    updates = await self.bot.get_updates(
+              ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\iboci\AppData\Local\Packages\PythonSoftwareFoundation.Python.3.11_qbz5n2kfra8p0\LocalCache\local-packages\Python311\site-packages\telegram\ext\_extbot.py", line 558, in get_updates
+    updates = await super().get_updates(
+              ^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\iboci\AppData\Local\Packages\PythonSoftwareFoundation.Python.3.11_qbz5n2kfra8p0\LocalCache\local-packages\Python311\site-packages\telegram\_bot.py", line 525, in decorator
+    result = await func(self, *args, **kwargs)  # skipcq: PYL-E1102
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\iboci\AppData\Local\Packages\PythonSoftwareFoundation.Python.3.11_qbz5n2kfra8p0\LocalCache\local-packages\Python311\site-packages\telegram\_bot.py", line 3584, in get_updates
+    await self._post(
+  File "C:\Users\iboci\AppData\Local\Packages\PythonSoftwareFoundation.Python.3.11_qbz5n2kfra8p0\LocalCache\local-packages\Python311\site-packages\telegram\_bot.py", line 613, in _post
+    return await self._do_post(
+           ^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\iboci\AppData\Local\Packages\PythonSoftwareFoundation.Python.3.11_qbz5n2kfra8p0\LocalCache\local-packages\Python311\site-packages\telegram\ext\_extbot.py", line 340, in _do_post
+    return await super()._do_post(
+           ^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\iboci\AppData\Local\Packages\PythonSoftwareFoundation.Python.3.11_qbz5n2kfra8p0\LocalCache\local-packages\Python311\site-packages\telegram\_bot.py", line 641, in _do_post
+    return await request.post(
+           ^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\iboci\AppData\Local\Packages\PythonSoftwareFoundation.Python.3.11_qbz5n2kfra8p0\LocalCache\local-packages\Python311\site-packages\telegram\request\_baserequest.py", line 200, in post
+    result = await self._request_wrapper(
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\iboci\AppData\Local\Packages\PythonSoftwareFoundation.Python.3.11_qbz5n2kfra8p0\LocalCache\local-packages\Python311\site-packages\telegram\request\_baserequest.py", line 381, in _request_wrapper
+    raise Conflict(message)
+telegram.error.Conflict: Conflict: terminated by other getUpdates request; make sure that only one bot instance is running
+2026-04-15 00:05:58,132 - httpx - INFO - HTTP Request: POST https://api.telegram.org/bot8069214468:AAHVVL4vdqq7B7C-5w7tGEHB_5FkkU6zxdc/getUpdates "HTTP/1.1 409 Conflict"
+2026-04-15 00:05:58,133 - telegram.ext.Updater - ERROR - Error while getting Updates: Conflict: terminated by other getUpdates request; make sure that only one bot instance is running
+2026-04-15 00:05:58,133 - telegram.ext.Application - ERROR - No error handlers are registered, logging exception.
+Traceback (most recent call last):
+  File "C:\Users\iboci\Live-Trading-bot\AI_Prototype\.venv\Lib\site-packages\telegram\ext\_updater.py", line 688, in _network_loop_retry
+    if not await action_cb():
+           ^^^^^^^^^^^^^^^^^
+  File "C:\Users\iboci\Live-Trading-bot\AI_Prototype\.venv\Lib\site-packages\telegram\ext\_updater.py", line 384, in polling_action_cb
+    raise exc
+  File "C:\Users\iboci\Live-Trading-bot\AI_Prototype\.venv\Lib\site-packages\telegram\ext\_updater.py", line 373, in polling_action_cb
+    updates = await self.bot.get_updates(
+              ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\iboci\Live-Trading-bot\AI_Prototype\.venv\Lib\site-packages\telegram\ext\_extbot.py", line 558, in get_updates
+    updates = await super().get_updates(
+              ^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\iboci\Live-Trading-bot\AI_Prototype\.venv\Lib\site-packages\telegram\_bot.py", line 525, in decorator
+    result = await func(self, *args, **kwargs)  # skipcq: PYL-E1102
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\iboci\Live-Trading-bot\AI_Prototype\.venv\Lib\site-packages\telegram\_bot.py", line 3584, in get_updates
+    await self._post(
+  File "C:\Users\iboci\Live-Trading-bot\AI_Prototype\.venv\Lib\site-packages\telegram\_bot.py", line 613, in _post
+    return await self._do_post(
+           ^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\iboci\Live-Trading-bot\AI_Prototype\.venv\Lib\site-packages\telegram\ext\_extbot.py", line 340, in _do_post
+    return await super()._do_post(
+           ^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\iboci\Live-Trading-bot\AI_Prototype\.venv\Lib\site-packages\telegram\_bot.py", line 641, in _do_post
+    return await request.post(
+           ^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\iboci\Live-Trading-bot\AI_Prototype\.venv\Lib\site-packages\telegram\request\_baserequest.py", line 200, in post
+    result = await self._request_wrapper(
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\iboci\Live-Trading-bot\AI_Prototype\.venv\Lib\site-packages\telegram\request\_baserequest.py", line 381, in _request_wrapper
+    raise Conflict(message)
+telegram.error.Conflict: Conflict: terminated by other getUpdates request; make sure that only one bot instance is running
+2026-04-15 00:05:58,534 - httpx - INFO - HTTP Request: POST https://api.telegram.org/bot8069214468:AAHVVL4vdqq7B7C-5w7tGEHB_5FkkU6zxdc/getUpdates "HTTP/1.1 200 OK"
+2026-04-15 00:05:58,536 - src.interfaces.telegram_bot - INFO - Message received from user 8769582575: Hi
+2026-04-15 00:05:58,646 - httpx - INFO - HTTP Request: POST https://api.telegram.org/bot8069214468:AAHVVL4vdqq7B7C-5w7tGEHB_5FkkU6zxdc/sendChatAction "HTTP/1.1 200 OK"
+2026-04-15 00:05:58,647 - src.core.executive - INFO - Processing message: Hi...
+2026-04-15 00:05:59,087 - src.memory.vector_db - ERROR - Failed to query memory: 
+2026-04-15 00:05:59,093 - src.core.executive - ERROR - Failed to retrieve context: 
+2026-04-15 00:05:59,094 - src.core.llm_router - INFO - Routing to System 1 (Local Model)
+2026-04-15 00:05:59,094 - src.core.executive - INFO - Response generated (42 chars)
+2026-04-15 00:05:59,123 - src.memory.vector_db - ERROR - Failed to add memory: 
+2026-04-15 00:05:59,124 - src.core.executive - WARNING - Failed to store response in memory: 
+2026-04-15 00:05:59,232 - httpx - INFO - HTTP Request: POST https://api.telegram.org/bot8069214468:AAHVVL4vdqq7B7C-5w7tGEHB_5FkkU6zxdc/getUpdates "HTTP/1.1 409 Conflict"
+2026-04-15 00:05:59,234 - telegram.ext.Updater - ERROR - Error while getting Updates: Conflict: terminated by other getUpdates request; make sure that only one bot instance is running
+2026-04-15 00:05:59,236 - telegram.ext.Application - ERROR - No error handlers are registered, logging exception.
+Traceback (most recent call last):
+  File "C:\Users\iboci\AppData\Local\Packages\PythonSoftwareFoundation.Python.3.11_qbz5n2kfra8p0\LocalCache\local-packages\Python311\site-packages\telegram\ext\_updater.py", line 688, in _network_loop_retry
+    if not await action_cb():
+           ^^^^^^^^^^^^^^^^^
+  File "C:\Users\iboci\AppData\Local\Packages\PythonSoftwareFoundation.Python.3.11_qbz5n2kfra8p0\LocalCache\local-packages\Python311\site-packages\telegram\ext\_updater.py", line 384, in polling_action_cb
+    raise exc
+  File "C:\Users\iboci\AppData\Local\Packages\PythonSoftwareFoundation.Python.3.11_qbz5n2kfra8p0\LocalCache\local-packages\Python311\site-packages\telegram\ext\_updater.py", line 373, in polling_action_cb
+    updates = await self.bot.get_updates(
+              ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\iboci\AppData\Local\Packages\PythonSoftwareFoundation.Python.3.11_qbz5n2kfra8p0\LocalCache\local-packages\Python311\site-packages\telegram\ext\_extbot.py", line 558, in get_updates
+    updates = await super().get_updates(
+              ^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\iboci\AppData\Local\Packages\PythonSoftwareFoundation.Python.3.11_qbz5n2kfra8p0\LocalCache\local-packages\Python311\site-packages\telegram\_bot.py", line 525, in decorator
+    result = await func(self, *args, **kwargs)  # skipcq: PYL-E1102
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\iboci\AppData\Local\Packages\PythonSoftwareFoundation.Python.3.11_qbz5n2kfra8p0\LocalCache\local-packages\Python311\site-packages\telegram\_bot.py", line 3584, in get_updates
+    await self._post(
+  File "C:\Users\iboci\AppData\Local\Packages\PythonSoftwareFoundation.Python.3.11_qbz5n2kfra8p0\LocalCache\local-packages\Python311\site-packages\telegram\_bot.py", line 613, in _post
+    return await self._do_post(
+           ^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\iboci\AppData\Local\Packages\PythonSoftwareFoundation.Python.3.11_qbz5n2kfra8p0\LocalCache\local-packages\Python311\site-packages\telegram\ext\_extbot.py", line 340, in _do_post
+    return await super()._do_post(
+           ^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\iboci\AppData\Local\Packages\PythonSoftwareFoundation.Python.3.11_qbz5n2kfra8p0\LocalCache\local-packages\Python311\site-packages\telegram\_bot.py", line 641, in _do_post
+    return await request.post(
+           ^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\iboci\AppData\Local\Packages\PythonSoftwareFoundation.Python.3.11_qbz5n2kfra8p0\LocalCache\local-packages\Python311\site-packages\telegram\request\_baserequest.py", line 200, in post
+    result = await self._request_wrapper(
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\iboci\AppData\Local\Packages\PythonSoftwareFoundation.Python.3.11_qbz5n2kfra8p0\LocalCache\local-packages\Python311\site-packages\telegram\request\_baserequest.py", line 381, in _request_wrapper
+    raise Conflict(message)
+telegram.error.Conflict: Conflict: terminated by other getUpdates request; make sure that only one bot instance is running
+2026-04-15 00:05:59,425 - httpx - INFO - HTTP Request: POST https://api.telegram.org/bot8069214468:AAHVVL4vdqq7B7C-5w7tGEHB_5FkkU6zxdc/sendMessage "HTTP/1.1 200 OK"
+2026-04-15 00:05:59,427 - src.interfaces.telegram_bot - INFO - Response sent to user 8769582575
+2026-04-15 00:06:03,279 - httpx - INFO - HTTP Request: POST https://api.telegram.org/bot8069214468:AAHVVL4vdqq7B7C-5w7tGEHB_5FkkU6zxdc/getUpdates "HTTP/1.1 409 Conflict"
+2026-04-15 00:06:03,280 - telegram.ext.Updater - ERROR - Error while getting Updates: Conflict: terminated by other getUpdates request; make sure that only one bot instance is running
+2026-04-15 00:06:03,281 - telegram.ext.Application - ERROR - No error handlers are registered, logging exception.
+Traceback (most recent call last):
+  File "C:\Users\iboci\Live-Trading-bot\AI_Prototype\.venv\Lib\site-packages\telegram\ext\_updater.py", line 688, in _network_loop_retry
+    if not await action_cb():
+           ^^^^^^^^^^^^^^^^^
+  File "C:\Users\iboci\Live-Trading-bot\AI_Prototype\.venv\Lib\site-packages\telegram\ext\_updater.py", line 384, in polling_action_cb
+    raise exc
+  File "C:\Users\iboci\Live-Trading-bot\AI_Prototype\.venv\Lib\site-packages\telegram\ext\_updater.py", line 373, in polling_action_cb
+    updates = await self.bot.get_updates(
+              ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\iboci\Live-Trading-bot\AI_Prototype\.venv\Lib\site-packages\telegram\ext\_extbot.py", line 558, in get_updates
+    updates = await super().get_updates(
+              ^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\iboci\Live-Trading-bot\AI_Prototype\.venv\Lib\site-packages\telegram\_bot.py", line 525, in decorator
+    result = await func(self, *args, **kwargs)  # skipcq: PYL-E1102
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\iboci\Live-Trading-bot\AI_Prototype\.venv\Lib\site-packages\telegram\_bot.py", line 3584, in get_updates
+    await self._post(
+  File "C:\Users\iboci\Live-Trading-bot\AI_Prototype\.venv\Lib\site-packages\telegram\_bot.py", line 613, in _post
+    return await self._do_post(
+           ^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\iboci\Live-Trading-bot\AI_Prototype\.venv\Lib\site-packages\telegram\ext\_extbot.py", line 340, in _do_post
+    return await super()._do_post(
+           ^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\iboci\Live-Trading-bot\AI_Prototype\.venv\Lib\site-packages\telegram\_bot.py", line 641, in _do_post
+    return await request.post(
+           ^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\iboci\Live-Trading-bot\AI_Prototype\.venv\Lib\site-packages\telegram\request\_baserequest.py", line 200, in post
+    result = await self._request_wrapper(
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\iboci\Live-Trading-bot\AI_Prototype\.venv\Lib\site-packages\telegram\request\_baserequest.py", line 381, in _request_wrapper
+    raise Conflict(message)
+telegram.error.Conflict: Conflict: terminated by other getUpdates request; make sure that only one bot instance is running
+2026-04-15 00:06:04,819 - httpx - INFO - HTTP Request: POST https://api.telegram.org/bot8069214468:AAHVVL4vdqq7B7C-5w7tGEHB_5FkkU6zxdc/getUpdates "HTTP/1.1 409 Conflict"
+2026-04-15 00:06:04,820 - telegram.ext.Updater - ERROR - Error while getting Updates: Conflict: terminated by other getUpdates request; make sure that only one bot instance is running
+2026-04-15 00:06:04,820 - telegram.ext.Application - ERROR - No error handlers are registered, logging exception.
+Traceback (most recent call last):
+  File "C:\Users\iboci\AppData\Local\Packages\PythonSoftwareFoundation.Python.3.11_qbz5n2kfra8p0\LocalCache\local-packages\Python311\site-packages\telegram\ext\_updater.py", line 688, in _network_loop_retry
+    if not await action_cb():
+           ^^^^^^^^^^^^^^^^^
+  File "C:\Users\iboci\AppData\Local\Packages\PythonSoftwareFoundation.Python.3.11_qbz5n2kfra8p0\LocalCache\local-packages\Python311\site-packages\telegram\ext\_updater.py", line 384, in polling_action_cb
+    raise exc
+  File "C:\Users\iboci\AppData\Local\Packages\PythonSoftwareFoundation.Python.3.11_qbz5n2kfra8p0\LocalCache\local-packages\Python311\site-packages\telegram\ext\_updater.py", line 373, in polling_action_cb
+    updates = await self.bot.get_updates(
+              ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\iboci\AppData\Local\Packages\PythonSoftwareFoundation.Python.3.11_qbz5n2kfra8p0\LocalCache\local-packages\Python311\site-packages\telegram\ext\_extbot.py", line 558, in get_updates
+    updates = await super().get_updates(
+              ^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\iboci\AppData\Local\Packages\PythonSoftwareFoundation.Python.3.11_qbz5n2kfra8p0\LocalCache\local-packages\Python311\site-packages\telegram\_bot.py", line 525, in decorator
+    result = await func(self, *args, **kwargs)  # skipcq: PYL-E1102
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\iboci\AppData\Local\Packages\PythonSoftwareFoundation.Python.3.11_qbz5n2kfra8p0\LocalCache\local-packages\Python311\site-packages\telegram\_bot.py", line 3584, in get_updates
+    await self._post(
+  File "C:\Users\iboci\AppData\Local\Packages\PythonSoftwareFoundation.Python.3.11_qbz5n2kfra8p0\LocalCache\local-packages\Python311\site-packages\telegram\_bot.py", line 613, in _post
+    return await self._do_post(
+           ^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\iboci\AppData\Local\Packages\PythonSoftwareFoundation.Python.3.11_qbz5n2kfra8p0\LocalCache\local-packages\Python311\site-packages\telegram\ext\_extbot.py", line 340, in _do_post
+    return await super()._do_post(
+           ^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\iboci\AppData\Local\Packages\PythonSoftwareFoundation.Python.3.11_qbz5n2kfra8p0\LocalCache\local-packages\Python311\site-packages\telegram\_bot.py", line 641, in _do_post
+    return await request.post(
+           ^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\iboci\AppData\Local\Packages\PythonSoftwareFoundation.Python.3.11_qbz5n2kfra8p0\LocalCache\local-packages\Python311\site-packages\telegram\request\_baserequest.py", line 200, in post
+    result = await self._request_wrapper(
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\iboci\AppData\Local\Packages\PythonSoftwareFoundation.Python.3.11_qbz5n2kfra8p0\LocalCache\local-packages\Python311\site-packages\telegram\request\_baserequest.py", line 381, in _request_wrapper
+    raise Conflict(message)
+telegram.error.Conflict: Conflict: terminated by other getUpdates request; make sure that only one bot instance is running
+2026-04-15 00:06:09,362 - httpx - INFO - HTTP Request: POST https://api.telegram.org/bot8069214468:AAHVVL4vdqq7B7C-5w7tGEHB_5FkkU6zxdc/getUpdates "HTTP/1.1 409 Conflict"
+2026-04-15 00:06:09,363 - telegram.ext.Updater - ERROR - Error while getting Updates: Conflict: terminated by other getUpdates request; make sure that only one bot instance is running
+2026-04-15 00:06:09,363 - telegram.ext.Application - ERROR - No error handlers are registered, logging exception.
+Traceback (most recent call last):
+  File "C:\Users\iboci\Live-Trading-bot\AI_Prototype\.venv\Lib\site-packages\telegram\ext\_updater.py", line 688, in _network_loop_retry
+    if not await action_cb():
+           ^^^^^^^^^^^^^^^^^
+  File "C:\Users\iboci\Live-Trading-bot\AI_Prototype\.venv\Lib\site-packages\telegram\ext\_updater.py", line 384, in polling_action_cb
+    raise exc
+  File "C:\Users\iboci\Live-Trading-bot\AI_Prototype\.venv\Lib\site-packages\telegram\ext\_updater.py", line 373, in polling_action_cb
+    updates = await self.bot.get_updates(
+              ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\iboci\Live-Trading-bot\AI_Prototype\.venv\Lib\site-packages\telegram\ext\_extbot.py", line 558, in get_updates
+    updates = await super().get_updates(
+              ^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\iboci\Live-Trading-bot\AI_Prototype\.venv\Lib\site-packages\telegram\_bot.py", line 525, in decorator
+    result = await func(self, *args, **kwargs)  # skipcq: PYL-E1102
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\iboci\Live-Trading-bot\AI_Prototype\.venv\Lib\site-packages\telegram\_bot.py", line 3584, in get_updates
+    await self._post(
+  File "C:\Users\iboci\Live-Trading-bot\AI_Prototype\.venv\Lib\site-packages\telegram\_bot.py", line 613, in _post
+    return await self._do_post(
+           ^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\iboci\Live-Trading-bot\AI_Prototype\.venv\Lib\site-packages\telegram\ext\_extbot.py", line 340, in _do_post
+    return await super()._do_post(
+           ^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\iboci\Live-Trading-bot\AI_Prototype\.venv\Lib\site-packages\telegram\_bot.py", line 641, in _do_post
+    return await request.post(
+           ^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\iboci\Live-Trading-bot\AI_Prototype\.venv\Lib\site-packages\telegram\request\_baserequest.py", line 200, in post
+    result = await self._request_wrapper(
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\iboci\Live-Trading-bot\AI_Prototype\.venv\Lib\site-packages\telegram\request\_baserequest.py", line 381, in _request_wrapper
+    raise Conflict(message)
+telegram.error.Conflict: Conflict: terminated by other getUpdates request; make sure that only one bot instance is running
+2026-04-15 00:06:11,646 - httpx - INFO - HTTP Request: POST https://api.telegram.org/bot8069214468:AAHVVL4vdqq7B7C-5w7tGEHB_5FkkU6zxdc/getUpdates "HTTP/1.1 409 Conflict"
+2026-04-15 00:06:11,648 - telegram.ext.Updater - ERROR - Error while getting Updates: Conflict: terminated by other getUpdates request; make sure that only one bot instance is running
+2026-04-15 00:06:11,648 - telegram.ext.Application - ERROR - No error handlers are registered, logging exception.
+Traceback (most recent call last):
+  File "C:\Users\iboci\AppData\Local\Packages\PythonSoftwareFoundation.Python.3.11_qbz5n2kfra8p0\LocalCache\local-packages\Python311\site-packages\telegram\ext\_updater.py", line 688, in _network_loop_retry
+    if not await action_cb():
+           ^^^^^^^^^^^^^^^^^
+  File "C:\Users\iboci\AppData\Local\Packages\PythonSoftwareFoundation.Python.3.11_qbz5n2kfra8p0\LocalCache\local-packages\Python311\site-packages\telegram\ext\_updater.py", line 384, in polling_action_cb
+    raise exc
+  File "C:\Users\iboci\AppData\Local\Packages\PythonSoftwareFoundation.Python.3.11_qbz5n2kfra8p0\LocalCache\local-packages\Python311\site-packages\telegram\ext\_updater.py", line 373, in polling_action_cb
+    updates = await self.bot.get_updates(
+              ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\iboci\AppData\Local\Packages\PythonSoftwareFoundation.Python.3.11_qbz5n2kfra8p0\LocalCache\local-packages\Python311\site-packages\telegram\ext\_extbot.py", line 558, in get_updates
+    updates = await super().get_updates(
+              ^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\iboci\AppData\Local\Packages\PythonSoftwareFoundation.Python.3.11_qbz5n2kfra8p0\LocalCache\local-packages\Python311\site-packages\telegram\_bot.py", line 525, in decorator
+    result = await func(self, *args, **kwargs)  # skipcq: PYL-E1102
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\iboci\AppData\Local\Packages\PythonSoftwareFoundation.Python.3.11_qbz5n2kfra8p0\LocalCache\local-packages\Python311\site-packages\telegram\_bot.py", line 3584, in get_updates
+    await self._post(
+  File "C:\Users\iboci\AppData\Local\Packages\PythonSoftwareFoundation.Python.3.11_qbz5n2kfra8p0\LocalCache\local-packages\Python311\site-packages\telegram\_bot.py", line 613, in _post
+    return await self._do_post(
+           ^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\iboci\AppData\Local\Packages\PythonSoftwareFoundation.Python.3.11_qbz5n2kfra8p0\LocalCache\local-packages\Python311\site-packages\telegram\ext\_extbot.py", line 340, in _do_post
+    return await super()._do_post(
+           ^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\iboci\AppData\Local\Packages\PythonSoftwareFoundation.Python.3.11_qbz5n2kfra8p0\LocalCache\local-packages\Python311\site-packages\telegram\_bot.py", line 641, in _do_post
+    return await request.post(
+           ^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\iboci\AppData\Local\Packages\PythonSoftwareFoundation.Python.3.11_qbz5n2kfra8p0\LocalCache\local-packages\Python311\site-packages\telegram\request\_baserequest.py", line 200, in post
+    result = await self._request_wrapper(
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\iboci\AppData\Local\Packages\PythonSoftwareFoundation.Python.3.11_qbz5n2kfra8p0\LocalCache\local-packages\Python311\site-packages\telegram\request\_baserequest.py", line 381, in _request_wrapper
+    raise Conflict(message)
+telegram.error.Conflict: Conflict: terminated by other getUpdates request; make sure that only one bot instance is running
+2026-04-15 00:06:16,925 - httpx - INFO - HTTP Request: POST https://api.telegram.org/bot8069214468:AAHVVL4vdqq7B7C-5w7tGEHB_5FkkU6zxdc/getUpdates "HTTP/1.1 409 Conflict"
+2026-04-15 00:06:16,926 - telegram.ext.Updater - ERROR - Error while getting Updates: Conflict: terminated by other getUpdates request; make sure that only one bot instance is running
+2026-04-15 00:06:16,926 - telegram.ext.Application - ERROR - No error handlers are registered, logging exception.
+Traceback (most recent call last):
+  File "C:\Users\iboci\Live-Trading-bot\AI_Prototype\.venv\Lib\site-packages\telegram\ext\_updater.py", line 688, in _network_loop_retry
+    if not await action_cb():
+           ^^^^^^^^^^^^^^^^^
+  File "C:\Users\iboci\Live-Trading-bot\AI_Prototype\.venv\Lib\site-packages\telegram\ext\_updater.py", line 384, in polling_action_cb
+    raise exc
+  File "C:\Users\iboci\Live-Trading-bot\AI_Prototype\.venv\Lib\site-packages\telegram\ext\_updater.py", line 373, in polling_action_cb
+    updates = await self.bot.get_updates(
+              ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\iboci\Live-Trading-bot\AI_Prototype\.venv\Lib\site-packages\telegram\ext\_extbot.py", line 558, in get_updates
+    updates = await super().get_updates(
+              ^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\iboci\Live-Trading-bot\AI_Prototype\.venv\Lib\site-packages\telegram\_bot.py", line 525, in decorator
+    result = await func(self, *args, **kwargs)  # skipcq: PYL-E1102
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\iboci\Live-Trading-bot\AI_Prototype\.venv\Lib\site-packages\telegram\_bot.py", line 3584, in get_updates
+    await self._post(
+  File "C:\Users\iboci\Live-Trading-bot\AI_Prototype\.venv\Lib\site-packages\telegram\_bot.py", line 613, in _post
+    return await self._do_post(
+           ^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\iboci\Live-Trading-bot\AI_Prototype\.venv\Lib\site-packages\telegram\ext\_extbot.py", line 340, in _do_post
+    return await super()._do_post(
+           ^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\iboci\Live-Trading-bot\AI_Prototype\.venv\Lib\site-packages\telegram\_bot.py", line 641, in _do_post
+    return await request.post(
+           ^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\iboci\Live-Trading-bot\AI_Prototype\.venv\Lib\site-packages\telegram\request\_baserequest.py", line 200, in post
+    result = await self._request_wrapper(
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\iboci\Live-Trading-bot\AI_Prototype\.venv\Lib\site-packages\telegram\request\_baserequest.py", line 381, in _request_wrapper
+    raise Conflict(message)
+telegram.error.Conflict: Conflict: terminated by other getUpdates request; make sure that only one bot instance is running
+2026-04-15 00:06:20,340 - httpx - INFO - HTTP Request: POST https://api.telegram.org/bot8069214468:AAHVVL4vdqq7B7C-5w7tGEHB_5FkkU6zxdc/getUpdates "HTTP/1.1 409 Conflict"
+2026-04-15 00:06:20,341 - telegram.ext.Updater - ERROR - Error while getting Updates: Conflict: terminated by other getUpdates request; make sure that only one bot instance is running
+2026-04-15 00:06:20,341 - telegram.ext.Application - ERROR - No error handlers are registered, logging exception.
+Traceback (most recent call last):
+  File "C:\Users\iboci\AppData\Local\Packages\PythonSoftwareFoundation.Python.3.11_qbz5n2kfra8p0\LocalCache\local-packages\Python311\site-packages\telegram\ext\_updater.py", line 688, in _network_loop_retry
+    if not await action_cb():
+           ^^^^^^^^^^^^^^^^^
+  File "C:\Users\iboci\AppData\Local\Packages\PythonSoftwareFoundation.Python.3.11_qbz5n2kfra8p0\LocalCache\local-packages\Python311\site-packages\telegram\ext\_updater.py", line 384, in polling_action_cb
+    raise exc
+  File "C:\Users\iboci\AppData\Local\Packages\PythonSoftwareFoundation.Python.3.11_qbz5n2kfra8p0\LocalCache\local-packages\Python311\site-packages\telegram\ext\_updater.py", line 373, in polling_action_cb
+    updates = await self.bot.get_updates(
+              ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\iboci\AppData\Local\Packages\PythonSoftwareFoundation.Python.3.11_qbz5n2kfra8p0\LocalCache\local-packages\Python311\site-packages\telegram\ext\_extbot.py", line 558, in get_updates
+    updates = await super().get_updates(
+              ^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\iboci\AppData\Local\Packages\PythonSoftwareFoundation.Python.3.11_qbz5n2kfra8p0\LocalCache\local-packages\Python311\site-packages\telegram\_bot.py", line 525, in decorator
+    result = await func(self, *args, **kwargs)  # skipcq: PYL-E1102
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\iboci\AppData\Local\Packages\PythonSoftwareFoundation.Python.3.11_qbz5n2kfra8p0\LocalCache\local-packages\Python311\site-packages\telegram\_bot.py", line 3584, in get_updates
+    await self._post(
+  File "C:\Users\iboci\AppData\Local\Packages\PythonSoftwareFoundation.Python.3.11_qbz5n2kfra8p0\LocalCache\local-packages\Python311\site-packages\telegram\_bot.py", line 613, in _post
+    return await self._do_post(
+           ^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\iboci\AppData\Local\Packages\PythonSoftwareFoundation.Python.3.11_qbz5n2kfra8p0\LocalCache\local-packages\Python311\site-packages\telegram\ext\_extbot.py", line 340, in _do_post
+    return await super()._do_post(
+           ^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\iboci\AppData\Local\Packages\PythonSoftwareFoundation.Python.3.11_qbz5n2kfra8p0\LocalCache\local-packages\Python311\site-packages\telegram\_bot.py", line 641, in _do_post
+    return await request.post(
+           ^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\iboci\AppData\Local\Packages\PythonSoftwareFoundation.Python.3.11_qbz5n2kfra8p0\LocalCache\local-packages\Python311\site-packages\telegram\request\_baserequest.py", line 200, in post
+    result = await self._request_wrapper(
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\iboci\AppData\Local\Packages\PythonSoftwareFoundation.Python.3.11_qbz5n2kfra8p0\LocalCache\local-packages\Python311\site-packages\telegram\request\_baserequest.py", line 381, in _request_wrapper
+    raise Conflict(message)
+telegram.error.Conflict: Conflict: terminated by other getUpdates request; make sure that only one bot instance is running
+2026-04-15 00:06:23,102 - httpx - INFO - HTTP Request: POST https://api.telegram.org/bot8069214468:AAHVVL4vdqq7B7C-5w7tGEHB_5FkkU6zxdc/getUpdates "HTTP/1.1 200 OK"
+2026-04-15 00:06:23,104 - src.interfaces.telegram_bot - INFO - Message received from user 8769582575: I need instructions on how to code a deep thinking model
+2026-04-15 00:06:23,196 - httpx - INFO - HTTP Request: POST https://api.telegram.org/bot8069214468:AAHVVL4vdqq7B7C-5w7tGEHB_5FkkU6zxdc/sendChatAction "HTTP/1.1 200 OK"
+2026-04-15 00:06:23,197 - src.core.executive - INFO - Processing message: I need instructions on how to code a deep thinking...
+2026-04-15 00:06:23,485 - src.memory.vector_db - ERROR - Failed to query memory: 
+2026-04-15 00:06:23,486 - src.core.executive - ERROR - Failed to retrieve context: 
+2026-04-15 00:06:23,488 - src.core.llm_router - INFO - Routing to System 2 (Gemini API)
+2026-04-15 00:06:23,837 - src.core.llm_router - ERROR - System 2 error: 404 models/gemini-pro is not found for API version v1beta, or is not supported for generateContent. Call ListModels to see the list of available models and their supported methods.
+Traceback (most recent call last):
+  File "C:\Users\iboci\Live-Trading-bot\AI_Prototype\.venv\Lib\site-packages\google\api_core\grpc_helpers.py", line 55, in error_remapped_callable
+    return callable_(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\iboci\Live-Trading-bot\AI_Prototype\.venv\Lib\site-packages\grpc\_channel.py", line 1159, in __call__
+    return _end_unary_response_blocking(state, call, False, None)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\iboci\Live-Trading-bot\AI_Prototype\.venv\Lib\site-packages\grpc\_channel.py", line 990, in _end_unary_response_blocking
+    raise _InactiveRpcError(state)  # pytype: disable=not-instantiable
+    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+grpc._channel._InactiveRpcError: <_InactiveRpcError of RPC that terminated with:
+	status = StatusCode.NOT_FOUND
+	details = "models/gemini-pro is not found for API version v1beta, or is not supported for generateContent. Call ListModels to see the list of available models and their supported methods."
+	debug_error_string = "UNKNOWN:Error received from peer ipv6:%5B2a00:1450:400d:812::200a%5D:443 {grpc_status:5, grpc_message:"models/gemini-pro is not found for API version v1beta, or is not supported for generateContent. Call ListModels to see the list of available models and their supported methods."}"
+>
+
+The above exception was the direct cause of the following exception:
+
+Traceback (most recent call last):
+  File "C:\Users\iboci\Live-Trading-bot\AI_Prototype\src\core\llm_router.py", line 119, in route_to_system_2
+    response = self.model.generate_content(
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\iboci\Live-Trading-bot\AI_Prototype\.venv\Lib\site-packages\google\generativeai\generative_models.py", line 243, in generate_content
+    response = self._client.generate_content(request)
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\iboci\Live-Trading-bot\AI_Prototype\.venv\Lib\site-packages\google\ai\generativelanguage_v1beta\services\generative_service\client.py", line 566, in generate_content
+    response = rpc(
+               ^^^^
+  File "C:\Users\iboci\Live-Trading-bot\AI_Prototype\.venv\Lib\site-packages\google\api_core\gapic_v1\method.py", line 128, in __call__
+    return wrapped_func(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\iboci\Live-Trading-bot\AI_Prototype\.venv\Lib\site-packages\google\api_core\retry\retry_unary.py", line 294, in retry_wrapped_func
+    return retry_target(
+           ^^^^^^^^^^^^^
+  File "C:\Users\iboci\Live-Trading-bot\AI_Prototype\.venv\Lib\site-packages\google\api_core\retry\retry_unary.py", line 156, in retry_target
+    next_sleep = _retry_error_helper(
+                 ^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\iboci\Live-Trading-bot\AI_Prototype\.venv\Lib\site-packages\google\api_core\retry\retry_base.py", line 216, in _retry_error_helper
+    raise final_exc from source_exc
+  File "C:\Users\iboci\Live-Trading-bot\AI_Prototype\.venv\Lib\site-packages\google\api_core\retry\retry_unary.py", line 147, in retry_target
+    result = target()
+             ^^^^^^^^
+  File "C:\Users\iboci\Live-Trading-bot\AI_Prototype\.venv\Lib\site-packages\google\api_core\timeout.py", line 130, in func_with_timeout
+    return func(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\iboci\Live-Trading-bot\AI_Prototype\.venv\Lib\site-packages\google\api_core\grpc_helpers.py", line 57, in error_remapped_callable
+    raise exceptions.from_grpc_error(exc) from exc
+google.api_core.exceptions.NotFound: 404 models/gemini-pro is not found for API version v1beta, or is not supported for generateContent. Call ListModels to see the list of available models and their supported methods.
+2026-04-15 00:06:23,877 - src.core.executive - ERROR - Failed to generate response: 404 models/gemini-pro is not found for API version v1beta, or is not supported for generateContent. Call ListModels to see the list of available models and their supported methods.
+Traceback (most recent call last):
+  File "C:\Users\iboci\Live-Trading-bot\AI_Prototype\.venv\Lib\site-packages\google\api_core\grpc_helpers.py", line 55, in error_remapped_callable
+    return callable_(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\iboci\Live-Trading-bot\AI_Prototype\.venv\Lib\site-packages\grpc\_channel.py", line 1159, in __call__
+    return _end_unary_response_blocking(state, call, False, None)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\iboci\Live-Trading-bot\AI_Prototype\.venv\Lib\site-packages\grpc\_channel.py", line 990, in _end_unary_response_blocking
+    raise _InactiveRpcError(state)  # pytype: disable=not-instantiable
+    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+grpc._channel._InactiveRpcError: <_InactiveRpcError of RPC that terminated with:
+	status = StatusCode.NOT_FOUND
+	details = "models/gemini-pro is not found for API version v1beta, or is not supported for generateContent. Call ListModels to see the list of available models and their supported methods."
+	debug_error_string = "UNKNOWN:Error received from peer ipv6:%5B2a00:1450:400d:812::200a%5D:443 {grpc_status:5, grpc_message:"models/gemini-pro is not found for API version v1beta, or is not supported for generateContent. Call ListModels to see the list of available models and their supported methods."}"
+>
+
+The above exception was the direct cause of the following exception:
+
+Traceback (most recent call last):
+  File "C:\Users\iboci\Live-Trading-bot\AI_Prototype\src\core\executive.py", line 196, in process_message
+    ai_response = self.cognitive_router.route_to_system_2(
+                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\iboci\Live-Trading-bot\AI_Prototype\src\core\llm_router.py", line 119, in route_to_system_2
+    response = self.model.generate_content(
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\iboci\Live-Trading-bot\AI_Prototype\.venv\Lib\site-packages\google\generativeai\generative_models.py", line 243, in generate_content
+    response = self._client.generate_content(request)
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\iboci\Live-Trading-bot\AI_Prototype\.venv\Lib\site-packages\google\ai\generativelanguage_v1beta\services\generative_service\client.py", line 566, in generate_content
+    response = rpc(
+               ^^^^
+  File "C:\Users\iboci\Live-Trading-bot\AI_Prototype\.venv\Lib\site-packages\google\api_core\gapic_v1\method.py", line 128, in __call__
+    return wrapped_func(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\iboci\Live-Trading-bot\AI_Prototype\.venv\Lib\site-packages\google\api_core\retry\retry_unary.py", line 294, in retry_wrapped_func
+    return retry_target(
+           ^^^^^^^^^^^^^
+  File "C:\Users\iboci\Live-Trading-bot\AI_Prototype\.venv\Lib\site-packages\google\api_core\retry\retry_unary.py", line 156, in retry_target
+    next_sleep = _retry_error_helper(
+                 ^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\iboci\Live-Trading-bot\AI_Prototype\.venv\Lib\site-packages\google\api_core\retry\retry_base.py", line 216, in _retry_error_helper
+    raise final_exc from source_exc
+  File "C:\Users\iboci\Live-Trading-bot\AI_Prototype\.venv\Lib\site-packages\google\api_core\retry\retry_unary.py", line 147, in retry_target
+    result = target()
+             ^^^^^^^^
+  File "C:\Users\iboci\Live-Trading-bot\AI_Prototype\.venv\Lib\site-packages\google\api_core\timeout.py", line 130, in func_with_timeout
+    return func(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\iboci\Live-Trading-bot\AI_Prototype\.venv\Lib\site-packages\google\api_core\grpc_helpers.py", line 57, in error_remapped_callable
+    raise exceptions.from_grpc_error(exc) from exc
+google.api_core.exceptions.NotFound: 404 models/gemini-pro is not found for API version v1beta, or is not supported for generateContent. Call ListModels to see the list of available models and their supported methods.
+2026-04-15 00:06:23,950 - httpx - INFO - HTTP Request: POST https://api.telegram.org/bot8069214468:AAHVVL4vdqq7B7C-5w7tGEHB_5FkkU6zxdc/getUpdates "HTTP/1.1 409 Conflict"
+2026-04-15 00:06:23,952 - telegram.ext.Updater - ERROR - Error while getting Updates: Conflict: terminated by other getUpdates request; make sure that only one bot instance is running
+2026-04-15 00:06:23,953 - telegram.ext.Application - ERROR - No error handlers are registered, logging exception.
+Traceback (most recent call last):
+  File "C:\Users\iboci\Live-Trading-bot\AI_Prototype\.venv\Lib\site-packages\telegram\ext\_updater.py", line 688, in _network_loop_retry
+    if not await action_cb():
+           ^^^^^^^^^^^^^^^^^
+  File "C:\Users\iboci\Live-Trading-bot\AI_Prototype\.venv\Lib\site-packages\telegram\ext\_updater.py", line 384, in polling_action_cb
+    raise exc
+  File "C:\Users\iboci\Live-Trading-bot\AI_Prototype\.venv\Lib\site-packages\telegram\ext\_updater.py", line 373, in polling_action_cb
+    updates = await self.bot.get_updates(
+              ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\iboci\Live-Trading-bot\AI_Prototype\.venv\Lib\site-packages\telegram\ext\_extbot.py", line 558, in get_updates
+    updates = await super().get_updates(
+              ^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\iboci\Live-Trading-bot\AI_Prototype\.venv\Lib\site-packages\telegram\_bot.py", line 525, in decorator
+    result = await func(self, *args, **kwargs)  # skipcq: PYL-E1102
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\iboci\Live-Trading-bot\AI_Prototype\.venv\Lib\site-packages\telegram\_bot.py", line 3584, in get_updates
+    await self._post(
+  File "C:\Users\iboci\Live-Trading-bot\AI_Prototype\.venv\Lib\site-packages\telegram\_bot.py", line 613, in _post
+    return await self._do_post(
+           ^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\iboci\Live-Trading-bot\AI_Prototype\.venv\Lib\site-packages\telegram\ext\_extbot.py", line 340, in _do_post
+    return await super()._do_post(
+           ^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\iboci\Live-Trading-bot\AI_Prototype\.venv\Lib\site-packages\telegram\_bot.py", line 641, in _do_post
+    return await request.post(
+           ^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\iboci\Live-Trading-bot\AI_Prototype\.venv\Lib\site-packages\telegram\request\_baserequest.py", line 200, in post
+    result = await self._request_wrapper(
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\iboci\Live-Trading-bot\AI_Prototype\.venv\Lib\site-packages\telegram\request\_baserequest.py", line 381, in _request_wrapper
+    raise Conflict(message)
+telegram.error.Conflict: Conflict: terminated by other getUpdates request; make sure that only one bot instance is running
+2026-04-15 00:06:24,011 - httpx - INFO - HTTP Request: POST https://api.telegram.org/bot8069214468:AAHVVL4vdqq7B7C-5w7tGEHB_5FkkU6zxdc/sendMessage "HTTP/1.1 200 OK"
+2026-04-15 00:06:24,014 - src.interfaces.telegram_bot - INFO - Response sent to user 8769582575
+2026-04-15 00:06:28,000 - httpx - INFO - HTTP Request: POST https://api.telegram.org/bot8069214468:AAHVVL4vdqq7B7C-5w7tGEHB_5FkkU6zxdc/getUpdates "HTTP/1.1 409 Conflict"
+2026-04-15 00:06:28,001 - telegram.ext.Updater - ERROR - Error while getting Updates: Conflict: terminated by other getUpdates request; make sure that only one bot instance is running
+2026-04-15 00:06:28,001 - telegram.ext.Application - ERROR - No error handlers are registered, logging exception.
+Traceback (most recent call last):
+  File "C:\Users\iboci\AppData\Local\Packages\PythonSoftwareFoundation.Python.3.11_qbz5n2kfra8p0\LocalCache\local-packages\Python311\site-packages\telegram\ext\_updater.py", line 688, in _network_loop_retry
+    if not await action_cb():
+           ^^^^^^^^^^^^^^^^^
+  File "C:\Users\iboci\AppData\Local\Packages\PythonSoftwareFoundation.Python.3.11_qbz5n2kfra8p0\LocalCache\local-packages\Python311\site-packages\telegram\ext\_updater.py", line 384, in polling_action_cb
+    raise exc
+  File "C:\Users\iboci\AppData\Local\Packages\PythonSoftwareFoundation.Python.3.11_qbz5n2kfra8p0\LocalCache\local-packages\Python311\site-packages\telegram\ext\_updater.py", line 373, in polling_action_cb
+    updates = await self.bot.get_updates(
+              ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\iboci\AppData\Local\Packages\PythonSoftwareFoundation.Python.3.11_qbz5n2kfra8p0\LocalCache\local-packages\Python311\site-packages\telegram\ext\_extbot.py", line 558, in get_updates
+    updates = await super().get_updates(
+              ^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\iboci\AppData\Local\Packages\PythonSoftwareFoundation.Python.3.11_qbz5n2kfra8p0\LocalCache\local-packages\Python311\site-packages\telegram\_bot.py", line 525, in decorator
+    result = await func(self, *args, **kwargs)  # skipcq: PYL-E1102
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\iboci\AppData\Local\Packages\PythonSoftwareFoundation.Python.3.11_qbz5n2kfra8p0\LocalCache\local-packages\Python311\site-packages\telegram\_bot.py", line 3584, in get_updates
+    await self._post(
+  File "C:\Users\iboci\AppData\Local\Packages\PythonSoftwareFoundation.Python.3.11_qbz5n2kfra8p0\LocalCache\local-packages\Python311\site-packages\telegram\_bot.py", line 613, in _post
+    return await self._do_post(
+           ^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\iboci\AppData\Local\Packages\PythonSoftwareFoundation.Python.3.11_qbz5n2kfra8p0\LocalCache\local-packages\Python311\site-packages\telegram\ext\_extbot.py", line 340, in _do_post
+    return await super()._do_post(
+           ^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\iboci\AppData\Local\Packages\PythonSoftwareFoundation.Python.3.11_qbz5n2kfra8p0\LocalCache\local-packages\Python311\site-packages\telegram\_bot.py", line 641, in _do_post
+    return await request.post(
+           ^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\iboci\AppData\Local\Packages\PythonSoftwareFoundation.Python.3.11_qbz5n2kfra8p0\LocalCache\local-packages\Python311\site-packages\telegram\request\_baserequest.py", line 200, in post
+    result = await self._request_wrapper(
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\iboci\AppData\Local\Packages\PythonSoftwareFoundation.Python.3.11_qbz5n2kfra8p0\LocalCache\local-packages\Python311\site-packages\telegram\request\_baserequest.py", line 381, in _request_wrapper
+    raise Conflict(message)
+telegram.error.Conflict: Conflict: terminated by other getUpdates request; make sure that only one bot instance is running
+2026-04-15 00:06:33,161 - httpx - INFO - HTTP Request: POST https://api.telegram.org/bot8069214468:AAHVVL4vdqq7B7C-5w7tGEHB_5FkkU6zxdc/getUpdates "HTTP/1.1 409 Conflict"
+2026-04-15 00:06:33,163 - telegram.ext.Updater - ERROR - Error while getting Updates: Conflict: terminated by other getUpdates request; make sure that only one bot instance is running
+2026-04-15 00:06:33,163 - telegram.ext.Application - ERROR - No error handlers are registered, logging exception.
+Traceback (most recent call last):
+  File "C:\Users\iboci\Live-Trading-bot\AI_Prototype\.venv\Lib\site-packages\telegram\ext\_updater.py", line 688, in _network_loop_retry
+    if not await action_cb():
+           ^^^^^^^^^^^^^^^^^
+  File "C:\Users\iboci\Live-Trading-bot\AI_Prototype\.venv\Lib\site-packages\telegram\ext\_updater.py", line 384, in polling_action_cb
+    raise exc
+  File "C:\Users\iboci\Live-Trading-bot\AI_Prototype\.venv\Lib\site-packages\telegram\ext\_updater.py", line 373, in polling_action_cb
+    updates = await self.bot.get_updates(
+              ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\iboci\Live-Trading-bot\AI_Prototype\.venv\Lib\site-packages\telegram\ext\_extbot.py", line 558, in get_updates
+    updates = await super().get_updates(
+              ^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\iboci\Live-Trading-bot\AI_Prototype\.venv\Lib\site-packages\telegram\_bot.py", line 525, in decorator
+    result = await func(self, *args, **kwargs)  # skipcq: PYL-E1102
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\iboci\Live-Trading-bot\AI_Prototype\.venv\Lib\site-packages\telegram\_bot.py", line 3584, in get_updates
+    await self._post(
+  File "C:\Users\iboci\Live-Trading-bot\AI_Prototype\.venv\Lib\site-packages\telegram\_bot.py", line 613, in _post
+    return await self._do_post(
+           ^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\iboci\Live-Trading-bot\AI_Prototype\.venv\Lib\site-packages\telegram\ext\_extbot.py", line 340, in _do_post
+    return await super()._do_post(
+           ^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\iboci\Live-Trading-bot\AI_Prototype\.venv\Lib\site-packages\telegram\_bot.py", line 641, in _do_post
+    return await request.post(
+           ^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\iboci\Live-Trading-bot\AI_Prototype\.venv\Lib\site-packages\telegram\request\_baserequest.py", line 200, in post
+    result = await self._request_wrapper(
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\iboci\Live-Trading-bot\AI_Prototype\.venv\Lib\site-packages\telegram\request\_baserequest.py", line 381, in _request_wrapper
+    raise Conflict(message)
+telegram.error.Conflict: Conflict: terminated by other getUpdates request; make sure that only one bot instance is running
+2026-04-15 00:06:37,696 - httpx - INFO - HTTP Request: POST https://api.telegram.org/bot8069214468:AAHVVL4vdqq7B7C-5w7tGEHB_5FkkU6zxdc/getUpdates "HTTP/1.1 409 Conflict"
+2026-04-15 00:06:37,698 - telegram.ext.Updater - ERROR - Error while getting Updates: Conflict: terminated by other getUpdates request; make sure that only one bot instance is running
+2026-04-15 00:06:37,698 - telegram.ext.Application - ERROR - No error handlers are registered, logging exception.
+Traceback (most recent call last):
+  File "C:\Users\iboci\AppData\Local\Packages\PythonSoftwareFoundation.Python.3.11_qbz5n2kfra8p0\LocalCache\local-packages\Python311\site-packages\telegram\ext\_updater.py", line 688, in _network_loop_retry
+    if not await action_cb():
+           ^^^^^^^^^^^^^^^^^
+  File "C:\Users\iboci\AppData\Local\Packages\PythonSoftwareFoundation.Python.3.11_qbz5n2kfra8p0\LocalCache\local-packages\Python311\site-packages\telegram\ext\_updater.py", line 384, in polling_action_cb
+    raise exc
+  File "C:\Users\iboci\AppData\Local\Packages\PythonSoftwareFoundation.Python.3.11_qbz5n2kfra8p0\LocalCache\local-packages\Python311\site-packages\telegram\ext\_updater.py", line 373, in polling_action_cb
+    updates = await self.bot.get_updates(
+              ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\iboci\AppData\Local\Packages\PythonSoftwareFoundation.Python.3.11_qbz5n2kfra8p0\LocalCache\local-packages\Python311\site-packages\telegram\ext\_extbot.py", line 558, in get_updates
+    updates = await super().get_updates(
+              ^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\iboci\AppData\Local\Packages\PythonSoftwareFoundation.Python.3.11_qbz5n2kfra8p0\LocalCache\local-packages\Python311\site-packages\telegram\_bot.py", line 525, in decorator
+    result = await func(self, *args, **kwargs)  # skipcq: PYL-E1102
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\iboci\AppData\Local\Packages\PythonSoftwareFoundation.Python.3.11_qbz5n2kfra8p0\LocalCache\local-packages\Python311\site-packages\telegram\_bot.py", line 3584, in get_updates
+    await self._post(
+  File "C:\Users\iboci\AppData\Local\Packages\PythonSoftwareFoundation.Python.3.11_qbz5n2kfra8p0\LocalCache\local-packages\Python311\site-packages\telegram\_bot.py", line 613, in _post
+    return await self._do_post(
+           ^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\iboci\AppData\Local\Packages\PythonSoftwareFoundation.Python.3.11_qbz5n2kfra8p0\LocalCache\local-packages\Python311\site-packages\telegram\ext\_extbot.py", line 340, in _do_post
+    return await super()._do_post(
+           ^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\iboci\AppData\Local\Packages\PythonSoftwareFoundation.Python.3.11_qbz5n2kfra8p0\LocalCache\local-packages\Python311\site-packages\telegram\_bot.py", line 641, in _do_post
+    return await request.post(
+           ^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\iboci\AppData\Local\Packages\PythonSoftwareFoundation.Python.3.11_qbz5n2kfra8p0\LocalCache\local-packages\Python311\site-packages\telegram\request\_baserequest.py", line 200, in post
+    result = await self._request_wrapper(
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\iboci\AppData\Local\Packages\PythonSoftwareFoundation.Python.3.11_qbz5n2kfra8p0\LocalCache\local-packages\Python311\site-packages\telegram\request\_baserequest.py", line 381, in _request_wrapper
+    raise Conflict(message)
+telegram.error.Conflict: Conflict: terminated by other getUpdates request; make sure that only one bot instance is running
+2026-04-15 00:06:44,696 - httpx - INFO - HTTP Request: POST https://api.telegram.org/bot8069214468:AAHVVL4vdqq7B7C-5w7tGEHB_5FkkU6zxdc/getUpdates "HTTP/1.1 200 OK"
+2026-04-15 00:06:45,361 - httpx - INFO - HTTP Request: POST https://api.telegram.org/bot8069214468:AAHVVL4vdqq7B7C-5w7tGEHB_5FkkU6zxdc/getUpdates "HTTP/1.1 409 Conflict"
+2026-04-15 00:06:45,362 - telegram.ext.Updater - ERROR - Error while getting Updates: Conflict: terminated by other getUpdates request; make sure that only one bot instance is running
+2026-04-15 00:06:45,362 - telegram.ext.Application - ERROR - No error handlers are registered, logging exception.
+Traceback (most recent call last):
+  File "C:\Users\iboci\Live-Trading-bot\AI_Prototype\.venv\Lib\site-packages\telegram\ext\_updater.py", line 688, in _network_loop_retry
+    if not await action_cb():
+           ^^^^^^^^^^^^^^^^^
+  File "C:\Users\iboci\Live-Trading-bot\AI_Prototype\.venv\Lib\site-packages\telegram\ext\_updater.py", line 384, in polling_action_cb
+    raise exc
+  File "C:\Users\iboci\Live-Trading-bot\AI_Prototype\.venv\Lib\site-packages\telegram\ext\_updater.py", line 373, in polling_action_cb
+    updates = await self.bot.get_updates(
+              ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\iboci\Live-Trading-bot\AI_Prototype\.venv\Lib\site-packages\telegram\ext\_extbot.py", line 558, in get_updates
+    updates = await super().get_updates(
+              ^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\iboci\Live-Trading-bot\AI_Prototype\.venv\Lib\site-packages\telegram\_bot.py", line 525, in decorator
+    result = await func(self, *args, **kwargs)  # skipcq: PYL-E1102
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\iboci\Live-Trading-bot\AI_Prototype\.venv\Lib\site-packages\telegram\_bot.py", line 3584, in get_updates
+    await self._post(
+  File "C:\Users\iboci\Live-Trading-bot\AI_Prototype\.venv\Lib\site-packages\telegram\_bot.py", line 613, in _post
+    return await self._do_post(
+           ^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\iboci\Live-Trading-bot\AI_Prototype\.venv\Lib\site-packages\telegram\ext\_extbot.py", line 340, in _do_post
+    return await super()._do_post(
+           ^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\iboci\Live-Trading-bot\AI_Prototype\.venv\Lib\site-packages\telegram\_bot.py", line 641, in _do_post
+    return await request.post(
+           ^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\iboci\Live-Trading-bot\AI_Prototype\.venv\Lib\site-packages\telegram\request\_baserequest.py", line 200, in post
+    result = await self._request_wrapper(
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\iboci\Live-Trading-bot\AI_Prototype\.venv\Lib\site-packages\telegram\request\_baserequest.py", line 381, in _request_wrapper
+    raise Conflict(message)
+telegram.error.Conflict: Conflict: terminated by other getUpdates request; make sure that only one bot instance is running
+2026-04-15 00:06:49,405 - httpx - INFO - HTTP Request: POST https://api.telegram.org/bot8069214468:AAHVVL4vdqq7B7C-5w7tGEHB_5FkkU6zxdc/getUpdates "HTTP/1.1 409 Conflict"
+2026-04-15 00:06:49,406 - telegram.ext.Updater - ERROR - Error while getting Updates: Conflict: terminated by other getUpdates request; make sure that only one bot instance is running
+2026-04-15 00:06:49,406 - telegram.ext.Application - ERROR - No error handlers are registered, logging exception.
+Traceback (most recent call last):
+  File "C:\Users\iboci\AppData\Local\Packages\PythonSoftwareFoundation.Python.3.11_qbz5n2kfra8p0\LocalCache\local-packages\Python311\site-packages\telegram\ext\_updater.py", line 688, in _network_loop_retry
+    if not await action_cb():
+           ^^^^^^^^^^^^^^^^^
+  File "C:\Users\iboci\AppData\Local\Packages\PythonSoftwareFoundation.Python.3.11_qbz5n2kfra8p0\LocalCache\local-packages\Python311\site-packages\telegram\ext\_updater.py", line 384, in polling_action_cb
+    raise exc
+  File "C:\Users\iboci\AppData\Local\Packages\PythonSoftwareFoundation.Python.3.11_qbz5n2kfra8p0\LocalCache\local-packages\Python311\site-packages\telegram\ext\_updater.py", line 373, in polling_action_cb
+    updates = await self.bot.get_updates(
+              ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\iboci\AppData\Local\Packages\PythonSoftwareFoundation.Python.3.11_qbz5n2kfra8p0\LocalCache\local-packages\Python311\site-packages\telegram\ext\_extbot.py", line 558, in get_updates
+    updates = await super().get_updates(
+              ^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\iboci\AppData\Local\Packages\PythonSoftwareFoundation.Python.3.11_qbz5n2kfra8p0\LocalCache\local-packages\Python311\site-packages\telegram\_bot.py", line 525, in decorator
+    result = await func(self, *args, **kwargs)  # skipcq: PYL-E1102
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\iboci\AppData\Local\Packages\PythonSoftwareFoundation.Python.3.11_qbz5n2kfra8p0\LocalCache\local-packages\Python311\site-packages\telegram\_bot.py", line 3584, in get_updates
+    await self._post(
+  File "C:\Users\iboci\AppData\Local\Packages\PythonSoftwareFoundation.Python.3.11_qbz5n2kfra8p0\LocalCache\local-packages\Python311\site-packages\telegram\_bot.py", line 613, in _post
+    return await self._do_post(
+           ^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\iboci\AppData\Local\Packages\PythonSoftwareFoundation.Python.3.11_qbz5n2kfra8p0\LocalCache\local-packages\Python311\site-packages\telegram\ext\_extbot.py", line 340, in _do_post
+    return await super()._do_post(
+           ^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\iboci\AppData\Local\Packages\PythonSoftwareFoundation.Python.3.11_qbz5n2kfra8p0\LocalCache\local-packages\Python311\site-packages\telegram\_bot.py", line 641, in _do_post
+    return await request.post(
+           ^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\iboci\AppData\Local\Packages\PythonSoftwareFoundation.Python.3.11_qbz5n2kfra8p0\LocalCache\local-packages\Python311\site-packages\telegram\request\_baserequest.py", line 200, in post
+    result = await self._request_wrapper(
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\iboci\AppData\Local\Packages\PythonSoftwareFoundation.Python.3.11_qbz5n2kfra8p0\LocalCache\local-packages\Python311\site-packages\telegram\request\_baserequest.py", line 381, in _request_wrapper
+    raise Conflict(message)
+telegram.error.Conflict: Conflict: terminated by other getUpdates request; make sure that only one bot instance is running
+2026-04-15 00:06:56,402 - httpx - INFO - HTTP Request: POST https://api.telegram.org/bot8069214468:AAHVVL4vdqq7B7C-5w7tGEHB_5FkkU6zxdc/getUpdates "HTTP/1.1 200 OK"
+2026-04-15 00:06:59,800 - src.interfaces.telegram_bot - INFO - Bot interrupted by user
+2026-04-15 00:06:59,801 - src.interfaces.telegram_bot - INFO - Shutting down ExecutiveAgent...
+2026-04-15 00:06:59,801 - src.core.executive - INFO - Closing ExecutiveAgent
+2026-04-15 00:06:59,802 - src.memory.ledger_db - INFO - LedgerMemory connection closed
+2026-04-15 00:06:59,802 - src.core.executive - INFO - ExecutiveAgent shutdown complete
