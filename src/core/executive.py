@@ -234,7 +234,7 @@ class ExecutiveAgent:
                 logger.info(f"Response generated ({len(ai_response)} chars)")
 
             except Exception as e:
-                error_response = f"System error: {str(e)}"
+                error_response = "An internal error occurred while generating the response."
                 logger.error(f"Failed to generate response: {e}", exc_info=True)
                 self.ledger_memory.log_event(
                     LogLevel.ERROR,
@@ -273,8 +273,8 @@ class ExecutiveAgent:
             return ai_response
 
         except Exception as e:
-            error_msg = f"Critical error in process_message: {str(e)}"
-            logger.error(error_msg, exc_info=True)
+            error_msg = "A critical error occurred while processing your message."
+            logger.error(f"Critical error in process_message: {e}", exc_info=True)
             return error_msg
 
     def close(self) -> None:

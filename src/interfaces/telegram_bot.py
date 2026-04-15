@@ -106,9 +106,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
         # Process the message through the ExecutiveAgent
         if executive_agent is None:
-            error_msg = "Executive Agent not initialized"
-            logger.error(error_msg)
-            await update.message.reply_text(f"System error: {error_msg}")
+            logger.error("Executive Agent not initialized")
+            await update.message.reply_text("System error: Service temporarily unavailable.")
             return
 
         # Process message (may call external APIs - handle timeouts)
@@ -124,8 +123,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         await update.message.reply_text(timeout_msg)
 
     except Exception as e:
-        error_msg = f"Error processing message: {str(e)}"
-        logger.error(error_msg, exc_info=True)
+        logger.error(f"Error processing message: {e}", exc_info=True)
         await update.message.reply_text("An error occurred while processing your message. Please try again.")
 
 
