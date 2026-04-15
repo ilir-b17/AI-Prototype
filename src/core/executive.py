@@ -13,7 +13,8 @@ from typing import Optional, Dict, Any, List
 
 from src.memory.vector_db import VectorMemory
 from src.memory.ledger_db import LedgerMemory, LogLevel
-from src.core.llm_router import CognitiveRouter
+from src.core.llm_router import CognitiveRouter, RequiresMFAError
+from src.core.security import verify_mfa_challenge
 
 logger = logging.getLogger(__name__)
 
@@ -58,6 +59,9 @@ class ExecutiveAgent:
 
             # Load Charter
             self.charter_text = self._load_charter()
+
+            # MFA state tracking
+            self.pending_mfa = {}
 
             logger.info("ExecutiveAgent initialized successfully")
             self.ledger_memory.log_event(
@@ -159,7 +163,7 @@ class ExecutiveAgent:
         logger.debug("Routing to System 1 (default)")
         return "system_1"
 
-    async def process_message(self, user_message: str) -> str:
+    async def process_message(self, user_message: str, user_id: str) -> str:
         """
         Process a user message through the executive pipeline.
 
@@ -174,6 +178,7 @@ class ExecutiveAgent:
 
         Args:
             user_message: The user's input message.
+            user_id: The ID of the user sending the message.
 
         Returns:
             str: The final response from the AI system.
@@ -185,6 +190,41 @@ class ExecutiveAgent:
             error_msg = "Invalid user message"
             logger.warning(error_msg)
             return f"Error: {error_msg}"
+
+        # Handle pending MFA challenge
+        if user_id in self.pending_mfa:
+            pending_tool = self.pending_mfa[user_id]
+            logger.info(f"Processing MFA challenge for user {user_id}")
+
+            if verify_mfa_challenge(user_message):
+                logger.info(f"MFA passed for user {user_id}")
+                del self.pending_mfa[user_id]
+
+                # Execute the pending tool
+                result = await self.cognitive_router._execute_tool(
+                    pending_tool["name"],
+                    pending_tool["arguments"]
+                )
+
+                self.ledger_memory.log_event(
+                    LogLevel.INFO,
+                    "MFA passed and sensitive action executed",
+                    {"user_id": user_id, "tool": pending_tool["name"]}
+                )
+
+                return result
+            else:
+                logger.warning(f"MFA failed for user {user_id}")
+                del self.pending_mfa[user_id]
+
+                self.ledger_memory.log_event(
+                    LogLevel.WARNING,
+                    "MFA authorization failed",
+                    {"user_id": user_id, "tool": pending_tool["name"]}
+                )
+
+                return "Error: MFA authorization failed. Action aborted."
+
 
         try:
             logger.info(f"Processing message: {user_message[:50]}...")
@@ -233,6 +273,18 @@ class ExecutiveAgent:
 
                 logger.info(f"Response generated ({len(ai_response)} chars)")
 
+            except RequiresMFAError as mfa_err:
+                self.pending_mfa[user_id] = {
+                    "name": mfa_err.tool_name,
+                    "arguments": mfa_err.arguments
+                }
+                logger.info(f"MFA challenge triggered for user {user_id}")
+                self.ledger_memory.log_event(
+                    LogLevel.WARNING,
+                    "Security lock triggered",
+                    {"user_id": user_id, "tool": mfa_err.tool_name}
+                )
+                return "SECURITY LOCK: To authorize this core change, please complete the phrase: 'The sky is...'"
             except Exception as e:
                 error_response = "An internal error occurred while generating the response."
                 logger.error(f"Failed to generate response: {e}", exc_info=True)

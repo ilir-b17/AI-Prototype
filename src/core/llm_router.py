@@ -8,9 +8,19 @@ API (System 2) for complex, analytical reasoning.
 
 import os
 import logging
+import json
 from typing import Optional, Dict, Any, List
 import google.generativeai as genai
 import ollama
+
+from src.tools.system_tools import SYSTEM_TOOLS_SCHEMA, update_ledger, request_core_update
+
+class RequiresMFAError(Exception):
+    """Exception raised when a tool call requires MFA."""
+    def __init__(self, tool_name: str, arguments: dict):
+        self.tool_name = tool_name
+        self.arguments = arguments
+        super().__init__(f"MFA required for tool: {tool_name}")
 
 logger = logging.getLogger(__name__)
 
@@ -28,6 +38,31 @@ class CognitiveRouter:
     System 1 (Local): Fast, pattern-matching based responses
     System 2 (Gemini): Complex reasoning, multi-step analysis, creative tasks
     """
+
+    async def _execute_tool(self, tool_name: str, arguments: dict) -> str:
+        """
+        Executes the specified tool locally and returns the result.
+        """
+        logger.info(f"Executing tool: {tool_name} with arguments: {arguments}")
+
+        try:
+            if tool_name == "update_ledger":
+                result = await update_ledger(
+                    task_description=arguments.get("task_description", ""),
+                    priority=arguments.get("priority", 5)
+                )
+                return result
+            elif tool_name == "request_core_update":
+                result = await request_core_update(
+                    component=arguments.get("component", ""),
+                    proposed_change=arguments.get("proposed_change", "")
+                )
+                return result
+            else:
+                return f"Error: Unknown tool {tool_name}."
+        except Exception as e:
+            logger.error(f"Error executing tool {tool_name}: {e}", exc_info=True)
+            return f"Error: Failed to execute tool due to [{str(e)}]."
 
     def __init__(self, model_name: str = "gemini-3.1-pro-preview") -> None:
         """
@@ -66,17 +101,72 @@ class CognitiveRouter:
 
         try:
             client = ollama.AsyncClient()
-            response = await client.chat(model='gemma4', messages=messages)
 
-            if response and 'message' in response and 'content' in response['message']:
-                result = response['message']['content'].strip()
-                logger.info(f"System 1 response received ({len(result)} chars)")
-                logger.debug(f"System 1 response: {result[:100]}...")
-                return result
-            else:
-                error_msg = "Unexpected response format from Ollama"
-                logger.warning(error_msg)
-                return f"[System 1 - Error]: {error_msg}"
+            # Format tools for Ollama
+            ollama_tools = []
+            for tool in SYSTEM_TOOLS_SCHEMA:
+                # Ollama format requires 'type': 'function' and 'function': {schema}
+                ollama_tools.append({
+                    "type": "function",
+                    "function": {
+                        "name": tool["name"],
+                        "description": tool["description"],
+                        "parameters": tool["parameters"]
+                    }
+                })
+
+            response = await client.chat(
+                model='gemma4',
+                messages=messages,
+                tools=ollama_tools
+            )
+
+            # Check for tool calls
+            if response and 'message' in response:
+                message = response['message']
+
+                if 'tool_calls' in message and message['tool_calls']:
+                    # Handle tool calls
+                    tool_call = message['tool_calls'][0]['function']
+                    tool_name = tool_call['name']
+                    arguments = tool_call.get('arguments', {})
+
+                    # Intercept sensitive core updates
+                    if tool_name == "request_core_update":
+                        raise RequiresMFAError(tool_name, arguments)
+
+                    # Pause, call execute tool
+                    tool_result = await self._execute_tool(tool_name, arguments)
+
+                    # Append result back to messages to get final response
+                    messages.append(message) # Append assistant's tool call
+                    messages.append({
+                        "role": "tool",
+                        "content": tool_result,
+                        "name": tool_name
+                    })
+
+                    # Call model again
+                    final_response = await client.chat(
+                        model='gemma4',
+                        messages=messages,
+                        tools=ollama_tools
+                    )
+
+                    if final_response and 'message' in final_response and 'content' in final_response['message']:
+                        return final_response['message']['content'].strip()
+                    return "Error parsing final response after tool call."
+
+                # Standard text response
+                elif 'content' in message:
+                    result = message['content'].strip()
+                    logger.info(f"System 1 response received ({len(result)} chars)")
+                    logger.debug(f"System 1 response: {result[:100]}...")
+                    return result
+
+            error_msg = "Unexpected response format from Ollama"
+            logger.warning(error_msg)
+            return f"[System 1 - Error]: {error_msg}"
 
         except Exception as e:
             error_msg = f"System 1 (Ollama) error: {str(e)}. Is the local server running at localhost:11434?"
@@ -137,6 +227,9 @@ class CognitiveRouter:
             if system_instruction and gemini_messages and gemini_messages[0]["role"] == "user":
                  gemini_messages[0]["parts"][0]["text"] = f"System Instruction: {system_instruction}\n\n{gemini_messages[0]['parts'][0]['text']}"
 
+            # Format tools for Gemini API
+            gemini_tools = [{"function_declarations": SYSTEM_TOOLS_SCHEMA}]
+
             # Call Gemini API
             response = await self.model.generate_content_async(
                 gemini_messages,
@@ -144,10 +237,64 @@ class CognitiveRouter:
                     temperature=0.7,
                     top_p=0.95,
                     max_output_tokens=512,
-                )
+                ),
+                tools=gemini_tools
             )
 
-            # Extract text from response
+            # Handle tool calls
+            if response and response.candidates and response.candidates[0].content.parts:
+                parts = response.candidates[0].content.parts
+
+                # Check if it's a function call
+                for part in parts:
+                    if "function_call" in part:
+                        func_call = part.function_call
+                        tool_name = func_call.name
+
+                        # Convert protobuf mapping to dict
+                        arguments = {k: v for k, v in func_call.args.items()}
+
+                        logger.info(f"System 2 requested tool call: {tool_name}")
+
+                        if tool_name == "request_core_update":
+                            raise RequiresMFAError(tool_name, arguments)
+
+                        # Execute tool
+                        tool_result = await self._execute_tool(tool_name, arguments)
+
+                        # Append the function call from the model
+                        gemini_messages.append({
+                            "role": "model",
+                            "parts": [part]
+                        })
+
+                        # Append the function response
+                        gemini_messages.append({
+                            "role": "user",
+                            "parts": [{
+                                "function_response": {
+                                    "name": tool_name,
+                                    "response": {"result": tool_result}
+                                }
+                            }]
+                        })
+
+                        # Get final response
+                        final_response = await self.model.generate_content_async(
+                            gemini_messages,
+                            generation_config=genai.types.GenerationConfig(
+                                temperature=0.7,
+                                top_p=0.95,
+                                max_output_tokens=512,
+                            ),
+                            tools=gemini_tools
+                        )
+
+                        if final_response and final_response.text:
+                            return final_response.text.strip()
+                        return "Error extracting final response from Gemini."
+
+            # Extract text from response (if no tool calls)
             if response and response.text:
                 result = response.text.strip()
                 logger.info(f"System 2 response received ({len(result)} chars)")
