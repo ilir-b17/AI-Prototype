@@ -32,7 +32,7 @@ class ExecutiveAgent:
         self,
         vector_db_path: str = "data/chroma_storage",
         ledger_db_path: str = "data/ledger.db",
-        gemini_model: str = "gemini-pro"
+        gemini_model: str = "gemini-3.1-pro-preview"
     ) -> None:
         """
         Initialize the ExecutiveAgent with all necessary subsystems.

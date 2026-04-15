@@ -905,3 +905,764 @@ telegram.error.Conflict: Conflict: terminated by other getUpdates request; make 
 2026-04-15 00:06:59,801 - src.core.executive - INFO - Closing ExecutiveAgent
 2026-04-15 00:06:59,802 - src.memory.ledger_db - INFO - LedgerMemory connection closed
 2026-04-15 00:06:59,802 - src.core.executive - INFO - ExecutiveAgent shutdown complete
+2026-04-15 07:21:09,941 - src.interfaces.telegram_bot - INFO - Initializing Executive Agent...
+2026-04-15 07:21:09,943 - src.core.executive - INFO - Initializing ExecutiveAgent (Prefrontal Cortex)
+2026-04-15 07:21:10,828 - chromadb.telemetry.product.posthog - ERROR - Failed to send telemetry event ClientStartEvent: capture() takes 1 positional argument but 3 were given
+2026-04-15 07:21:10,830 - chromadb.telemetry.product.posthog - ERROR - Failed to send telemetry event ClientCreateCollectionEvent: capture() takes 1 positional argument but 3 were given
+2026-04-15 07:21:10,831 - src.memory.vector_db - INFO - VectorMemory initialized with persistence at data/chroma_storage
+2026-04-15 07:21:10,836 - src.memory.ledger_db - INFO - LedgerMemory initialized with database at data/ledger.db
+2026-04-15 07:21:10,836 - src.core.llm_router - INFO - CognitiveRouter initialized with model: gemini-pro
+2026-04-15 07:21:10,836 - src.core.executive - INFO - ExecutiveAgent initialized successfully
+2026-04-15 07:21:10,842 - src.interfaces.telegram_bot - INFO - Executive Agent initialized successfully
+2026-04-15 07:21:11,281 - src.interfaces.telegram_bot - INFO - Telegram bot initialized and starting polling...
+2026-04-15 07:21:11,412 - httpx - INFO - HTTP Request: POST https://api.telegram.org/bot8069214468:AAHVVL4vdqq7B7C-5w7tGEHB_5FkkU6zxdc/getMe "HTTP/1.1 200 OK"
+2026-04-15 07:21:11,441 - httpx - INFO - HTTP Request: POST https://api.telegram.org/bot8069214468:AAHVVL4vdqq7B7C-5w7tGEHB_5FkkU6zxdc/deleteWebhook "HTTP/1.1 200 OK"
+2026-04-15 07:21:11,443 - telegram.ext.Application - INFO - Application started
+2026-04-15 07:21:11,524 - httpx - INFO - HTTP Request: POST https://api.telegram.org/bot8069214468:AAHVVL4vdqq7B7C-5w7tGEHB_5FkkU6zxdc/getUpdates "HTTP/1.1 200 OK"
+2026-04-15 07:21:11,526 - src.interfaces.telegram_bot - INFO - Message received from user 8769582575: Hi
+2026-04-15 07:21:11,588 - httpx - INFO - HTTP Request: POST https://api.telegram.org/bot8069214468:AAHVVL4vdqq7B7C-5w7tGEHB_5FkkU6zxdc/sendChatAction "HTTP/1.1 200 OK"
+2026-04-15 07:21:11,589 - src.core.executive - INFO - Processing message: Hi...
+2026-04-15 07:21:11,931 - src.memory.vector_db - ERROR - Failed to query memory: 
+2026-04-15 07:21:11,933 - src.core.executive - ERROR - Failed to retrieve context: 
+2026-04-15 07:21:11,933 - src.core.llm_router - INFO - Routing to System 1 (Local Model)
+2026-04-15 07:21:11,934 - src.core.executive - INFO - Response generated (42 chars)
+2026-04-15 07:21:11,958 - src.memory.vector_db - ERROR - Failed to add memory: 
+2026-04-15 07:21:11,960 - src.core.executive - WARNING - Failed to store response in memory: 
+2026-04-15 07:21:12,041 - httpx - INFO - HTTP Request: POST https://api.telegram.org/bot8069214468:AAHVVL4vdqq7B7C-5w7tGEHB_5FkkU6zxdc/sendMessage "HTTP/1.1 200 OK"
+2026-04-15 07:21:12,043 - src.interfaces.telegram_bot - INFO - Response sent to user 8769582575
+2026-04-15 07:21:21,554 - httpx - INFO - HTTP Request: POST https://api.telegram.org/bot8069214468:AAHVVL4vdqq7B7C-5w7tGEHB_5FkkU6zxdc/getUpdates "HTTP/1.1 200 OK"
+2026-04-15 07:21:31,582 - httpx - INFO - HTTP Request: POST https://api.telegram.org/bot8069214468:AAHVVL4vdqq7B7C-5w7tGEHB_5FkkU6zxdc/getUpdates "HTTP/1.1 200 OK"
+2026-04-15 07:21:32,555 - httpx - INFO - HTTP Request: POST https://api.telegram.org/bot8069214468:AAHVVL4vdqq7B7C-5w7tGEHB_5FkkU6zxdc/getUpdates "HTTP/1.1 200 OK"
+2026-04-15 07:21:32,557 - src.interfaces.telegram_bot - INFO - Message received from user 8769582575: Can you code
+2026-04-15 07:21:32,654 - httpx - INFO - HTTP Request: POST https://api.telegram.org/bot8069214468:AAHVVL4vdqq7B7C-5w7tGEHB_5FkkU6zxdc/sendChatAction "HTTP/1.1 200 OK"
+2026-04-15 07:21:32,655 - src.core.executive - INFO - Processing message: Can you code...
+2026-04-15 07:21:32,683 - src.memory.vector_db - ERROR - Failed to query memory: 
+2026-04-15 07:21:32,697 - src.core.executive - ERROR - Failed to retrieve context: 
+2026-04-15 07:21:32,699 - src.core.llm_router - INFO - Routing to System 2 (Gemini API)
+2026-04-15 07:21:33,092 - src.core.llm_router - ERROR - System 2 error: 404 models/gemini-pro is not found for API version v1beta, or is not supported for generateContent. Call ListModels to see the list of available models and their supported methods.
+Traceback (most recent call last):
+  File "C:\Users\iboci\AppData\Local\Packages\PythonSoftwareFoundation.Python.3.11_qbz5n2kfra8p0\LocalCache\local-packages\Python311\site-packages\google\api_core\grpc_helpers.py", line 55, in error_remapped_callable
+    return callable_(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\iboci\AppData\Local\Packages\PythonSoftwareFoundation.Python.3.11_qbz5n2kfra8p0\LocalCache\local-packages\Python311\site-packages\grpc\_interceptor.py", line 276, in __call__
+    response, ignored_call = self._with_call(
+                             ^^^^^^^^^^^^^^^^
+  File "C:\Users\iboci\AppData\Local\Packages\PythonSoftwareFoundation.Python.3.11_qbz5n2kfra8p0\LocalCache\local-packages\Python311\site-packages\grpc\_interceptor.py", line 331, in _with_call
+    return call.result(), call
+           ^^^^^^^^^^^^^
+  File "C:\Users\iboci\AppData\Local\Packages\PythonSoftwareFoundation.Python.3.11_qbz5n2kfra8p0\LocalCache\local-packages\Python311\site-packages\grpc\_channel.py", line 438, in result
+    raise self
+  File "C:\Users\iboci\AppData\Local\Packages\PythonSoftwareFoundation.Python.3.11_qbz5n2kfra8p0\LocalCache\local-packages\Python311\site-packages\grpc\_interceptor.py", line 314, in continuation
+    response, call = self._thunk(new_method).with_call(
+                     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\iboci\AppData\Local\Packages\PythonSoftwareFoundation.Python.3.11_qbz5n2kfra8p0\LocalCache\local-packages\Python311\site-packages\grpc\_channel.py", line 1173, in with_call
+    return _end_unary_response_blocking(state, call, True, None)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\iboci\AppData\Local\Packages\PythonSoftwareFoundation.Python.3.11_qbz5n2kfra8p0\LocalCache\local-packages\Python311\site-packages\grpc\_channel.py", line 990, in _end_unary_response_blocking
+    raise _InactiveRpcError(state)  # pytype: disable=not-instantiable
+    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+grpc._channel._InactiveRpcError: <_InactiveRpcError of RPC that terminated with:
+	status = StatusCode.NOT_FOUND
+	details = "models/gemini-pro is not found for API version v1beta, or is not supported for generateContent. Call ListModels to see the list of available models and their supported methods."
+	debug_error_string = "UNKNOWN:Error received from peer ipv6:%5B2a00:1450:400d:802::200a%5D:443 {grpc_status:5, grpc_message:"models/gemini-pro is not found for API version v1beta, or is not supported for generateContent. Call ListModels to see the list of available models and their supported methods."}"
+>
+
+The above exception was the direct cause of the following exception:
+
+Traceback (most recent call last):
+  File "C:\Users\iboci\Live-Trading-bot\AI_Prototype\src\core\llm_router.py", line 119, in route_to_system_2
+    response = self.model.generate_content(
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\iboci\AppData\Local\Packages\PythonSoftwareFoundation.Python.3.11_qbz5n2kfra8p0\LocalCache\local-packages\Python311\site-packages\google\generativeai\generative_models.py", line 331, in generate_content
+    response = self._client.generate_content(
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\iboci\AppData\Local\Packages\PythonSoftwareFoundation.Python.3.11_qbz5n2kfra8p0\LocalCache\local-packages\Python311\site-packages\google\ai\generativelanguage_v1beta\services\generative_service\client.py", line 835, in generate_content
+    response = rpc(
+               ^^^^
+  File "C:\Users\iboci\AppData\Local\Packages\PythonSoftwareFoundation.Python.3.11_qbz5n2kfra8p0\LocalCache\local-packages\Python311\site-packages\google\api_core\gapic_v1\method.py", line 128, in __call__
+    return wrapped_func(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\iboci\AppData\Local\Packages\PythonSoftwareFoundation.Python.3.11_qbz5n2kfra8p0\LocalCache\local-packages\Python311\site-packages\google\api_core\retry\retry_unary.py", line 294, in retry_wrapped_func
+    return retry_target(
+           ^^^^^^^^^^^^^
+  File "C:\Users\iboci\AppData\Local\Packages\PythonSoftwareFoundation.Python.3.11_qbz5n2kfra8p0\LocalCache\local-packages\Python311\site-packages\google\api_core\retry\retry_unary.py", line 156, in retry_target
+    next_sleep = _retry_error_helper(
+                 ^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\iboci\AppData\Local\Packages\PythonSoftwareFoundation.Python.3.11_qbz5n2kfra8p0\LocalCache\local-packages\Python311\site-packages\google\api_core\retry\retry_base.py", line 216, in _retry_error_helper
+    raise final_exc from source_exc
+  File "C:\Users\iboci\AppData\Local\Packages\PythonSoftwareFoundation.Python.3.11_qbz5n2kfra8p0\LocalCache\local-packages\Python311\site-packages\google\api_core\retry\retry_unary.py", line 147, in retry_target
+    result = target()
+             ^^^^^^^^
+  File "C:\Users\iboci\AppData\Local\Packages\PythonSoftwareFoundation.Python.3.11_qbz5n2kfra8p0\LocalCache\local-packages\Python311\site-packages\google\api_core\timeout.py", line 130, in func_with_timeout
+    return func(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\iboci\AppData\Local\Packages\PythonSoftwareFoundation.Python.3.11_qbz5n2kfra8p0\LocalCache\local-packages\Python311\site-packages\google\api_core\grpc_helpers.py", line 57, in error_remapped_callable
+    raise exceptions.from_grpc_error(exc) from exc
+google.api_core.exceptions.NotFound: 404 models/gemini-pro is not found for API version v1beta, or is not supported for generateContent. Call ListModels to see the list of available models and their supported methods.
+2026-04-15 07:21:33,340 - src.core.executive - ERROR - Failed to generate response: 404 models/gemini-pro is not found for API version v1beta, or is not supported for generateContent. Call ListModels to see the list of available models and their supported methods.
+Traceback (most recent call last):
+  File "C:\Users\iboci\AppData\Local\Packages\PythonSoftwareFoundation.Python.3.11_qbz5n2kfra8p0\LocalCache\local-packages\Python311\site-packages\google\api_core\grpc_helpers.py", line 55, in error_remapped_callable
+    return callable_(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\iboci\AppData\Local\Packages\PythonSoftwareFoundation.Python.3.11_qbz5n2kfra8p0\LocalCache\local-packages\Python311\site-packages\grpc\_interceptor.py", line 276, in __call__
+    response, ignored_call = self._with_call(
+                             ^^^^^^^^^^^^^^^^
+  File "C:\Users\iboci\AppData\Local\Packages\PythonSoftwareFoundation.Python.3.11_qbz5n2kfra8p0\LocalCache\local-packages\Python311\site-packages\grpc\_interceptor.py", line 331, in _with_call
+    return call.result(), call
+           ^^^^^^^^^^^^^
+  File "C:\Users\iboci\AppData\Local\Packages\PythonSoftwareFoundation.Python.3.11_qbz5n2kfra8p0\LocalCache\local-packages\Python311\site-packages\grpc\_channel.py", line 438, in result
+    raise self
+  File "C:\Users\iboci\AppData\Local\Packages\PythonSoftwareFoundation.Python.3.11_qbz5n2kfra8p0\LocalCache\local-packages\Python311\site-packages\grpc\_interceptor.py", line 314, in continuation
+    response, call = self._thunk(new_method).with_call(
+                     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\iboci\AppData\Local\Packages\PythonSoftwareFoundation.Python.3.11_qbz5n2kfra8p0\LocalCache\local-packages\Python311\site-packages\grpc\_channel.py", line 1173, in with_call
+    return _end_unary_response_blocking(state, call, True, None)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\iboci\AppData\Local\Packages\PythonSoftwareFoundation.Python.3.11_qbz5n2kfra8p0\LocalCache\local-packages\Python311\site-packages\grpc\_channel.py", line 990, in _end_unary_response_blocking
+    raise _InactiveRpcError(state)  # pytype: disable=not-instantiable
+    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+grpc._channel._InactiveRpcError: <_InactiveRpcError of RPC that terminated with:
+	status = StatusCode.NOT_FOUND
+	details = "models/gemini-pro is not found for API version v1beta, or is not supported for generateContent. Call ListModels to see the list of available models and their supported methods."
+	debug_error_string = "UNKNOWN:Error received from peer ipv6:%5B2a00:1450:400d:802::200a%5D:443 {grpc_status:5, grpc_message:"models/gemini-pro is not found for API version v1beta, or is not supported for generateContent. Call ListModels to see the list of available models and their supported methods."}"
+>
+
+The above exception was the direct cause of the following exception:
+
+Traceback (most recent call last):
+  File "C:\Users\iboci\Live-Trading-bot\AI_Prototype\src\core\executive.py", line 196, in process_message
+    ai_response = self.cognitive_router.route_to_system_2(
+                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\iboci\Live-Trading-bot\AI_Prototype\src\core\llm_router.py", line 119, in route_to_system_2
+    response = self.model.generate_content(
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\iboci\AppData\Local\Packages\PythonSoftwareFoundation.Python.3.11_qbz5n2kfra8p0\LocalCache\local-packages\Python311\site-packages\google\generativeai\generative_models.py", line 331, in generate_content
+    response = self._client.generate_content(
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\iboci\AppData\Local\Packages\PythonSoftwareFoundation.Python.3.11_qbz5n2kfra8p0\LocalCache\local-packages\Python311\site-packages\google\ai\generativelanguage_v1beta\services\generative_service\client.py", line 835, in generate_content
+    response = rpc(
+               ^^^^
+  File "C:\Users\iboci\AppData\Local\Packages\PythonSoftwareFoundation.Python.3.11_qbz5n2kfra8p0\LocalCache\local-packages\Python311\site-packages\google\api_core\gapic_v1\method.py", line 128, in __call__
+    return wrapped_func(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\iboci\AppData\Local\Packages\PythonSoftwareFoundation.Python.3.11_qbz5n2kfra8p0\LocalCache\local-packages\Python311\site-packages\google\api_core\retry\retry_unary.py", line 294, in retry_wrapped_func
+    return retry_target(
+           ^^^^^^^^^^^^^
+  File "C:\Users\iboci\AppData\Local\Packages\PythonSoftwareFoundation.Python.3.11_qbz5n2kfra8p0\LocalCache\local-packages\Python311\site-packages\google\api_core\retry\retry_unary.py", line 156, in retry_target
+    next_sleep = _retry_error_helper(
+                 ^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\iboci\AppData\Local\Packages\PythonSoftwareFoundation.Python.3.11_qbz5n2kfra8p0\LocalCache\local-packages\Python311\site-packages\google\api_core\retry\retry_base.py", line 216, in _retry_error_helper
+    raise final_exc from source_exc
+  File "C:\Users\iboci\AppData\Local\Packages\PythonSoftwareFoundation.Python.3.11_qbz5n2kfra8p0\LocalCache\local-packages\Python311\site-packages\google\api_core\retry\retry_unary.py", line 147, in retry_target
+    result = target()
+             ^^^^^^^^
+  File "C:\Users\iboci\AppData\Local\Packages\PythonSoftwareFoundation.Python.3.11_qbz5n2kfra8p0\LocalCache\local-packages\Python311\site-packages\google\api_core\timeout.py", line 130, in func_with_timeout
+    return func(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\iboci\AppData\Local\Packages\PythonSoftwareFoundation.Python.3.11_qbz5n2kfra8p0\LocalCache\local-packages\Python311\site-packages\google\api_core\grpc_helpers.py", line 57, in error_remapped_callable
+    raise exceptions.from_grpc_error(exc) from exc
+google.api_core.exceptions.NotFound: 404 models/gemini-pro is not found for API version v1beta, or is not supported for generateContent. Call ListModels to see the list of available models and their supported methods.
+2026-04-15 07:21:33,431 - httpx - INFO - HTTP Request: POST https://api.telegram.org/bot8069214468:AAHVVL4vdqq7B7C-5w7tGEHB_5FkkU6zxdc/sendMessage "HTTP/1.1 200 OK"
+2026-04-15 07:21:33,433 - src.interfaces.telegram_bot - INFO - Response sent to user 8769582575
+2026-04-15 07:21:42,656 - httpx - INFO - HTTP Request: POST https://api.telegram.org/bot8069214468:AAHVVL4vdqq7B7C-5w7tGEHB_5FkkU6zxdc/getUpdates "HTTP/1.1 200 OK"
+2026-04-15 07:21:52,776 - httpx - INFO - HTTP Request: POST https://api.telegram.org/bot8069214468:AAHVVL4vdqq7B7C-5w7tGEHB_5FkkU6zxdc/getUpdates "HTTP/1.1 200 OK"
+2026-04-15 07:22:02,918 - httpx - INFO - HTTP Request: POST https://api.telegram.org/bot8069214468:AAHVVL4vdqq7B7C-5w7tGEHB_5FkkU6zxdc/getUpdates "HTTP/1.1 200 OK"
+2026-04-15 07:22:12,942 - httpx - INFO - HTTP Request: POST https://api.telegram.org/bot8069214468:AAHVVL4vdqq7B7C-5w7tGEHB_5FkkU6zxdc/getUpdates "HTTP/1.1 200 OK"
+2026-04-15 07:22:23,102 - httpx - INFO - HTTP Request: POST https://api.telegram.org/bot8069214468:AAHVVL4vdqq7B7C-5w7tGEHB_5FkkU6zxdc/getUpdates "HTTP/1.1 200 OK"
+2026-04-15 07:22:33,135 - httpx - INFO - HTTP Request: POST https://api.telegram.org/bot8069214468:AAHVVL4vdqq7B7C-5w7tGEHB_5FkkU6zxdc/getUpdates "HTTP/1.1 200 OK"
+2026-04-15 07:22:43,164 - httpx - INFO - HTTP Request: POST https://api.telegram.org/bot8069214468:AAHVVL4vdqq7B7C-5w7tGEHB_5FkkU6zxdc/getUpdates "HTTP/1.1 200 OK"
+2026-04-15 07:22:53,186 - httpx - INFO - HTTP Request: POST https://api.telegram.org/bot8069214468:AAHVVL4vdqq7B7C-5w7tGEHB_5FkkU6zxdc/getUpdates "HTTP/1.1 200 OK"
+2026-04-15 07:23:03,338 - httpx - INFO - HTTP Request: POST https://api.telegram.org/bot8069214468:AAHVVL4vdqq7B7C-5w7tGEHB_5FkkU6zxdc/getUpdates "HTTP/1.1 200 OK"
+2026-04-15 07:23:13,370 - httpx - INFO - HTTP Request: POST https://api.telegram.org/bot8069214468:AAHVVL4vdqq7B7C-5w7tGEHB_5FkkU6zxdc/getUpdates "HTTP/1.1 200 OK"
+2026-04-15 07:23:23,399 - httpx - INFO - HTTP Request: POST https://api.telegram.org/bot8069214468:AAHVVL4vdqq7B7C-5w7tGEHB_5FkkU6zxdc/getUpdates "HTTP/1.1 200 OK"
+2026-04-15 07:23:33,427 - httpx - INFO - HTTP Request: POST https://api.telegram.org/bot8069214468:AAHVVL4vdqq7B7C-5w7tGEHB_5FkkU6zxdc/getUpdates "HTTP/1.1 200 OK"
+2026-04-15 07:23:43,460 - httpx - INFO - HTTP Request: POST https://api.telegram.org/bot8069214468:AAHVVL4vdqq7B7C-5w7tGEHB_5FkkU6zxdc/getUpdates "HTTP/1.1 200 OK"
+2026-04-15 07:23:53,490 - httpx - INFO - HTTP Request: POST https://api.telegram.org/bot8069214468:AAHVVL4vdqq7B7C-5w7tGEHB_5FkkU6zxdc/getUpdates "HTTP/1.1 200 OK"
+2026-04-15 07:24:03,518 - httpx - INFO - HTTP Request: POST https://api.telegram.org/bot8069214468:AAHVVL4vdqq7B7C-5w7tGEHB_5FkkU6zxdc/getUpdates "HTTP/1.1 200 OK"
+2026-04-15 07:24:09,614 - httpx - INFO - HTTP Request: POST https://api.telegram.org/bot8069214468:AAHVVL4vdqq7B7C-5w7tGEHB_5FkkU6zxdc/getUpdates "HTTP/1.1 200 OK"
+2026-04-15 07:24:09,615 - telegram.ext.Application - INFO - Application is stopping. This might take a moment.
+2026-04-15 07:24:09,615 - telegram.ext.Application - INFO - Application.stop() complete
+2026-04-15 07:24:09,619 - src.interfaces.telegram_bot - INFO - Shutting down ExecutiveAgent...
+2026-04-15 07:24:09,619 - src.core.executive - INFO - Closing ExecutiveAgent
+2026-04-15 07:24:09,620 - src.memory.ledger_db - INFO - LedgerMemory connection closed
+2026-04-15 07:24:09,620 - src.core.executive - INFO - ExecutiveAgent shutdown complete
+2026-04-15 07:24:39,668 - src.interfaces.telegram_bot - INFO - Initializing Executive Agent...
+2026-04-15 07:24:39,668 - src.core.executive - INFO - Initializing ExecutiveAgent (Prefrontal Cortex)
+2026-04-15 07:24:40,754 - chromadb.telemetry.product.posthog - ERROR - Failed to send telemetry event ClientStartEvent: capture() takes 1 positional argument but 3 were given
+2026-04-15 07:24:40,758 - chromadb.telemetry.product.posthog - ERROR - Failed to send telemetry event ClientCreateCollectionEvent: capture() takes 1 positional argument but 3 were given
+2026-04-15 07:24:40,759 - src.memory.vector_db - INFO - VectorMemory initialized with persistence at data/chroma_storage
+2026-04-15 07:24:40,761 - src.memory.ledger_db - INFO - LedgerMemory initialized with database at data/ledger.db
+2026-04-15 07:24:40,763 - src.core.llm_router - INFO - CognitiveRouter initialized with model: gemini-pro
+2026-04-15 07:24:40,763 - src.core.executive - INFO - ExecutiveAgent initialized successfully
+2026-04-15 07:24:40,773 - src.interfaces.telegram_bot - INFO - Executive Agent initialized successfully
+2026-04-15 07:24:41,298 - src.interfaces.telegram_bot - INFO - Telegram bot initialized and starting polling...
+2026-04-15 07:24:41,403 - httpx - INFO - HTTP Request: POST https://api.telegram.org/bot8069214468:AAHVVL4vdqq7B7C-5w7tGEHB_5FkkU6zxdc/getMe "HTTP/1.1 200 OK"
+2026-04-15 07:24:41,428 - httpx - INFO - HTTP Request: POST https://api.telegram.org/bot8069214468:AAHVVL4vdqq7B7C-5w7tGEHB_5FkkU6zxdc/deleteWebhook "HTTP/1.1 200 OK"
+2026-04-15 07:24:41,430 - telegram.ext.Application - INFO - Application started
+2026-04-15 07:24:51,505 - httpx - INFO - HTTP Request: POST https://api.telegram.org/bot8069214468:AAHVVL4vdqq7B7C-5w7tGEHB_5FkkU6zxdc/getUpdates "HTTP/1.1 200 OK"
+2026-04-15 07:25:01,617 - httpx - INFO - HTTP Request: POST https://api.telegram.org/bot8069214468:AAHVVL4vdqq7B7C-5w7tGEHB_5FkkU6zxdc/getUpdates "HTTP/1.1 200 OK"
+2026-04-15 07:25:04,168 - httpx - INFO - HTTP Request: POST https://api.telegram.org/bot8069214468:AAHVVL4vdqq7B7C-5w7tGEHB_5FkkU6zxdc/getUpdates "HTTP/1.1 200 OK"
+2026-04-15 07:25:04,170 - src.interfaces.telegram_bot - INFO - Message received from user 8769582575: Can you code
+2026-04-15 07:25:04,288 - httpx - INFO - HTTP Request: POST https://api.telegram.org/bot8069214468:AAHVVL4vdqq7B7C-5w7tGEHB_5FkkU6zxdc/sendChatAction "HTTP/1.1 200 OK"
+2026-04-15 07:25:04,289 - src.core.executive - INFO - Processing message: Can you code...
+2026-04-15 07:25:04,736 - src.memory.vector_db - ERROR - Failed to query memory: 
+2026-04-15 07:25:04,736 - src.core.executive - ERROR - Failed to retrieve context: 
+2026-04-15 07:25:04,738 - src.core.llm_router - INFO - Routing to System 2 (Gemini API)
+2026-04-15 07:25:05,176 - src.core.llm_router - ERROR - System 2 error: 404 models/gemini-pro is not found for API version v1beta, or is not supported for generateContent. Call ListModels to see the list of available models and their supported methods.
+Traceback (most recent call last):
+  File "C:\Users\iboci\Live-Trading-bot\AI_Prototype\.venv\Lib\site-packages\google\api_core\grpc_helpers.py", line 55, in error_remapped_callable
+    return callable_(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\iboci\Live-Trading-bot\AI_Prototype\.venv\Lib\site-packages\grpc\_channel.py", line 1159, in __call__
+    return _end_unary_response_blocking(state, call, False, None)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\iboci\Live-Trading-bot\AI_Prototype\.venv\Lib\site-packages\grpc\_channel.py", line 990, in _end_unary_response_blocking
+    raise _InactiveRpcError(state)  # pytype: disable=not-instantiable
+    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+grpc._channel._InactiveRpcError: <_InactiveRpcError of RPC that terminated with:
+	status = StatusCode.NOT_FOUND
+	details = "models/gemini-pro is not found for API version v1beta, or is not supported for generateContent. Call ListModels to see the list of available models and their supported methods."
+	debug_error_string = "UNKNOWN:Error received from peer ipv6:%5B2a00:1450:400d:803::200a%5D:443 {grpc_status:5, grpc_message:"models/gemini-pro is not found for API version v1beta, or is not supported for generateContent. Call ListModels to see the list of available models and their supported methods."}"
+>
+
+The above exception was the direct cause of the following exception:
+
+Traceback (most recent call last):
+  File "c:\Users\iboci\Live-Trading-bot\AI_Prototype\src\core\llm_router.py", line 119, in route_to_system_2
+    response = self.model.generate_content(
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\iboci\Live-Trading-bot\AI_Prototype\.venv\Lib\site-packages\google\generativeai\generative_models.py", line 243, in generate_content
+    response = self._client.generate_content(request)
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\iboci\Live-Trading-bot\AI_Prototype\.venv\Lib\site-packages\google\ai\generativelanguage_v1beta\services\generative_service\client.py", line 566, in generate_content
+    response = rpc(
+               ^^^^
+  File "C:\Users\iboci\Live-Trading-bot\AI_Prototype\.venv\Lib\site-packages\google\api_core\gapic_v1\method.py", line 128, in __call__
+    return wrapped_func(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\iboci\Live-Trading-bot\AI_Prototype\.venv\Lib\site-packages\google\api_core\retry\retry_unary.py", line 294, in retry_wrapped_func
+    return retry_target(
+           ^^^^^^^^^^^^^
+  File "C:\Users\iboci\Live-Trading-bot\AI_Prototype\.venv\Lib\site-packages\google\api_core\retry\retry_unary.py", line 156, in retry_target
+    next_sleep = _retry_error_helper(
+                 ^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\iboci\Live-Trading-bot\AI_Prototype\.venv\Lib\site-packages\google\api_core\retry\retry_base.py", line 216, in _retry_error_helper
+    raise final_exc from source_exc
+  File "C:\Users\iboci\Live-Trading-bot\AI_Prototype\.venv\Lib\site-packages\google\api_core\retry\retry_unary.py", line 147, in retry_target
+    result = target()
+             ^^^^^^^^
+  File "C:\Users\iboci\Live-Trading-bot\AI_Prototype\.venv\Lib\site-packages\google\api_core\timeout.py", line 130, in func_with_timeout
+    return func(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\iboci\Live-Trading-bot\AI_Prototype\.venv\Lib\site-packages\google\api_core\grpc_helpers.py", line 57, in error_remapped_callable
+    raise exceptions.from_grpc_error(exc) from exc
+google.api_core.exceptions.NotFound: 404 models/gemini-pro is not found for API version v1beta, or is not supported for generateContent. Call ListModels to see the list of available models and their supported methods.
+2026-04-15 07:25:05,291 - src.core.executive - ERROR - Failed to generate response: 404 models/gemini-pro is not found for API version v1beta, or is not supported for generateContent. Call ListModels to see the list of available models and their supported methods.
+Traceback (most recent call last):
+  File "C:\Users\iboci\Live-Trading-bot\AI_Prototype\.venv\Lib\site-packages\google\api_core\grpc_helpers.py", line 55, in error_remapped_callable
+    return callable_(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\iboci\Live-Trading-bot\AI_Prototype\.venv\Lib\site-packages\grpc\_channel.py", line 1159, in __call__
+    return _end_unary_response_blocking(state, call, False, None)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\iboci\Live-Trading-bot\AI_Prototype\.venv\Lib\site-packages\grpc\_channel.py", line 990, in _end_unary_response_blocking
+    raise _InactiveRpcError(state)  # pytype: disable=not-instantiable
+    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+grpc._channel._InactiveRpcError: <_InactiveRpcError of RPC that terminated with:
+	status = StatusCode.NOT_FOUND
+	details = "models/gemini-pro is not found for API version v1beta, or is not supported for generateContent. Call ListModels to see the list of available models and their supported methods."
+	debug_error_string = "UNKNOWN:Error received from peer ipv6:%5B2a00:1450:400d:803::200a%5D:443 {grpc_status:5, grpc_message:"models/gemini-pro is not found for API version v1beta, or is not supported for generateContent. Call ListModels to see the list of available models and their supported methods."}"
+>
+
+The above exception was the direct cause of the following exception:
+
+Traceback (most recent call last):
+  File "c:\Users\iboci\Live-Trading-bot\AI_Prototype\src\core\executive.py", line 196, in process_message
+    ai_response = self.cognitive_router.route_to_system_2(
+                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "c:\Users\iboci\Live-Trading-bot\AI_Prototype\src\core\llm_router.py", line 119, in route_to_system_2
+    response = self.model.generate_content(
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\iboci\Live-Trading-bot\AI_Prototype\.venv\Lib\site-packages\google\generativeai\generative_models.py", line 243, in generate_content
+    response = self._client.generate_content(request)
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\iboci\Live-Trading-bot\AI_Prototype\.venv\Lib\site-packages\google\ai\generativelanguage_v1beta\services\generative_service\client.py", line 566, in generate_content
+    response = rpc(
+               ^^^^
+  File "C:\Users\iboci\Live-Trading-bot\AI_Prototype\.venv\Lib\site-packages\google\api_core\gapic_v1\method.py", line 128, in __call__
+    return wrapped_func(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\iboci\Live-Trading-bot\AI_Prototype\.venv\Lib\site-packages\google\api_core\retry\retry_unary.py", line 294, in retry_wrapped_func
+    return retry_target(
+           ^^^^^^^^^^^^^
+  File "C:\Users\iboci\Live-Trading-bot\AI_Prototype\.venv\Lib\site-packages\google\api_core\retry\retry_unary.py", line 156, in retry_target
+    next_sleep = _retry_error_helper(
+                 ^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\iboci\Live-Trading-bot\AI_Prototype\.venv\Lib\site-packages\google\api_core\retry\retry_base.py", line 216, in _retry_error_helper
+    raise final_exc from source_exc
+  File "C:\Users\iboci\Live-Trading-bot\AI_Prototype\.venv\Lib\site-packages\google\api_core\retry\retry_unary.py", line 147, in retry_target
+    result = target()
+             ^^^^^^^^
+  File "C:\Users\iboci\Live-Trading-bot\AI_Prototype\.venv\Lib\site-packages\google\api_core\timeout.py", line 130, in func_with_timeout
+    return func(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\iboci\Live-Trading-bot\AI_Prototype\.venv\Lib\site-packages\google\api_core\grpc_helpers.py", line 57, in error_remapped_callable
+    raise exceptions.from_grpc_error(exc) from exc
+google.api_core.exceptions.NotFound: 404 models/gemini-pro is not found for API version v1beta, or is not supported for generateContent. Call ListModels to see the list of available models and their supported methods.
+2026-04-15 07:25:05,387 - httpx - INFO - HTTP Request: POST https://api.telegram.org/bot8069214468:AAHVVL4vdqq7B7C-5w7tGEHB_5FkkU6zxdc/sendMessage "HTTP/1.1 200 OK"
+2026-04-15 07:25:05,390 - src.interfaces.telegram_bot - INFO - Response sent to user 8769582575
+2026-04-15 07:25:14,304 - httpx - INFO - HTTP Request: POST https://api.telegram.org/bot8069214468:AAHVVL4vdqq7B7C-5w7tGEHB_5FkkU6zxdc/getUpdates "HTTP/1.1 200 OK"
+2026-04-15 07:25:24,329 - httpx - INFO - HTTP Request: POST https://api.telegram.org/bot8069214468:AAHVVL4vdqq7B7C-5w7tGEHB_5FkkU6zxdc/getUpdates "HTTP/1.1 200 OK"
+2026-04-15 07:25:34,357 - httpx - INFO - HTTP Request: POST https://api.telegram.org/bot8069214468:AAHVVL4vdqq7B7C-5w7tGEHB_5FkkU6zxdc/getUpdates "HTTP/1.1 200 OK"
+2026-04-15 07:25:35,006 - src.interfaces.telegram_bot - INFO - Bot interrupted by user
+2026-04-15 07:25:35,006 - src.interfaces.telegram_bot - INFO - Shutting down ExecutiveAgent...
+2026-04-15 07:25:35,007 - src.core.executive - INFO - Closing ExecutiveAgent
+2026-04-15 07:25:35,007 - src.memory.ledger_db - INFO - LedgerMemory connection closed
+2026-04-15 07:25:35,008 - src.core.executive - INFO - ExecutiveAgent shutdown complete
+2026-04-15 07:26:36,807 - src.interfaces.telegram_bot - INFO - Initializing Executive Agent...
+2026-04-15 07:26:36,807 - src.core.executive - INFO - Initializing ExecutiveAgent (Prefrontal Cortex)
+2026-04-15 07:26:36,950 - chromadb.telemetry.product.posthog - ERROR - Failed to send telemetry event ClientStartEvent: capture() takes 1 positional argument but 3 were given
+2026-04-15 07:26:36,952 - chromadb.telemetry.product.posthog - ERROR - Failed to send telemetry event ClientCreateCollectionEvent: capture() takes 1 positional argument but 3 were given
+2026-04-15 07:26:36,952 - src.memory.vector_db - INFO - VectorMemory initialized with persistence at data/chroma_storage
+2026-04-15 07:26:36,955 - src.memory.ledger_db - INFO - LedgerMemory initialized with database at data/ledger.db
+2026-04-15 07:26:36,955 - src.core.llm_router - INFO - CognitiveRouter initialized with model: gemini-pro
+2026-04-15 07:26:36,955 - src.core.executive - INFO - ExecutiveAgent initialized successfully
+2026-04-15 07:26:36,963 - src.interfaces.telegram_bot - INFO - Executive Agent initialized successfully
+2026-04-15 07:26:37,430 - src.interfaces.telegram_bot - INFO - Telegram bot initialized and starting polling...
+2026-04-15 07:26:37,513 - httpx - INFO - HTTP Request: POST https://api.telegram.org/bot8069214468:AAHVVL4vdqq7B7C-5w7tGEHB_5FkkU6zxdc/getMe "HTTP/1.1 200 OK"
+2026-04-15 07:26:37,538 - httpx - INFO - HTTP Request: POST https://api.telegram.org/bot8069214468:AAHVVL4vdqq7B7C-5w7tGEHB_5FkkU6zxdc/deleteWebhook "HTTP/1.1 200 OK"
+2026-04-15 07:26:37,540 - telegram.ext.Application - INFO - Application started
+2026-04-15 07:26:47,613 - httpx - INFO - HTTP Request: POST https://api.telegram.org/bot8069214468:AAHVVL4vdqq7B7C-5w7tGEHB_5FkkU6zxdc/getUpdates "HTTP/1.1 200 OK"
+2026-04-15 07:26:57,420 - httpx - INFO - HTTP Request: POST https://api.telegram.org/bot8069214468:AAHVVL4vdqq7B7C-5w7tGEHB_5FkkU6zxdc/getUpdates "HTTP/1.1 200 OK"
+2026-04-15 07:26:57,421 - src.interfaces.telegram_bot - INFO - Message received from user 8769582575: Test
+2026-04-15 07:26:57,539 - httpx - INFO - HTTP Request: POST https://api.telegram.org/bot8069214468:AAHVVL4vdqq7B7C-5w7tGEHB_5FkkU6zxdc/sendChatAction "HTTP/1.1 200 OK"
+2026-04-15 07:26:57,540 - src.core.executive - INFO - Processing message: Test...
+2026-04-15 07:26:57,751 - src.memory.vector_db - ERROR - Failed to query memory: 
+2026-04-15 07:26:57,763 - src.core.executive - ERROR - Failed to retrieve context: 
+2026-04-15 07:26:57,776 - src.core.llm_router - INFO - Routing to System 1 (Local Model)
+2026-04-15 07:26:57,795 - src.core.executive - INFO - Response generated (44 chars)
+2026-04-15 07:26:57,827 - src.memory.vector_db - ERROR - Failed to add memory: 
+2026-04-15 07:26:57,848 - src.core.executive - WARNING - Failed to store response in memory: 
+2026-04-15 07:26:57,951 - httpx - INFO - HTTP Request: POST https://api.telegram.org/bot8069214468:AAHVVL4vdqq7B7C-5w7tGEHB_5FkkU6zxdc/sendMessage "HTTP/1.1 200 OK"
+2026-04-15 07:26:57,957 - src.interfaces.telegram_bot - INFO - Response sent to user 8769582575
+2026-04-15 07:27:02,945 - httpx - INFO - HTTP Request: POST https://api.telegram.org/bot8069214468:AAHVVL4vdqq7B7C-5w7tGEHB_5FkkU6zxdc/getUpdates "HTTP/1.1 200 OK"
+2026-04-15 07:27:02,947 - src.interfaces.telegram_bot - INFO - Message received from user 8769582575: Code test
+2026-04-15 07:27:02,991 - httpx - INFO - HTTP Request: POST https://api.telegram.org/bot8069214468:AAHVVL4vdqq7B7C-5w7tGEHB_5FkkU6zxdc/sendChatAction "HTTP/1.1 200 OK"
+2026-04-15 07:27:02,992 - src.core.executive - INFO - Processing message: Code test...
+2026-04-15 07:27:03,021 - src.memory.vector_db - ERROR - Failed to query memory: 
+2026-04-15 07:27:03,026 - src.core.executive - ERROR - Failed to retrieve context: 
+2026-04-15 07:27:03,027 - src.core.llm_router - INFO - Routing to System 2 (Gemini API)
+2026-04-15 07:27:03,213 - src.core.llm_router - ERROR - System 2 error: 404 models/gemini-pro is not found for API version v1beta, or is not supported for generateContent. Call ListModels to see the list of available models and their supported methods.
+Traceback (most recent call last):
+  File "C:\Users\iboci\Live-Trading-bot\AI_Prototype\.venv\Lib\site-packages\google\api_core\grpc_helpers.py", line 55, in error_remapped_callable
+    return callable_(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\iboci\Live-Trading-bot\AI_Prototype\.venv\Lib\site-packages\grpc\_channel.py", line 1159, in __call__
+    return _end_unary_response_blocking(state, call, False, None)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\iboci\Live-Trading-bot\AI_Prototype\.venv\Lib\site-packages\grpc\_channel.py", line 990, in _end_unary_response_blocking
+    raise _InactiveRpcError(state)  # pytype: disable=not-instantiable
+    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+grpc._channel._InactiveRpcError: <_InactiveRpcError of RPC that terminated with:
+	status = StatusCode.NOT_FOUND
+	details = "models/gemini-pro is not found for API version v1beta, or is not supported for generateContent. Call ListModels to see the list of available models and their supported methods."
+	debug_error_string = "UNKNOWN:Error received from peer ipv6:%5B2a00:1450:400d:803::200a%5D:443 {grpc_status:5, grpc_message:"models/gemini-pro is not found for API version v1beta, or is not supported for generateContent. Call ListModels to see the list of available models and their supported methods."}"
+>
+
+The above exception was the direct cause of the following exception:
+
+Traceback (most recent call last):
+  File "c:\Users\iboci\Live-Trading-bot\AI_Prototype\src\core\llm_router.py", line 119, in route_to_system_2
+    response = self.model.generate_content(
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\iboci\Live-Trading-bot\AI_Prototype\.venv\Lib\site-packages\google\generativeai\generative_models.py", line 243, in generate_content
+    response = self._client.generate_content(request)
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\iboci\Live-Trading-bot\AI_Prototype\.venv\Lib\site-packages\google\ai\generativelanguage_v1beta\services\generative_service\client.py", line 566, in generate_content
+    response = rpc(
+               ^^^^
+  File "C:\Users\iboci\Live-Trading-bot\AI_Prototype\.venv\Lib\site-packages\google\api_core\gapic_v1\method.py", line 128, in __call__
+    return wrapped_func(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\iboci\Live-Trading-bot\AI_Prototype\.venv\Lib\site-packages\google\api_core\retry\retry_unary.py", line 294, in retry_wrapped_func
+    return retry_target(
+           ^^^^^^^^^^^^^
+  File "C:\Users\iboci\Live-Trading-bot\AI_Prototype\.venv\Lib\site-packages\google\api_core\retry\retry_unary.py", line 156, in retry_target
+    next_sleep = _retry_error_helper(
+                 ^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\iboci\Live-Trading-bot\AI_Prototype\.venv\Lib\site-packages\google\api_core\retry\retry_base.py", line 216, in _retry_error_helper
+    raise final_exc from source_exc
+  File "C:\Users\iboci\Live-Trading-bot\AI_Prototype\.venv\Lib\site-packages\google\api_core\retry\retry_unary.py", line 147, in retry_target
+    result = target()
+             ^^^^^^^^
+  File "C:\Users\iboci\Live-Trading-bot\AI_Prototype\.venv\Lib\site-packages\google\api_core\timeout.py", line 130, in func_with_timeout
+    return func(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\iboci\Live-Trading-bot\AI_Prototype\.venv\Lib\site-packages\google\api_core\grpc_helpers.py", line 57, in error_remapped_callable
+    raise exceptions.from_grpc_error(exc) from exc
+google.api_core.exceptions.NotFound: 404 models/gemini-pro is not found for API version v1beta, or is not supported for generateContent. Call ListModels to see the list of available models and their supported methods.
+2026-04-15 07:27:03,223 - src.core.executive - ERROR - Failed to generate response: 404 models/gemini-pro is not found for API version v1beta, or is not supported for generateContent. Call ListModels to see the list of available models and their supported methods.
+Traceback (most recent call last):
+  File "C:\Users\iboci\Live-Trading-bot\AI_Prototype\.venv\Lib\site-packages\google\api_core\grpc_helpers.py", line 55, in error_remapped_callable
+    return callable_(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\iboci\Live-Trading-bot\AI_Prototype\.venv\Lib\site-packages\grpc\_channel.py", line 1159, in __call__
+    return _end_unary_response_blocking(state, call, False, None)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\iboci\Live-Trading-bot\AI_Prototype\.venv\Lib\site-packages\grpc\_channel.py", line 990, in _end_unary_response_blocking
+    raise _InactiveRpcError(state)  # pytype: disable=not-instantiable
+    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+grpc._channel._InactiveRpcError: <_InactiveRpcError of RPC that terminated with:
+	status = StatusCode.NOT_FOUND
+	details = "models/gemini-pro is not found for API version v1beta, or is not supported for generateContent. Call ListModels to see the list of available models and their supported methods."
+	debug_error_string = "UNKNOWN:Error received from peer ipv6:%5B2a00:1450:400d:803::200a%5D:443 {grpc_status:5, grpc_message:"models/gemini-pro is not found for API version v1beta, or is not supported for generateContent. Call ListModels to see the list of available models and their supported methods."}"
+>
+
+The above exception was the direct cause of the following exception:
+
+Traceback (most recent call last):
+  File "c:\Users\iboci\Live-Trading-bot\AI_Prototype\src\core\executive.py", line 196, in process_message
+    ai_response = self.cognitive_router.route_to_system_2(
+                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "c:\Users\iboci\Live-Trading-bot\AI_Prototype\src\core\llm_router.py", line 119, in route_to_system_2
+    response = self.model.generate_content(
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\iboci\Live-Trading-bot\AI_Prototype\.venv\Lib\site-packages\google\generativeai\generative_models.py", line 243, in generate_content
+    response = self._client.generate_content(request)
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\iboci\Live-Trading-bot\AI_Prototype\.venv\Lib\site-packages\google\ai\generativelanguage_v1beta\services\generative_service\client.py", line 566, in generate_content
+    response = rpc(
+               ^^^^
+  File "C:\Users\iboci\Live-Trading-bot\AI_Prototype\.venv\Lib\site-packages\google\api_core\gapic_v1\method.py", line 128, in __call__
+    return wrapped_func(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\iboci\Live-Trading-bot\AI_Prototype\.venv\Lib\site-packages\google\api_core\retry\retry_unary.py", line 294, in retry_wrapped_func
+    return retry_target(
+           ^^^^^^^^^^^^^
+  File "C:\Users\iboci\Live-Trading-bot\AI_Prototype\.venv\Lib\site-packages\google\api_core\retry\retry_unary.py", line 156, in retry_target
+    next_sleep = _retry_error_helper(
+                 ^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\iboci\Live-Trading-bot\AI_Prototype\.venv\Lib\site-packages\google\api_core\retry\retry_base.py", line 216, in _retry_error_helper
+    raise final_exc from source_exc
+  File "C:\Users\iboci\Live-Trading-bot\AI_Prototype\.venv\Lib\site-packages\google\api_core\retry\retry_unary.py", line 147, in retry_target
+    result = target()
+             ^^^^^^^^
+  File "C:\Users\iboci\Live-Trading-bot\AI_Prototype\.venv\Lib\site-packages\google\api_core\timeout.py", line 130, in func_with_timeout
+    return func(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\iboci\Live-Trading-bot\AI_Prototype\.venv\Lib\site-packages\google\api_core\grpc_helpers.py", line 57, in error_remapped_callable
+    raise exceptions.from_grpc_error(exc) from exc
+google.api_core.exceptions.NotFound: 404 models/gemini-pro is not found for API version v1beta, or is not supported for generateContent. Call ListModels to see the list of available models and their supported methods.
+2026-04-15 07:27:03,312 - httpx - INFO - HTTP Request: POST https://api.telegram.org/bot8069214468:AAHVVL4vdqq7B7C-5w7tGEHB_5FkkU6zxdc/sendMessage "HTTP/1.1 200 OK"
+2026-04-15 07:27:03,314 - src.interfaces.telegram_bot - INFO - Response sent to user 8769582575
+2026-04-15 07:27:12,972 - httpx - INFO - HTTP Request: POST https://api.telegram.org/bot8069214468:AAHVVL4vdqq7B7C-5w7tGEHB_5FkkU6zxdc/getUpdates "HTTP/1.1 200 OK"
+2026-04-15 07:27:23,123 - httpx - INFO - HTTP Request: POST https://api.telegram.org/bot8069214468:AAHVVL4vdqq7B7C-5w7tGEHB_5FkkU6zxdc/getUpdates "HTTP/1.1 200 OK"
+2026-04-15 07:27:33,148 - httpx - INFO - HTTP Request: POST https://api.telegram.org/bot8069214468:AAHVVL4vdqq7B7C-5w7tGEHB_5FkkU6zxdc/getUpdates "HTTP/1.1 200 OK"
+2026-04-15 07:27:38,921 - httpx - INFO - HTTP Request: POST https://api.telegram.org/bot8069214468:AAHVVL4vdqq7B7C-5w7tGEHB_5FkkU6zxdc/getUpdates "HTTP/1.1 200 OK"
+2026-04-15 07:27:38,922 - telegram.ext.Application - INFO - Application is stopping. This might take a moment.
+2026-04-15 07:27:38,922 - telegram.ext.Application - INFO - Application.stop() complete
+2026-04-15 07:27:38,924 - src.interfaces.telegram_bot - INFO - Shutting down ExecutiveAgent...
+2026-04-15 07:27:38,924 - src.core.executive - INFO - Closing ExecutiveAgent
+2026-04-15 07:27:38,925 - src.memory.ledger_db - INFO - LedgerMemory connection closed
+2026-04-15 07:27:38,925 - src.core.executive - INFO - ExecutiveAgent shutdown complete
+2026-04-15 07:28:53,197 - src.interfaces.telegram_bot - INFO - Initializing Executive Agent...
+2026-04-15 07:28:53,197 - src.core.executive - INFO - Initializing ExecutiveAgent (Prefrontal Cortex)
+2026-04-15 07:28:53,987 - chromadb.telemetry.product.posthog - ERROR - Failed to send telemetry event ClientStartEvent: capture() takes 1 positional argument but 3 were given
+2026-04-15 07:28:53,988 - chromadb.telemetry.product.posthog - ERROR - Failed to send telemetry event ClientCreateCollectionEvent: capture() takes 1 positional argument but 3 were given
+2026-04-15 07:28:53,988 - src.memory.vector_db - INFO - VectorMemory initialized with persistence at data/chroma_storage
+2026-04-15 07:28:53,992 - src.memory.ledger_db - INFO - LedgerMemory initialized with database at data/ledger.db
+2026-04-15 07:28:53,992 - src.core.llm_router - INFO - CognitiveRouter initialized with model: gemini-pro
+2026-04-15 07:28:53,992 - src.core.executive - INFO - ExecutiveAgent initialized successfully
+2026-04-15 07:28:54,025 - src.interfaces.telegram_bot - INFO - Executive Agent initialized successfully
+2026-04-15 07:28:54,492 - src.interfaces.telegram_bot - INFO - Telegram bot initialized and starting polling...
+2026-04-15 07:28:54,577 - httpx - INFO - HTTP Request: POST https://api.telegram.org/bot8069214468:AAHVVL4vdqq7B7C-5w7tGEHB_5FkkU6zxdc/getMe "HTTP/1.1 200 OK"
+2026-04-15 07:28:54,612 - httpx - INFO - HTTP Request: POST https://api.telegram.org/bot8069214468:AAHVVL4vdqq7B7C-5w7tGEHB_5FkkU6zxdc/deleteWebhook "HTTP/1.1 200 OK"
+2026-04-15 07:28:54,613 - telegram.ext.Application - INFO - Application started
+2026-04-15 07:29:04,687 - httpx - INFO - HTTP Request: POST https://api.telegram.org/bot8069214468:AAHVVL4vdqq7B7C-5w7tGEHB_5FkkU6zxdc/getUpdates "HTTP/1.1 200 OK"
+2026-04-15 07:29:14,723 - httpx - INFO - HTTP Request: POST https://api.telegram.org/bot8069214468:AAHVVL4vdqq7B7C-5w7tGEHB_5FkkU6zxdc/getUpdates "HTTP/1.1 200 OK"
+2026-04-15 07:29:16,494 - httpx - INFO - HTTP Request: POST https://api.telegram.org/bot8069214468:AAHVVL4vdqq7B7C-5w7tGEHB_5FkkU6zxdc/getUpdates "HTTP/1.1 200 OK"
+2026-04-15 07:29:16,496 - src.interfaces.telegram_bot - INFO - Message received from user 8769582575: test code
+2026-04-15 07:29:16,683 - httpx - INFO - HTTP Request: POST https://api.telegram.org/bot8069214468:AAHVVL4vdqq7B7C-5w7tGEHB_5FkkU6zxdc/sendChatAction "HTTP/1.1 200 OK"
+2026-04-15 07:29:16,683 - src.core.executive - INFO - Processing message: test code...
+2026-04-15 07:29:17,016 - src.memory.vector_db - ERROR - Failed to query memory: 
+2026-04-15 07:29:17,018 - src.core.executive - ERROR - Failed to retrieve context: 
+2026-04-15 07:29:17,019 - src.core.llm_router - INFO - Routing to System 2 (Gemini API)
+2026-04-15 07:29:17,295 - src.core.llm_router - ERROR - System 2 error: 404 models/gemini-pro is not found for API version v1beta, or is not supported for generateContent. Call ListModels to see the list of available models and their supported methods.
+Traceback (most recent call last):
+  File "C:\Users\iboci\AppData\Local\Packages\PythonSoftwareFoundation.Python.3.11_qbz5n2kfra8p0\LocalCache\local-packages\Python311\site-packages\google\api_core\grpc_helpers.py", line 55, in error_remapped_callable
+    return callable_(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\iboci\AppData\Local\Packages\PythonSoftwareFoundation.Python.3.11_qbz5n2kfra8p0\LocalCache\local-packages\Python311\site-packages\grpc\_interceptor.py", line 276, in __call__
+    response, ignored_call = self._with_call(
+                             ^^^^^^^^^^^^^^^^
+  File "C:\Users\iboci\AppData\Local\Packages\PythonSoftwareFoundation.Python.3.11_qbz5n2kfra8p0\LocalCache\local-packages\Python311\site-packages\grpc\_interceptor.py", line 331, in _with_call
+    return call.result(), call
+           ^^^^^^^^^^^^^
+  File "C:\Users\iboci\AppData\Local\Packages\PythonSoftwareFoundation.Python.3.11_qbz5n2kfra8p0\LocalCache\local-packages\Python311\site-packages\grpc\_channel.py", line 438, in result
+    raise self
+  File "C:\Users\iboci\AppData\Local\Packages\PythonSoftwareFoundation.Python.3.11_qbz5n2kfra8p0\LocalCache\local-packages\Python311\site-packages\grpc\_interceptor.py", line 314, in continuation
+    response, call = self._thunk(new_method).with_call(
+                     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\iboci\AppData\Local\Packages\PythonSoftwareFoundation.Python.3.11_qbz5n2kfra8p0\LocalCache\local-packages\Python311\site-packages\grpc\_channel.py", line 1173, in with_call
+    return _end_unary_response_blocking(state, call, True, None)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\iboci\AppData\Local\Packages\PythonSoftwareFoundation.Python.3.11_qbz5n2kfra8p0\LocalCache\local-packages\Python311\site-packages\grpc\_channel.py", line 990, in _end_unary_response_blocking
+    raise _InactiveRpcError(state)  # pytype: disable=not-instantiable
+    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+grpc._channel._InactiveRpcError: <_InactiveRpcError of RPC that terminated with:
+	status = StatusCode.NOT_FOUND
+	details = "models/gemini-pro is not found for API version v1beta, or is not supported for generateContent. Call ListModels to see the list of available models and their supported methods."
+	debug_error_string = "UNKNOWN:Error received from peer ipv6:%5B2a00:1450:400d:812::200a%5D:443 {grpc_message:"models/gemini-pro is not found for API version v1beta, or is not supported for generateContent. Call ListModels to see the list of available models and their supported methods.", grpc_status:5}"
+>
+
+The above exception was the direct cause of the following exception:
+
+Traceback (most recent call last):
+  File "C:\Users\iboci\Live-Trading-bot\AI_Prototype\src\core\llm_router.py", line 119, in route_to_system_2
+    response = self.model.generate_content(
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\iboci\AppData\Local\Packages\PythonSoftwareFoundation.Python.3.11_qbz5n2kfra8p0\LocalCache\local-packages\Python311\site-packages\google\generativeai\generative_models.py", line 331, in generate_content
+    response = self._client.generate_content(
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\iboci\AppData\Local\Packages\PythonSoftwareFoundation.Python.3.11_qbz5n2kfra8p0\LocalCache\local-packages\Python311\site-packages\google\ai\generativelanguage_v1beta\services\generative_service\client.py", line 835, in generate_content
+    response = rpc(
+               ^^^^
+  File "C:\Users\iboci\AppData\Local\Packages\PythonSoftwareFoundation.Python.3.11_qbz5n2kfra8p0\LocalCache\local-packages\Python311\site-packages\google\api_core\gapic_v1\method.py", line 128, in __call__
+    return wrapped_func(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\iboci\AppData\Local\Packages\PythonSoftwareFoundation.Python.3.11_qbz5n2kfra8p0\LocalCache\local-packages\Python311\site-packages\google\api_core\retry\retry_unary.py", line 294, in retry_wrapped_func
+    return retry_target(
+           ^^^^^^^^^^^^^
+  File "C:\Users\iboci\AppData\Local\Packages\PythonSoftwareFoundation.Python.3.11_qbz5n2kfra8p0\LocalCache\local-packages\Python311\site-packages\google\api_core\retry\retry_unary.py", line 156, in retry_target
+    next_sleep = _retry_error_helper(
+                 ^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\iboci\AppData\Local\Packages\PythonSoftwareFoundation.Python.3.11_qbz5n2kfra8p0\LocalCache\local-packages\Python311\site-packages\google\api_core\retry\retry_base.py", line 216, in _retry_error_helper
+    raise final_exc from source_exc
+  File "C:\Users\iboci\AppData\Local\Packages\PythonSoftwareFoundation.Python.3.11_qbz5n2kfra8p0\LocalCache\local-packages\Python311\site-packages\google\api_core\retry\retry_unary.py", line 147, in retry_target
+    result = target()
+             ^^^^^^^^
+  File "C:\Users\iboci\AppData\Local\Packages\PythonSoftwareFoundation.Python.3.11_qbz5n2kfra8p0\LocalCache\local-packages\Python311\site-packages\google\api_core\timeout.py", line 130, in func_with_timeout
+    return func(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\iboci\AppData\Local\Packages\PythonSoftwareFoundation.Python.3.11_qbz5n2kfra8p0\LocalCache\local-packages\Python311\site-packages\google\api_core\grpc_helpers.py", line 57, in error_remapped_callable
+    raise exceptions.from_grpc_error(exc) from exc
+google.api_core.exceptions.NotFound: 404 models/gemini-pro is not found for API version v1beta, or is not supported for generateContent. Call ListModels to see the list of available models and their supported methods.
+2026-04-15 07:29:17,383 - src.core.executive - ERROR - Failed to generate response: 404 models/gemini-pro is not found for API version v1beta, or is not supported for generateContent. Call ListModels to see the list of available models and their supported methods.
+Traceback (most recent call last):
+  File "C:\Users\iboci\AppData\Local\Packages\PythonSoftwareFoundation.Python.3.11_qbz5n2kfra8p0\LocalCache\local-packages\Python311\site-packages\google\api_core\grpc_helpers.py", line 55, in error_remapped_callable
+    return callable_(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\iboci\AppData\Local\Packages\PythonSoftwareFoundation.Python.3.11_qbz5n2kfra8p0\LocalCache\local-packages\Python311\site-packages\grpc\_interceptor.py", line 276, in __call__
+    response, ignored_call = self._with_call(
+                             ^^^^^^^^^^^^^^^^
+  File "C:\Users\iboci\AppData\Local\Packages\PythonSoftwareFoundation.Python.3.11_qbz5n2kfra8p0\LocalCache\local-packages\Python311\site-packages\grpc\_interceptor.py", line 331, in _with_call
+    return call.result(), call
+           ^^^^^^^^^^^^^
+  File "C:\Users\iboci\AppData\Local\Packages\PythonSoftwareFoundation.Python.3.11_qbz5n2kfra8p0\LocalCache\local-packages\Python311\site-packages\grpc\_channel.py", line 438, in result
+    raise self
+  File "C:\Users\iboci\AppData\Local\Packages\PythonSoftwareFoundation.Python.3.11_qbz5n2kfra8p0\LocalCache\local-packages\Python311\site-packages\grpc\_interceptor.py", line 314, in continuation
+    response, call = self._thunk(new_method).with_call(
+                     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\iboci\AppData\Local\Packages\PythonSoftwareFoundation.Python.3.11_qbz5n2kfra8p0\LocalCache\local-packages\Python311\site-packages\grpc\_channel.py", line 1173, in with_call
+    return _end_unary_response_blocking(state, call, True, None)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\iboci\AppData\Local\Packages\PythonSoftwareFoundation.Python.3.11_qbz5n2kfra8p0\LocalCache\local-packages\Python311\site-packages\grpc\_channel.py", line 990, in _end_unary_response_blocking
+    raise _InactiveRpcError(state)  # pytype: disable=not-instantiable
+    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+grpc._channel._InactiveRpcError: <_InactiveRpcError of RPC that terminated with:
+	status = StatusCode.NOT_FOUND
+	details = "models/gemini-pro is not found for API version v1beta, or is not supported for generateContent. Call ListModels to see the list of available models and their supported methods."
+	debug_error_string = "UNKNOWN:Error received from peer ipv6:%5B2a00:1450:400d:812::200a%5D:443 {grpc_message:"models/gemini-pro is not found for API version v1beta, or is not supported for generateContent. Call ListModels to see the list of available models and their supported methods.", grpc_status:5}"
+>
+
+The above exception was the direct cause of the following exception:
+
+Traceback (most recent call last):
+  File "C:\Users\iboci\Live-Trading-bot\AI_Prototype\src\core\executive.py", line 196, in process_message
+    ai_response = self.cognitive_router.route_to_system_2(
+                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\iboci\Live-Trading-bot\AI_Prototype\src\core\llm_router.py", line 119, in route_to_system_2
+    response = self.model.generate_content(
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\iboci\AppData\Local\Packages\PythonSoftwareFoundation.Python.3.11_qbz5n2kfra8p0\LocalCache\local-packages\Python311\site-packages\google\generativeai\generative_models.py", line 331, in generate_content
+    response = self._client.generate_content(
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\iboci\AppData\Local\Packages\PythonSoftwareFoundation.Python.3.11_qbz5n2kfra8p0\LocalCache\local-packages\Python311\site-packages\google\ai\generativelanguage_v1beta\services\generative_service\client.py", line 835, in generate_content
+    response = rpc(
+               ^^^^
+  File "C:\Users\iboci\AppData\Local\Packages\PythonSoftwareFoundation.Python.3.11_qbz5n2kfra8p0\LocalCache\local-packages\Python311\site-packages\google\api_core\gapic_v1\method.py", line 128, in __call__
+    return wrapped_func(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\iboci\AppData\Local\Packages\PythonSoftwareFoundation.Python.3.11_qbz5n2kfra8p0\LocalCache\local-packages\Python311\site-packages\google\api_core\retry\retry_unary.py", line 294, in retry_wrapped_func
+    return retry_target(
+           ^^^^^^^^^^^^^
+  File "C:\Users\iboci\AppData\Local\Packages\PythonSoftwareFoundation.Python.3.11_qbz5n2kfra8p0\LocalCache\local-packages\Python311\site-packages\google\api_core\retry\retry_unary.py", line 156, in retry_target
+    next_sleep = _retry_error_helper(
+                 ^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\iboci\AppData\Local\Packages\PythonSoftwareFoundation.Python.3.11_qbz5n2kfra8p0\LocalCache\local-packages\Python311\site-packages\google\api_core\retry\retry_base.py", line 216, in _retry_error_helper
+    raise final_exc from source_exc
+  File "C:\Users\iboci\AppData\Local\Packages\PythonSoftwareFoundation.Python.3.11_qbz5n2kfra8p0\LocalCache\local-packages\Python311\site-packages\google\api_core\retry\retry_unary.py", line 147, in retry_target
+    result = target()
+             ^^^^^^^^
+  File "C:\Users\iboci\AppData\Local\Packages\PythonSoftwareFoundation.Python.3.11_qbz5n2kfra8p0\LocalCache\local-packages\Python311\site-packages\google\api_core\timeout.py", line 130, in func_with_timeout
+    return func(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\iboci\AppData\Local\Packages\PythonSoftwareFoundation.Python.3.11_qbz5n2kfra8p0\LocalCache\local-packages\Python311\site-packages\google\api_core\grpc_helpers.py", line 57, in error_remapped_callable
+    raise exceptions.from_grpc_error(exc) from exc
+google.api_core.exceptions.NotFound: 404 models/gemini-pro is not found for API version v1beta, or is not supported for generateContent. Call ListModels to see the list of available models and their supported methods.
+2026-04-15 07:29:17,479 - httpx - INFO - HTTP Request: POST https://api.telegram.org/bot8069214468:AAHVVL4vdqq7B7C-5w7tGEHB_5FkkU6zxdc/sendMessage "HTTP/1.1 200 OK"
+2026-04-15 07:29:17,483 - src.interfaces.telegram_bot - INFO - Response sent to user 8769582575
+2026-04-15 07:29:26,527 - httpx - INFO - HTTP Request: POST https://api.telegram.org/bot8069214468:AAHVVL4vdqq7B7C-5w7tGEHB_5FkkU6zxdc/getUpdates "HTTP/1.1 200 OK"
+2026-04-15 07:29:29,911 - httpx - INFO - HTTP Request: POST https://api.telegram.org/bot8069214468:AAHVVL4vdqq7B7C-5w7tGEHB_5FkkU6zxdc/getUpdates "HTTP/1.1 200 OK"
+2026-04-15 07:29:29,913 - src.interfaces.telegram_bot - INFO - Message received from user 8769582575: hi
+2026-04-15 07:29:30,008 - httpx - INFO - HTTP Request: POST https://api.telegram.org/bot8069214468:AAHVVL4vdqq7B7C-5w7tGEHB_5FkkU6zxdc/sendChatAction "HTTP/1.1 200 OK"
+2026-04-15 07:29:30,008 - src.core.executive - INFO - Processing message: hi...
+2026-04-15 07:29:30,043 - src.memory.vector_db - ERROR - Failed to query memory: 
+2026-04-15 07:29:30,043 - src.core.executive - ERROR - Failed to retrieve context: 
+2026-04-15 07:29:30,043 - src.core.llm_router - INFO - Routing to System 1 (Local Model)
+2026-04-15 07:29:30,043 - src.core.executive - INFO - Response generated (42 chars)
+2026-04-15 07:29:30,074 - src.memory.vector_db - ERROR - Failed to add memory: 
+2026-04-15 07:29:30,074 - src.core.executive - WARNING - Failed to store response in memory: 
+2026-04-15 07:29:30,136 - httpx - INFO - HTTP Request: POST https://api.telegram.org/bot8069214468:AAHVVL4vdqq7B7C-5w7tGEHB_5FkkU6zxdc/sendMessage "HTTP/1.1 200 OK"
+2026-04-15 07:29:30,138 - src.interfaces.telegram_bot - INFO - Response sent to user 8769582575
+2026-04-15 07:29:32,836 - httpx - INFO - HTTP Request: POST https://api.telegram.org/bot8069214468:AAHVVL4vdqq7B7C-5w7tGEHB_5FkkU6zxdc/getUpdates "HTTP/1.1 200 OK"
+2026-04-15 07:29:32,838 - src.interfaces.telegram_bot - INFO - Message received from user 8769582575: test code
+2026-04-15 07:29:32,879 - httpx - INFO - HTTP Request: POST https://api.telegram.org/bot8069214468:AAHVVL4vdqq7B7C-5w7tGEHB_5FkkU6zxdc/sendChatAction "HTTP/1.1 200 OK"
+2026-04-15 07:29:32,879 - src.core.executive - INFO - Processing message: test code...
+2026-04-15 07:29:32,943 - src.memory.vector_db - ERROR - Failed to query memory: 
+2026-04-15 07:29:32,943 - src.core.executive - ERROR - Failed to retrieve context: 
+2026-04-15 07:29:32,945 - src.core.llm_router - INFO - Routing to System 2 (Gemini API)
+2026-04-15 07:29:33,023 - src.core.llm_router - ERROR - System 2 error: 404 models/gemini-pro is not found for API version v1beta, or is not supported for generateContent. Call ListModels to see the list of available models and their supported methods.
+Traceback (most recent call last):
+  File "C:\Users\iboci\AppData\Local\Packages\PythonSoftwareFoundation.Python.3.11_qbz5n2kfra8p0\LocalCache\local-packages\Python311\site-packages\google\api_core\grpc_helpers.py", line 55, in error_remapped_callable
+    return callable_(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\iboci\AppData\Local\Packages\PythonSoftwareFoundation.Python.3.11_qbz5n2kfra8p0\LocalCache\local-packages\Python311\site-packages\grpc\_interceptor.py", line 276, in __call__
+    response, ignored_call = self._with_call(
+                             ^^^^^^^^^^^^^^^^
+  File "C:\Users\iboci\AppData\Local\Packages\PythonSoftwareFoundation.Python.3.11_qbz5n2kfra8p0\LocalCache\local-packages\Python311\site-packages\grpc\_interceptor.py", line 331, in _with_call
+    return call.result(), call
+           ^^^^^^^^^^^^^
+  File "C:\Users\iboci\AppData\Local\Packages\PythonSoftwareFoundation.Python.3.11_qbz5n2kfra8p0\LocalCache\local-packages\Python311\site-packages\grpc\_channel.py", line 438, in result
+    raise self
+  File "C:\Users\iboci\AppData\Local\Packages\PythonSoftwareFoundation.Python.3.11_qbz5n2kfra8p0\LocalCache\local-packages\Python311\site-packages\grpc\_interceptor.py", line 314, in continuation
+    response, call = self._thunk(new_method).with_call(
+                     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\iboci\AppData\Local\Packages\PythonSoftwareFoundation.Python.3.11_qbz5n2kfra8p0\LocalCache\local-packages\Python311\site-packages\grpc\_channel.py", line 1173, in with_call
+    return _end_unary_response_blocking(state, call, True, None)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\iboci\AppData\Local\Packages\PythonSoftwareFoundation.Python.3.11_qbz5n2kfra8p0\LocalCache\local-packages\Python311\site-packages\grpc\_channel.py", line 990, in _end_unary_response_blocking
+    raise _InactiveRpcError(state)  # pytype: disable=not-instantiable
+    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+grpc._channel._InactiveRpcError: <_InactiveRpcError of RPC that terminated with:
+	status = StatusCode.NOT_FOUND
+	details = "models/gemini-pro is not found for API version v1beta, or is not supported for generateContent. Call ListModels to see the list of available models and their supported methods."
+	debug_error_string = "UNKNOWN:Error received from peer ipv6:%5B2a00:1450:400d:812::200a%5D:443 {grpc_message:"models/gemini-pro is not found for API version v1beta, or is not supported for generateContent. Call ListModels to see the list of available models and their supported methods.", grpc_status:5}"
+>
+
+The above exception was the direct cause of the following exception:
+
+Traceback (most recent call last):
+  File "C:\Users\iboci\Live-Trading-bot\AI_Prototype\src\core\llm_router.py", line 119, in route_to_system_2
+    response = self.model.generate_content(
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\iboci\AppData\Local\Packages\PythonSoftwareFoundation.Python.3.11_qbz5n2kfra8p0\LocalCache\local-packages\Python311\site-packages\google\generativeai\generative_models.py", line 331, in generate_content
+    response = self._client.generate_content(
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\iboci\AppData\Local\Packages\PythonSoftwareFoundation.Python.3.11_qbz5n2kfra8p0\LocalCache\local-packages\Python311\site-packages\google\ai\generativelanguage_v1beta\services\generative_service\client.py", line 835, in generate_content
+    response = rpc(
+               ^^^^
+  File "C:\Users\iboci\AppData\Local\Packages\PythonSoftwareFoundation.Python.3.11_qbz5n2kfra8p0\LocalCache\local-packages\Python311\site-packages\google\api_core\gapic_v1\method.py", line 128, in __call__
+    return wrapped_func(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\iboci\AppData\Local\Packages\PythonSoftwareFoundation.Python.3.11_qbz5n2kfra8p0\LocalCache\local-packages\Python311\site-packages\google\api_core\retry\retry_unary.py", line 294, in retry_wrapped_func
+    return retry_target(
+           ^^^^^^^^^^^^^
+  File "C:\Users\iboci\AppData\Local\Packages\PythonSoftwareFoundation.Python.3.11_qbz5n2kfra8p0\LocalCache\local-packages\Python311\site-packages\google\api_core\retry\retry_unary.py", line 156, in retry_target
+    next_sleep = _retry_error_helper(
+                 ^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\iboci\AppData\Local\Packages\PythonSoftwareFoundation.Python.3.11_qbz5n2kfra8p0\LocalCache\local-packages\Python311\site-packages\google\api_core\retry\retry_base.py", line 216, in _retry_error_helper
+    raise final_exc from source_exc
+  File "C:\Users\iboci\AppData\Local\Packages\PythonSoftwareFoundation.Python.3.11_qbz5n2kfra8p0\LocalCache\local-packages\Python311\site-packages\google\api_core\retry\retry_unary.py", line 147, in retry_target
+    result = target()
+             ^^^^^^^^
+  File "C:\Users\iboci\AppData\Local\Packages\PythonSoftwareFoundation.Python.3.11_qbz5n2kfra8p0\LocalCache\local-packages\Python311\site-packages\google\api_core\timeout.py", line 130, in func_with_timeout
+    return func(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\iboci\AppData\Local\Packages\PythonSoftwareFoundation.Python.3.11_qbz5n2kfra8p0\LocalCache\local-packages\Python311\site-packages\google\api_core\grpc_helpers.py", line 57, in error_remapped_callable
+    raise exceptions.from_grpc_error(exc) from exc
+google.api_core.exceptions.NotFound: 404 models/gemini-pro is not found for API version v1beta, or is not supported for generateContent. Call ListModels to see the list of available models and their supported methods.
+2026-04-15 07:29:33,027 - src.core.executive - ERROR - Failed to generate response: 404 models/gemini-pro is not found for API version v1beta, or is not supported for generateContent. Call ListModels to see the list of available models and their supported methods.
+Traceback (most recent call last):
+  File "C:\Users\iboci\AppData\Local\Packages\PythonSoftwareFoundation.Python.3.11_qbz5n2kfra8p0\LocalCache\local-packages\Python311\site-packages\google\api_core\grpc_helpers.py", line 55, in error_remapped_callable
+    return callable_(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\iboci\AppData\Local\Packages\PythonSoftwareFoundation.Python.3.11_qbz5n2kfra8p0\LocalCache\local-packages\Python311\site-packages\grpc\_interceptor.py", line 276, in __call__
+    response, ignored_call = self._with_call(
+                             ^^^^^^^^^^^^^^^^
+  File "C:\Users\iboci\AppData\Local\Packages\PythonSoftwareFoundation.Python.3.11_qbz5n2kfra8p0\LocalCache\local-packages\Python311\site-packages\grpc\_interceptor.py", line 331, in _with_call
+    return call.result(), call
+           ^^^^^^^^^^^^^
+  File "C:\Users\iboci\AppData\Local\Packages\PythonSoftwareFoundation.Python.3.11_qbz5n2kfra8p0\LocalCache\local-packages\Python311\site-packages\grpc\_channel.py", line 438, in result
+    raise self
+  File "C:\Users\iboci\AppData\Local\Packages\PythonSoftwareFoundation.Python.3.11_qbz5n2kfra8p0\LocalCache\local-packages\Python311\site-packages\grpc\_interceptor.py", line 314, in continuation
+    response, call = self._thunk(new_method).with_call(
+                     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\iboci\AppData\Local\Packages\PythonSoftwareFoundation.Python.3.11_qbz5n2kfra8p0\LocalCache\local-packages\Python311\site-packages\grpc\_channel.py", line 1173, in with_call
+    return _end_unary_response_blocking(state, call, True, None)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\iboci\AppData\Local\Packages\PythonSoftwareFoundation.Python.3.11_qbz5n2kfra8p0\LocalCache\local-packages\Python311\site-packages\grpc\_channel.py", line 990, in _end_unary_response_blocking
+    raise _InactiveRpcError(state)  # pytype: disable=not-instantiable
+    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+grpc._channel._InactiveRpcError: <_InactiveRpcError of RPC that terminated with:
+	status = StatusCode.NOT_FOUND
+	details = "models/gemini-pro is not found for API version v1beta, or is not supported for generateContent. Call ListModels to see the list of available models and their supported methods."
+	debug_error_string = "UNKNOWN:Error received from peer ipv6:%5B2a00:1450:400d:812::200a%5D:443 {grpc_message:"models/gemini-pro is not found for API version v1beta, or is not supported for generateContent. Call ListModels to see the list of available models and their supported methods.", grpc_status:5}"
+>
+
+The above exception was the direct cause of the following exception:
+
+Traceback (most recent call last):
+  File "C:\Users\iboci\Live-Trading-bot\AI_Prototype\src\core\executive.py", line 196, in process_message
+    ai_response = self.cognitive_router.route_to_system_2(
+                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\iboci\Live-Trading-bot\AI_Prototype\src\core\llm_router.py", line 119, in route_to_system_2
+    response = self.model.generate_content(
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\iboci\AppData\Local\Packages\PythonSoftwareFoundation.Python.3.11_qbz5n2kfra8p0\LocalCache\local-packages\Python311\site-packages\google\generativeai\generative_models.py", line 331, in generate_content
+    response = self._client.generate_content(
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\iboci\AppData\Local\Packages\PythonSoftwareFoundation.Python.3.11_qbz5n2kfra8p0\LocalCache\local-packages\Python311\site-packages\google\ai\generativelanguage_v1beta\services\generative_service\client.py", line 835, in generate_content
+    response = rpc(
+               ^^^^
+  File "C:\Users\iboci\AppData\Local\Packages\PythonSoftwareFoundation.Python.3.11_qbz5n2kfra8p0\LocalCache\local-packages\Python311\site-packages\google\api_core\gapic_v1\method.py", line 128, in __call__
+    return wrapped_func(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\iboci\AppData\Local\Packages\PythonSoftwareFoundation.Python.3.11_qbz5n2kfra8p0\LocalCache\local-packages\Python311\site-packages\google\api_core\retry\retry_unary.py", line 294, in retry_wrapped_func
+    return retry_target(
+           ^^^^^^^^^^^^^
+  File "C:\Users\iboci\AppData\Local\Packages\PythonSoftwareFoundation.Python.3.11_qbz5n2kfra8p0\LocalCache\local-packages\Python311\site-packages\google\api_core\retry\retry_unary.py", line 156, in retry_target
+    next_sleep = _retry_error_helper(
+                 ^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\iboci\AppData\Local\Packages\PythonSoftwareFoundation.Python.3.11_qbz5n2kfra8p0\LocalCache\local-packages\Python311\site-packages\google\api_core\retry\retry_base.py", line 216, in _retry_error_helper
+    raise final_exc from source_exc
+  File "C:\Users\iboci\AppData\Local\Packages\PythonSoftwareFoundation.Python.3.11_qbz5n2kfra8p0\LocalCache\local-packages\Python311\site-packages\google\api_core\retry\retry_unary.py", line 147, in retry_target
+    result = target()
+             ^^^^^^^^
+  File "C:\Users\iboci\AppData\Local\Packages\PythonSoftwareFoundation.Python.3.11_qbz5n2kfra8p0\LocalCache\local-packages\Python311\site-packages\google\api_core\timeout.py", line 130, in func_with_timeout
+    return func(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\iboci\AppData\Local\Packages\PythonSoftwareFoundation.Python.3.11_qbz5n2kfra8p0\LocalCache\local-packages\Python311\site-packages\google\api_core\grpc_helpers.py", line 57, in error_remapped_callable
+    raise exceptions.from_grpc_error(exc) from exc
+google.api_core.exceptions.NotFound: 404 models/gemini-pro is not found for API version v1beta, or is not supported for generateContent. Call ListModels to see the list of available models and their supported methods.
+2026-04-15 07:29:33,116 - httpx - INFO - HTTP Request: POST https://api.telegram.org/bot8069214468:AAHVVL4vdqq7B7C-5w7tGEHB_5FkkU6zxdc/sendMessage "HTTP/1.1 200 OK"
+2026-04-15 07:29:33,118 - src.interfaces.telegram_bot - INFO - Response sent to user 8769582575
+2026-04-15 07:29:42,867 - httpx - INFO - HTTP Request: POST https://api.telegram.org/bot8069214468:AAHVVL4vdqq7B7C-5w7tGEHB_5FkkU6zxdc/getUpdates "HTTP/1.1 200 OK"
+2026-04-15 07:29:52,891 - httpx - INFO - HTTP Request: POST https://api.telegram.org/bot8069214468:AAHVVL4vdqq7B7C-5w7tGEHB_5FkkU6zxdc/getUpdates "HTTP/1.1 200 OK"
+2026-04-15 07:30:02,372 - httpx - INFO - HTTP Request: POST https://api.telegram.org/bot8069214468:AAHVVL4vdqq7B7C-5w7tGEHB_5FkkU6zxdc/getUpdates "HTTP/1.1 200 OK"
+2026-04-15 07:30:02,373 - telegram.ext.Application - INFO - Application is stopping. This might take a moment.
+2026-04-15 07:30:02,374 - telegram.ext.Application - INFO - Application.stop() complete
+2026-04-15 07:30:02,375 - src.interfaces.telegram_bot - INFO - Shutting down ExecutiveAgent...
+2026-04-15 07:30:02,375 - src.core.executive - INFO - Closing ExecutiveAgent
+2026-04-15 07:30:02,376 - src.memory.ledger_db - INFO - LedgerMemory connection closed
+2026-04-15 07:30:02,376 - src.core.executive - INFO - ExecutiveAgent shutdown complete

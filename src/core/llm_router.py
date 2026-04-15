@@ -28,12 +28,12 @@ class CognitiveRouter:
     System 2 (Gemini): Complex reasoning, multi-step analysis, creative tasks
     """
 
-    def __init__(self, model_name: str = "gemini-1.5-pro") -> None:
+    def __init__(self, model_name: str = "gemini-3.1-pro-preview") -> None:
         """
         Initialize the CognitiveRouter.
 
         Args:
-            model_name: The Gemini model to use for System 2. Defaults to "gemini-1.5-pro".
+            model_name: The Gemini model to use for System 2. Defaults to "gemini-3.1-pro-preview".
 
         Raises:
             ValueError: If GEMINI_API_KEY is not set in environment.
