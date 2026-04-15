@@ -22,6 +22,12 @@ class RequiresMFAError(Exception):
         self.arguments = arguments
         super().__init__(f"MFA required for tool: {tool_name}")
 
+class RequiresHITLError(Exception):
+    """Exception raised when the orchestrator needs to pause and ask the Admin for guidance."""
+    def __init__(self, message: str):
+        self.message = message
+        super().__init__(self.message)
+
 logger = logging.getLogger(__name__)
 
 # Load Gemini API key from environment
@@ -150,6 +156,12 @@ class CognitiveRouter:
                     if tool_name == "request_core_update":
                         raise RequiresMFAError(tool_name, arguments)
 
+                    # Intercept HITL requests
+                    if tool_name == "ask_admin_for_guidance":
+                        context_summary = arguments.get("context_summary", "")
+                        specific_question = arguments.get("specific_question", "")
+                        raise RequiresHITLError(f"Guidance Needed: {context_summary}\nQuestion: {specific_question}")
+
                     # Pause, call execute tool
                     tool_result = await self._execute_tool(tool_name, arguments)
 
@@ -273,6 +285,11 @@ class CognitiveRouter:
 
                         if tool_name == "request_core_update":
                             raise RequiresMFAError(tool_name, arguments)
+
+                        if tool_name == "ask_admin_for_guidance":
+                            context_summary = arguments.get("context_summary", "")
+                            specific_question = arguments.get("specific_question", "")
+                            raise RequiresHITLError(f"Guidance Needed: {context_summary}\nQuestion: {specific_question}")
 
                         # Execute tool
                         tool_result = await self._execute_tool(tool_name, arguments)

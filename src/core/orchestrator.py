@@ -17,7 +17,7 @@ from typing import Dict, Any, List
 from src.memory.vector_db import VectorMemory
 from src.memory.ledger_db import LedgerMemory, LogLevel
 from src.memory.core_memory import CoreMemory
-from src.core.llm_router import CognitiveRouter, RequiresMFAError
+from src.core.llm_router import CognitiveRouter, RequiresMFAError, RequiresHITLError
 from src.core.security import verify_mfa_challenge
 
 logger = logging.getLogger(__name__)
@@ -44,6 +44,7 @@ class Orchestrator:
 
             self.charter_text = self._load_charter()
             self.pending_mfa = {}
+            self.pending_hitl_state = {}
 
             logger.info("Orchestrator initialized successfully")
         except Exception as e:
@@ -144,6 +145,8 @@ class Orchestrator:
                 timeout=30.0
             )
             state["worker_outputs"]["research"] = response
+        except RequiresHITLError:
+            raise
         except Exception as e:
             logger.error(f"Research Agent failed: {e}")
             state["worker_outputs"]["research"] = f"Error: {e}"
@@ -175,6 +178,8 @@ class Orchestrator:
                 timeout=30.0
             )
             state["worker_outputs"]["coder"] = response
+        except RequiresHITLError:
+            raise
         except Exception as e:
             logger.error(f"Coder Agent failed: {e}")
             state["worker_outputs"]["coder"] = f"Error: {e}"
@@ -223,6 +228,11 @@ class Orchestrator:
             if not state.get("final_response"):
                 state["final_response"] = output_to_eval
 
+        if state["iteration_count"] >= 3 and state["critic_feedback"] != "PASS":
+            raise RequiresHITLError(
+                f"Guidance Needed: The Critic node continuously rejected the worker's output after 3 iterations.\nQuestion: How should I proceed to satisfy the charter?"
+            )
+
         return state
 
     async def process_message(self, user_message: str, user_id: str) -> str:
@@ -245,21 +255,35 @@ class Orchestrator:
                 del self.pending_mfa[user_id]
                 return "Error: MFA authorization failed. Action aborted."
 
-        state = {
-            "user_input": user_message,
-            "current_plan": [],
-            "worker_outputs": {},
-            "final_response": "",
-            "iteration_count": 0
-        }
+        if user_id in self.pending_hitl_state:
+            # Resume state
+            state = self.pending_hitl_state.pop(user_id)
+            state["admin_guidance"] = user_message
+            # Append guidance so the next node run sees it
+            state["user_input"] += f"\n[ADMIN GUIDANCE: {user_message}]"
+            # Reset iteration count to allow processing the new guidance
+            state["iteration_count"] = 0
+            # Force re-planning in the next step
+            state["current_plan"] = []
+        else:
+            # New state
+            state = {
+                "user_id": user_id,
+                "user_input": user_message,
+                "current_plan": [],
+                "worker_outputs": {},
+                "final_response": "",
+                "iteration_count": 0,
+                "admin_guidance": ""
+            }
 
         try:
             max_iterations = 3
 
             while state["iteration_count"] < max_iterations:
 
-                # 1. Supervisor (only run on first iteration)
-                if state["iteration_count"] == 0:
+                # 1. Supervisor (only run on first iteration, and if we don't have a plan)
+                if not state["current_plan"] and state["iteration_count"] == 0:
                     state = await self.supervisor_node(state)
                 else:
                     # Append critic feedback to user input to force correction
@@ -322,6 +346,9 @@ class Orchestrator:
                 "arguments": mfa_err.arguments
             }
             return "SECURITY LOCK: To authorize this core change, please complete the phrase: 'The sky is...'"
+        except RequiresHITLError as hitl_err:
+            self.pending_hitl_state[user_id] = state
+            return str(hitl_err)
         except Exception as e:
             logger.error(f"Graph execution failed: {e}", exc_info=True)
             return "An internal error occurred."
