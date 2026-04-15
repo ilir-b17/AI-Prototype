@@ -8,8 +8,9 @@ API (System 2) for complex, analytical reasoning.
 
 import os
 import logging
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, List
 import google.generativeai as genai
+import ollama
 
 logger = logging.getLogger(__name__)
 
@@ -45,48 +46,54 @@ class CognitiveRouter:
         self.model = genai.GenerativeModel(model_name) if GEMINI_API_KEY else None
         logger.info(f"CognitiveRouter initialized with model: {model_name}")
 
-    def route_to_system_1(
+    async def route_to_system_1(
         self,
-        prompt: str,
-        context: Optional[Dict[str, Any]] = None
+        messages: List[Dict[str, str]]
     ) -> str:
         """
         Route to System 1 (Local Model) - Fast, pattern-based responses.
 
-        This is a placeholder for the local Gemma 4 model. Currently returns
-        a mock response. Will be replaced with actual local inference.
+        Uses local Gemma 4 model via Ollama.
 
         Args:
-            prompt: The user's prompt/question.
-            context: Optional context dictionary (e.g., retrieved memories).
+            messages: List of message dictionaries, formatted for chat.
+                e.g., [{"role": "system", "content": "..."}, {"role": "user", "content": "..."}]
 
         Returns:
             str: The model's response.
         """
-        logger.info("Routing to System 1 (Local Model)")
+        logger.info("Routing to System 1 (Local Model - gemma4)")
 
-        if context:
-            context_str = ", ".join([f"{k}: {v}" for k, v in context.items()])
-            logger.debug(f"System 1 context: {context_str}")
+        try:
+            client = ollama.AsyncClient()
+            response = await client.chat(model='gemma4', messages=messages)
 
-        # Placeholder response for local model
-        response = f"[System 1 - Local Model] Processing: {prompt[:50]}..."
-        logger.debug(f"System 1 response: {response}")
-        return response
+            if response and 'message' in response and 'content' in response['message']:
+                result = response['message']['content'].strip()
+                logger.info(f"System 1 response received ({len(result)} chars)")
+                logger.debug(f"System 1 response: {result[:100]}...")
+                return result
+            else:
+                error_msg = "Unexpected response format from Ollama"
+                logger.warning(error_msg)
+                return f"[System 1 - Error]: {error_msg}"
 
-    def route_to_system_2(
+        except Exception as e:
+            error_msg = f"System 1 (Ollama) error: {str(e)}. Is the local server running at localhost:11434?"
+            logger.error(error_msg, exc_info=True)
+            return f"[System 1 - Error]: {error_msg}"
+
+    async def route_to_system_2(
         self,
-        prompt: str,
-        context: Optional[Dict[str, Any]] = None
+        messages: List[Dict[str, str]]
     ) -> str:
         """
         Route to System 2 (Gemini API) - Complex reasoning and analysis.
 
-        Sends the prompt to the Gemini API for advanced reasoning tasks.
+        Sends the messages to the Gemini API for advanced reasoning tasks.
 
         Args:
-            prompt: The user's prompt/question.
-            context: Optional context dictionary (e.g., retrieved memories).
+            messages: List of message dictionaries.
 
         Returns:
             str: The model's response from Gemini.
@@ -103,21 +110,36 @@ class CognitiveRouter:
         logger.info("Routing to System 2 (Gemini API)")
 
         try:
-            # Construct the full prompt with context if provided
-            full_prompt = prompt
+            system_instruction = None
+            history = []
 
-            if context:
-                # Include relevant context in the prompt
-                context_str = "\n".join(
-                    [f"- {k}: {v}" for k, v in context.items()]
-                )
-                full_prompt = f"{prompt}\n\nContext:\n{context_str}"
+            # Extract system instruction
+            if messages and messages[0].get("role") == "system":
+                system_instruction = messages[0].get("content")
+                # Gemini generative model supports system_instruction on init,
+                # but we can also prepend it to the first user message or configure it if needed.
+                # For `GenerativeModel`, we can set `system_instruction` parameter in `generate_content` or constructor.
+                # Since we initialize it in __init__ without system prompt, we will use it here.
+                # A common pattern is to just prepend it to the first user message if system_instruction is not configured globally.
 
-            logger.debug(f"System 2 prompt length: {len(full_prompt)}")
+            # Format messages for Gemini
+            gemini_messages = []
+            for msg in messages:
+                if msg["role"] == "system":
+                    continue # handled above
+
+                role = "user" if msg["role"] == "user" else "model"
+                gemini_messages.append({
+                    "role": role,
+                    "parts": [{"text": msg["content"]}]
+                })
+
+            if system_instruction and gemini_messages and gemini_messages[0]["role"] == "user":
+                 gemini_messages[0]["parts"][0]["text"] = f"System Instruction: {system_instruction}\n\n{gemini_messages[0]['parts'][0]['text']}"
 
             # Call Gemini API
-            response = self.model.generate_content(
-                full_prompt,
+            response = await self.model.generate_content_async(
+                gemini_messages,
                 generation_config=genai.types.GenerationConfig(
                     temperature=0.7,
                     top_p=0.95,

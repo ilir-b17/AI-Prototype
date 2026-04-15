@@ -6,6 +6,7 @@ retrieves context from memory, and routes decisions to the appropriate cognitive
 system (System 1 or System 2).
 """
 
+import os
 import logging
 from datetime import datetime
 from typing import Optional, Dict, Any, List
@@ -55,16 +56,36 @@ class ExecutiveAgent:
             # Initialize cognitive router
             self.cognitive_router = CognitiveRouter(model_name=gemini_model)
 
+            # Load Charter
+            self.charter_text = self._load_charter()
+
             logger.info("ExecutiveAgent initialized successfully")
             self.ledger_memory.log_event(
                 LogLevel.INFO,
                 "ExecutiveAgent initialized",
-                {"subsystems": ["VectorMemory", "LedgerMemory", "CognitiveRouter"]}
+                {"subsystems": ["VectorMemory", "LedgerMemory", "CognitiveRouter", "Charter"]}
             )
 
         except Exception as e:
             logger.error(f"Failed to initialize ExecutiveAgent: {e}", exc_info=True)
             raise
+
+    def _load_charter(self, filepath: str = "charter.md") -> str:
+        """
+        Loads the core identity charter.
+        """
+        try:
+            if os.path.exists(filepath):
+                with open(filepath, 'r') as f:
+                    charter = f.read().strip()
+                logger.info(f"Loaded charter from {filepath}")
+                return charter
+            else:
+                logger.critical(f"Charter file '{filepath}' not found! Using fallback directive.")
+                return "Core Directive: You are a rational, autonomous AI. You must prioritize logic, log your actions, and do no harm."
+        except Exception as e:
+            logger.critical(f"Failed to read charter file '{filepath}': {e}. Using fallback directive.")
+            return "Core Directive: You are a rational, autonomous AI. You must prioritize logic, log your actions, and do no harm."
 
     def _retrieve_context(self, user_message: str, n_results: int = 2) -> List[Dict[str, Any]]:
         """
@@ -138,7 +159,7 @@ class ExecutiveAgent:
         logger.debug("Routing to System 1 (default)")
         return "system_1"
 
-    def process_message(self, user_message: str) -> str:
+    async def process_message(self, user_message: str) -> str:
         """
         Process a user message through the executive pipeline.
 
@@ -186,22 +207,29 @@ class ExecutiveAgent:
 
             # Step 5: Get response from appropriate system
             try:
-                context_dict = {
-                    "system": system_choice,
-                    "timestamp": datetime.now().isoformat(),
-                    "memory_sources": len(context_memories)
-                }
+                # Format messages array
+                messages = [
+                    {"role": "system", "content": self.charter_text}
+                ]
+
+                # Add context as an assistant or system thought
+                if context_memories:
+                    context_str = "\n".join([f"- {m['document']}" for m in context_memories])
+                    messages.append({
+                        "role": "user",
+                        "content": f"[Context Retrieval System]: Retrieved relevant memories:\n{context_str}"
+                    })
+                    messages.append({
+                        "role": "assistant",
+                        "content": "I have acknowledged the retrieved context and will use it to inform my response if relevant."
+                    })
+
+                messages.append({"role": "user", "content": user_message})
 
                 if system_choice == "system_2" and self.cognitive_router.get_system_2_available():
-                    ai_response = self.cognitive_router.route_to_system_2(
-                        user_message,
-                        context=context_dict
-                    )
+                    ai_response = await self.cognitive_router.route_to_system_2(messages)
                 else:
-                    ai_response = self.cognitive_router.route_to_system_1(
-                        user_message,
-                        context=context_dict
-                    )
+                    ai_response = await self.cognitive_router.route_to_system_1(messages)
 
                 logger.info(f"Response generated ({len(ai_response)} chars)")
 
