@@ -152,6 +152,14 @@ class CognitiveRouter:
             flags=re.IGNORECASE,
         )
 
+        # Internal planning/scratchpad sections the model sometimes generates
+        # Strips: ## ⚙️ Section Title, [Output Draft], [Internal Critique], [Finalized Deliverable]
+        text = re.sub(r'^#{1,3}\s.*$', '', text, flags=re.MULTILINE)
+        text = re.sub(r'\[Output Draft\].*?(?=\[|$)', '', text, flags=re.DOTALL | re.IGNORECASE)
+        text = re.sub(r'\[Internal Critique\].*?(?=\[|$)', '', text, flags=re.DOTALL | re.IGNORECASE)
+        text = re.sub(r'\[Finalized Deliverable\]\s*', '', text, flags=re.IGNORECASE)
+        text = re.sub(r'---+\s*\n', '', text)  # horizontal rule separators
+
         # Collapse leftover blank lines
         text = re.sub(r'\n{3,}', '\n\n', text)
 
@@ -166,6 +174,9 @@ class CognitiveRouter:
         # Dynamic tools registered at runtime after Admin approval
         # key: tool_name  →  value: async callable
         self.dynamic_tools: dict = {}
+
+        # System 1: cached Ollama client — created once, reused across all calls
+        self._ollama_client: Optional[ollama.AsyncClient] = None
 
         # System 2 provider selection: Groq takes priority over Gemini
         self.groq_client = None
@@ -182,6 +193,15 @@ class CognitiveRouter:
             logger.warning("No System 2 available. Set GROQ_API_KEY (free) or GEMINI_API_KEY + USE_GEMINI=True.")
 
         logger.info(f"CognitiveRouter initialized. System 1: {local_model}")
+
+    async def close(self) -> None:
+        """Release the cached Ollama client connection."""
+        if self._ollama_client is not None:
+            try:
+                await self._ollama_client.close()
+            except Exception as e:
+                logger.debug(f"Error closing Ollama client: {e}")
+            self._ollama_client = None
 
     async def route_to_system_1(
         self,
@@ -203,9 +223,11 @@ class CognitiveRouter:
         """
         logger.info(f"Routing to System 1 (Local Model - {self.local_model})")
 
-        client = None
         try:
-            client = ollama.AsyncClient()
+            # Reuse cached client — avoids connection overhead on every call
+            if self._ollama_client is None:
+                self._ollama_client = ollama.AsyncClient()
+            client = self._ollama_client
 
             # Format tools for Ollama
             ollama_tools = []
@@ -224,11 +246,13 @@ class CognitiveRouter:
 
             # Use configured local model (default: gemma4:e4b, fallback: gemma2)
             available_model = self.local_model
+            active_tools = ollama_tools or None
             try:
                 response = await asyncio.wait_for(
                     client.chat(
                         model=available_model,
-                        messages=messages
+                        messages=messages,
+                        tools=active_tools
                     ),
                     timeout=60.0
                 )
@@ -239,7 +263,8 @@ class CognitiveRouter:
                     response = await asyncio.wait_for(
                         client.chat(
                             model=available_model,
-                            messages=messages
+                            messages=messages,
+                            tools=active_tools
                         ),
                         timeout=60.0
                     )
@@ -254,7 +279,8 @@ class CognitiveRouter:
                         response = await asyncio.wait_for(
                             client.chat(
                                 model=available_model,
-                                messages=messages
+                                messages=messages,
+                                tools=active_tools
                             ),
                             timeout=60.0
                         )
@@ -309,7 +335,8 @@ class CognitiveRouter:
                     final_response = await asyncio.wait_for(
                         client.chat(
                             model=available_model,
-                            messages=followup_messages
+                            messages=followup_messages,
+                            tools=active_tools
                         ),
                         timeout=60.0
                     )
@@ -339,13 +366,6 @@ class CognitiveRouter:
             error_msg = f"System 1 (Local Model) error: {str(e)}. Make sure Ollama is running with a model like 'gemma4:e4b' or 'gemma2' available."
             logger.error(error_msg, exc_info=True)
             return f"[System 1 - Error]: {error_msg}"
-        finally:
-            # Properly close the client to avoid resource leak
-            try:
-                if client:
-                    await client.close()
-            except Exception as e:
-                logger.debug(f"Error closing Ollama client: {e}")
 
     async def _route_to_gemini(
         self,
@@ -632,18 +652,94 @@ Rules:
             raise RuntimeError("No System 2 provider configured. Set GROQ_API_KEY or GEMINI_API_KEY+USE_GEMINI=True.")
 
     async def _route_to_groq(self, messages: List[Dict[str, str]]) -> str:
-        """Route to Groq API (llama-3.3-70b or configured model)."""
+        """Route to Groq API (llama-3.3-70b or configured model) with full tool calling."""
         logger.info(f"Routing to System 2 (Groq/{self.groq_model})")
         try:
-            # Groq uses OpenAI-compatible format — messages pass through as-is
+            # Format tools in OpenAI-compatible format for Groq
+            groq_tools = [
+                {
+                    "type": "function",
+                    "function": {
+                        "name": tool["name"],
+                        "description": tool["description"],
+                        "parameters": tool["parameters"],
+                    }
+                }
+                for tool in SYSTEM_TOOLS_SCHEMA
+            ]
+
             response = await self.groq_client.chat.completions.create(
                 model=self.groq_model,
                 messages=messages,
+                tools=groq_tools,
+                tool_choice="auto",
                 max_tokens=2048,
             )
-            result = response.choices[0].message.content.strip()
+
+            choice = response.choices[0]
+
+            # Handle tool calls
+            if choice.finish_reason == "tool_calls" and choice.message.tool_calls:
+                tool_call = choice.message.tool_calls[0]
+                tool_name = tool_call.function.name
+                try:
+                    arguments = json.loads(tool_call.function.arguments)
+                except (json.JSONDecodeError, TypeError):
+                    arguments = {}
+
+                logger.info(f"Groq requested tool call: {tool_name}")
+
+                # Security intercepts (same as System 1)
+                if tool_name == "request_core_update":
+                    raise RequiresMFAError(tool_name, arguments)
+                if tool_name == "ask_admin_for_guidance":
+                    raise RequiresHITLError(
+                        f"Guidance Needed: {arguments.get('context_summary', '')}\n"
+                        f"Question: {arguments.get('specific_question', '')}"
+                    )
+                if tool_name == "request_capability":
+                    raise RequiresCapabilitySynthesisError(
+                        gap_description=arguments.get("gap_description", "unspecified gap"),
+                        suggested_tool_name=arguments.get("suggested_tool_name", "new_tool"),
+                    )
+
+                tool_result = await self._execute_tool(tool_name, arguments)
+                logger.info(f"Groq tool '{tool_name}' executed: {tool_result[:100]}")
+
+                # Follow-up in proper OpenAI tool-result format
+                followup_messages = list(messages) + [
+                    {
+                        "role": "assistant",
+                        "content": None,
+                        "tool_calls": [{
+                            "id": tool_call.id,
+                            "type": "function",
+                            "function": {"name": tool_name, "arguments": tool_call.function.arguments}
+                        }]
+                    },
+                    {
+                        "role": "tool",
+                        "tool_call_id": tool_call.id,
+                        "content": tool_result
+                    }
+                ]
+
+                final_response = await self.groq_client.chat.completions.create(
+                    model=self.groq_model,
+                    messages=followup_messages,
+                    max_tokens=2048,
+                )
+                result = final_response.choices[0].message.content.strip()
+                logger.info(f"System 2 (Groq) response after tool call ({len(result)} chars)")
+                return result
+
+            # Standard text response
+            result = choice.message.content.strip()
             logger.info(f"System 2 (Groq) response received ({len(result)} chars)")
             return result
+
+        except (RequiresMFAError, RequiresHITLError, RequiresCapabilitySynthesisError):
+            raise
         except Exception as e:
             logger.error(f"Groq error: {e}", exc_info=True)
             raise

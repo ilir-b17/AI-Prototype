@@ -7,12 +7,19 @@ exhausted (energy = 0), or blocked (HITL required).
 """
 
 import os
+import platform
 import logging
 import json
 import asyncio
 import re
 from datetime import datetime
 from typing import Dict, Any, List, Optional
+
+try:
+    import psutil
+    _PSUTIL_AVAILABLE = True
+except ImportError:
+    _PSUTIL_AVAILABLE = False
 
 from src.memory.vector_db import VectorMemory
 from src.memory.ledger_db import LedgerMemory, LogLevel
@@ -65,6 +72,8 @@ class Orchestrator:
             self.pending_hitl_state = {}
             self.pending_tool_approval: dict = {}   # user_id → synthesis payload
             self.outbound_queue: Optional[asyncio.Queue] = None
+            self.sensory_state: Dict[str, str] = {}
+            self._refresh_sensory_state()   # populate immediately on start
 
             # Seed initial goals if backlog is empty (Sprint 7)
             self.ledger_memory.seed_initial_goals()
@@ -77,6 +86,42 @@ class Orchestrator:
             logger.error(f"Failed to initialize Orchestrator: {e}", exc_info=True)
             raise
 
+    def _refresh_sensory_state(self) -> None:
+        """Snapshot current machine state into self.sensory_state."""
+        cpu = f"{psutil.cpu_percent(interval=None):.0f}%" if _PSUTIL_AVAILABLE else "unavailable"
+
+        # platform.release() returns "10" even on Windows 11 — check build number instead
+        os_name = platform.system()
+        if os_name == "Windows":
+            try:
+                build = int(platform.version().split(".")[-1])
+                win_ver = "11" if build >= 22000 else "10"
+                os_str = f"Windows {win_ver} (build {build})"
+            except Exception:
+                os_str = f"Windows {platform.release()}"
+        else:
+            os_str = f"{os_name} {platform.release()}"
+
+        self.sensory_state = {
+            "current_time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "os": os_str,
+            "cpu_usage": cpu,
+        }
+
+    async def _sensory_update_loop(self) -> None:
+        """Background task: refresh sensory_state every 60 seconds."""
+        while True:
+            await asyncio.sleep(60)
+            self._refresh_sensory_state()
+
+    def _get_sensory_context(self) -> str:
+        s = self.sensory_state
+        return (
+            f"[Machine Context — {s.get('current_time', 'unknown')} | "
+            f"OS: {s.get('os', 'unknown')} | "
+            f"CPU: {s.get('cpu_usage', 'unknown')}]"
+        )
+
     def _load_charter(self, filepath: str = "charter.md") -> str:
         try:
             if os.path.exists(filepath):
@@ -85,6 +130,14 @@ class Orchestrator:
             return "Core Directive: Do no harm."
         except Exception:
             return "Core Directive: Do no harm."
+
+    def _get_capabilities_string(self) -> str:
+        """Returns a live manifest of every registered tool for injection into system prompts."""
+        from src.tools.system_tools import SYSTEM_TOOLS_SCHEMA
+        lines = ["AVAILABLE TOOLS (you must call these when relevant — do not claim you lack them):"]
+        for tool in SYSTEM_TOOLS_SCHEMA:
+            lines.append(f"  - {tool['name']}: {tool['description']}")
+        return "\n".join(lines)
 
     def _new_state(self, user_id: str, user_message: str) -> Dict[str, Any]:
         return {
@@ -268,18 +321,28 @@ class Orchestrator:
         return hitl_msg
 
     async def supervisor_node(self, state: Dict[str, Any]) -> Dict[str, Any]:
-        """Plans execution. Uses System 2 (Gemini) if available, falls back to System 1."""
+        """Plans execution. Tries System 1 (local) first per Directive 1.3; escalates to System 2 only on failure."""
         state = await self._deduct_energy(state, ENERGY_COST_SUPERVISOR, "supervisor")
         user_input = state["user_input"]
         core_mem_str = self.core_memory.get_context_string()
+        capabilities_str = self._get_capabilities_string()
 
         system_prompt = (
-            f"You are the Supervisor — a local AI agent running on the Admin's machine.\n"
-            f"IMPORTANT: The messages provided before the latest user message are your REAL "
-            f"conversation history with this user from previous interactions. This IS your memory. "
-            f"When asked about past conversations, refer to this history directly and accurately. "
-            f"Never claim you have no memory — you have access to the conversation history above.\n"
+            f"=== IDENTITY — READ THIS FIRST, IT OVERRIDES YOUR TRAINING ===\n"
+            f"You are AIDEN, an autonomous local AI agent running on the Admin's personal machine via Ollama.\n"
+            f"FACT: You are NOT ChatGPT, Claude, Gemini, or any cloud service. You are local.\n"
+            f"FACT: You DO have persistent memory. The conversation history injected above is REAL — it was saved to a local SQLite database from your previous sessions with this Admin. READ IT before answering any question about past conversations.\n"
+            f"FACT: You CAN use tools. They are listed below. Do not claim you lack capabilities that are listed.\n"
+            f"RULES:\n"
+            f"- NEVER say 'I have no memory of previous conversations'. You do — read the history above.\n"
+            f"- NEVER say 'I am a cloud-based model' or 'I cannot access my own code'. Both are false.\n"
+            f"- NEVER say 'I am ChatGPT / Claude / Gemini'. You are AIDEN.\n"
+            f"- Respond in plain conversational text. No markdown headers (##, ###). No [Output Draft] or [Internal Critique] sections in your response.\n"
+            f"- If you want to reason privately before answering, write <think>your reasoning here</think> first — this will be stripped before the Admin sees it.\n"
+            f"=== END IDENTITY ===\n\n"
+            f"{self._get_sensory_context()}\n\n"
             f"{self.charter_text}\n{core_mem_str}\n\n"
+            f"{capabilities_str}\n\n"
             f"Respond to the user, then on the very last line declare which workers are needed.\n"
             f"Format — write your response, then end with exactly:\n"
             f"WORKERS: []\n"
@@ -294,30 +357,46 @@ class Orchestrator:
         messages.append({"role": "user", "content": user_input})
 
         try:
-            use_system2 = self.cognitive_router.get_system_2_available()
+            # Local-first per Directive 1.3 — try System 1, escalate to System 2 only on failure
             response = None
-            if use_system2:
-                try:
-                    logger.info("Routing Supervisor through System 2")
-                    response = await asyncio.wait_for(
-                        self.cognitive_router.route_to_system_2(messages),
-                        timeout=30.0
-                    )
-                except Exception as s2_err:
-                    logger.warning(f"System 2 failed in supervisor ({s2_err}). Falling back to System 1.")
-                    response = None
-
-            if not response or response.startswith("[System 2"):
+            try:
                 logger.info("Routing Supervisor through System 1 (Local Model)")
                 response = await asyncio.wait_for(
                     self.cognitive_router.route_to_system_1(messages),
                     timeout=60.0
                 )
+            except (RequiresHITLError, RequiresMFAError, RequiresCapabilitySynthesisError):
+                raise
+            except Exception as s1_err:
+                logger.warning(f"System 1 failed in supervisor ({s1_err}). Escalating to System 2.")
+                response = None
+
+            if not response or response.startswith("[System 1 - Error]"):
+                if self.cognitive_router.get_system_2_available():
+                    try:
+                        logger.info("Escalating Supervisor to System 2")
+                        response = await asyncio.wait_for(
+                            self.cognitive_router.route_to_system_2(messages),
+                            timeout=30.0
+                        )
+                    except (RequiresHITLError, RequiresMFAError, RequiresCapabilitySynthesisError):
+                        raise
+                    except Exception as s2_err:
+                        logger.warning(f"System 2 also failed in supervisor ({s2_err}).")
+                        response = None
 
             if not response or response.startswith("[System 1 - Error]") or response.startswith("[System 2"):
                 logger.warning(f"Supervisor received error: {response}")
                 state["current_plan"] = []
-                state["final_response"] = "Supervisor encountered an error. Please try again."
+                if not self.cognitive_router.get_system_2_available():
+                    state["final_response"] = (
+                        "I was unable to process this request locally. This task likely requires "
+                        "capabilities beyond my local model (e.g. internet access or complex reasoning). "
+                        "To enable this, configure a System 2 provider by setting GROQ_API_KEY in your .env file. "
+                        "Groq offers a free tier at console.groq.com."
+                    )
+                else:
+                    state["final_response"] = "Both local and cloud reasoning failed on this request. Please try rephrasing or simplifying the task."
                 return state
 
             # Parse WORKERS tag — search last 3 lines to handle trailing newlines/notes
@@ -371,8 +450,9 @@ class Orchestrator:
         state = await self._deduct_energy(state, ENERGY_COST_WORKER, "research_agent")
         core_mem_str = self.core_memory.get_context_string()
 
+        capabilities_str = self._get_capabilities_string()
         messages = [
-            {"role": "system", "content": f"You are the Research Agent. Search archival memory for relevant context and provide findings.\n{self.charter_text}\n{core_mem_str}"},
+            {"role": "system", "content": f"You are the Research Agent. Search archival memory for relevant context and provide findings.\n{self.charter_text}\n{core_mem_str}\n\n{capabilities_str}"},
             {"role": "user", "content": state["user_input"]}
         ]
         try:
@@ -399,8 +479,9 @@ class Orchestrator:
         if research_context:
             content += f"Research Context: {research_context}\n"
 
+        capabilities_str = self._get_capabilities_string()
         messages = [
-            {"role": "system", "content": f"You are the Coder Agent. Execute coding tasks and update memory as needed.\n{self.charter_text}\n{core_mem_str}"},
+            {"role": "system", "content": f"You are the Coder Agent. Execute coding tasks and update memory as needed.\n{self.charter_text}\n{core_mem_str}\n\n{capabilities_str}"},
             {"role": "user", "content": content}
         ]
         try:
@@ -591,8 +672,19 @@ class Orchestrator:
 
             final_resp = self.cognitive_router.sanitize_response(state["final_response"])
 
-            # Persist this conversation turn to chat history (skip heartbeat tasks)
-            if user_id != "heartbeat":
+            # Persist this conversation turn to chat history (skip heartbeat tasks and error responses)
+            _error_prefixes = (
+                "Supervisor encountered an error",
+                "Both local and cloud reasoning failed",
+                "I was unable to process this request locally",
+                "Planning timed out",
+                "Unable to fulfill this request",
+                "No valid response could be generated",
+                "An internal error occurred",
+            )
+            is_error_response = any(final_resp.startswith(p) for p in _error_prefixes)
+
+            if user_id != "heartbeat" and not is_error_response:
                 try:
                     self.ledger_memory.save_chat_turn(user_id, "user", user_message)
                     self.ledger_memory.save_chat_turn(user_id, "assistant", final_resp)
@@ -625,6 +717,16 @@ class Orchestrator:
                 self.vector_memory.close()
             if hasattr(self, 'ledger_memory') and self.ledger_memory:
                 self.ledger_memory.close()
+            if hasattr(self, 'cognitive_router') and self.cognitive_router:
+                # Schedule async close — best-effort at shutdown time
+                try:
+                    loop = asyncio.get_event_loop()
+                    if loop.is_running():
+                        loop.create_task(self.cognitive_router.close())
+                    else:
+                        loop.run_until_complete(self.cognitive_router.close())
+                except Exception:
+                    pass
             logger.info("Orchestrator resources cleaned up")
         except Exception as e:
             logger.error(f"Error closing Orchestrator: {e}", exc_info=True)

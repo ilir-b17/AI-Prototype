@@ -36,24 +36,43 @@ class VectorMemory:
             Exception: If ChromaDB initialization fails.
         """
         self.persist_dir = persist_dir
+        self.collection = None
 
         # Ensure the persistence directory exists
         os.makedirs(self.persist_dir, exist_ok=True)
 
         try:
             # Initialize ChromaDB client with persistence enabled
+            # Disable telemetry to avoid capture() errors
             settings = Settings(
                 is_persistent=True,
                 persist_directory=self.persist_dir,
                 anonymized_telemetry=False,
+                allow_reset=True,
             )
             self.client = chromadb.Client(settings)
 
-            # Get or create the default collection
-            self.collection = self.client.get_or_create_collection(
-                name="agent_memory",
-                metadata={"hnsw:space": "cosine"}
-            )
+            # Try to get or create the default collection
+            try:
+                self.collection = self.client.get_or_create_collection(
+                    name="agent_memory",
+                    metadata={"hnsw:space": "cosine"}
+                )
+            except Exception as collection_error:
+                logger.warning(f"Collection initialization failed: {collection_error}. Attempting recovery...")
+                # Try to recover by resetting the collection
+                try:
+                    self.client.delete_collection(name="agent_memory")
+                    logger.info("Deleted corrupted collection")
+                except Exception:
+                    pass  # Collection may not exist yet
+
+                # Create fresh collection
+                self.collection = self.client.create_collection(
+                    name="agent_memory",
+                    metadata={"hnsw:space": "cosine"}
+                )
+                logger.info("Created fresh collection after recovery")
 
             logger.info(f"VectorMemory initialized with persistence at {self.persist_dir}")
         except Exception as e:
@@ -67,7 +86,7 @@ class VectorMemory:
         memory_id: Optional[str] = None
     ) -> str:
         """
-        Add a semantic memory to the vector database.
+        Add a semantic memory to the vector database with retry logic.
 
         Args:
             text: The text content of the memory.
@@ -81,7 +100,7 @@ class VectorMemory:
 
         Raises:
             ValueError: If text is empty or None.
-            Exception: If insertion into ChromaDB fails.
+            Exception: If insertion into ChromaDB fails after retries.
         """
         if not text or not isinstance(text, str):
             raise ValueError("Text must be a non-empty string")
@@ -93,19 +112,28 @@ class VectorMemory:
         if not memory_id:
             memory_id = str(uuid.uuid4())
 
-        try:
-            # Add memory to the collection with explicit ID
-            self.collection.add(
-                ids=[memory_id],
-                documents=[text],
-                metadatas=[metadata]
-            )
+        # Retry logic for transient failures
+        max_retries = 3
+        for attempt in range(max_retries):
+            try:
+                # Add memory to the collection with explicit ID
+                self.collection.add(
+                    ids=[memory_id],
+                    documents=[text],
+                    metadatas=[metadata]
+                )
 
-            logger.info(f"Memory added with ID: {memory_id}")
-            return memory_id
-        except Exception as e:
-            logger.error(f"Failed to add memory: {e}")
-            raise
+                logger.info(f"Memory added with ID: {memory_id}")
+                return memory_id
+            except Exception as e:
+                if attempt < max_retries - 1:
+                    logger.warning(f"Failed to add memory (attempt {attempt + 1}/{max_retries}): {e}")
+                    # Wait briefly before retry
+                    import time
+                    time.sleep(0.5)
+                else:
+                    logger.error(f"Failed to add memory after {max_retries} attempts: {e}")
+                    raise
 
     def query_memory(
         self,
@@ -212,3 +240,15 @@ class VectorMemory:
         except Exception as e:
             logger.error(f"Failed to clear all memories: {e}")
             raise
+
+    def close(self) -> None:
+        """
+        Close the ChromaDB client and release resources.
+        """
+        try:
+            if hasattr(self, 'client') and self.client:
+                # ChromaDB doesn't have an explicit close, but we can set to None
+                logger.info("Closing VectorMemory connections")
+                self.client = None
+        except Exception as e:
+            logger.warning(f"Error closing VectorMemory: {e}")
