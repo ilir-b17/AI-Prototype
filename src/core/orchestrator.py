@@ -200,9 +200,13 @@ class Orchestrator:
         core_mem_str = self.core_memory.get_context_string()
 
         system_prompt = (
-            f"You are the Supervisor. Respond to the user, then on the very last line "
-            f"declare which workers are needed.\n"
+            f"You are the Supervisor — a local AI agent running on the Admin's machine.\n"
+            f"IMPORTANT: The messages provided before the latest user message are your REAL "
+            f"conversation history with this user from previous interactions. This IS your memory. "
+            f"When asked about past conversations, refer to this history directly and accurately. "
+            f"Never claim you have no memory — you have access to the conversation history above.\n"
             f"{self.charter_text}\n{core_mem_str}\n\n"
+            f"Respond to the user, then on the very last line declare which workers are needed.\n"
             f"Format — write your response, then end with exactly:\n"
             f"WORKERS: []\n"
             f"or WORKERS: [\"research_agent\"] or WORKERS: [\"coder_agent\"]\n"
