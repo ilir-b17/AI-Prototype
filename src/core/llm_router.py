@@ -26,6 +26,7 @@ from src.tools.system_tools import (
     SYSTEM_TOOLS_SCHEMA, update_ledger, request_core_update,
     update_core_memory, search_archival_memory,
     query_highest_priority_task, spawn_new_objective, update_objective_status,
+    get_system_info,
 )
 
 class RequiresMFAError(Exception):
@@ -38,6 +39,13 @@ class RequiresHITLError(Exception):
     def __init__(self, message: str):
         self.message = message
         super().__init__(self.message)
+
+class RequiresCapabilitySynthesisError(Exception):
+    """Raised when System 1 calls request_capability — signals a tool gap to the orchestrator."""
+    def __init__(self, gap_description: str, suggested_tool_name: str):
+        self.gap_description = gap_description
+        self.suggested_tool_name = suggested_tool_name
+        super().__init__(f"Capability gap: {gap_description}")
 
 logger = logging.getLogger(__name__)
 
@@ -96,6 +104,11 @@ class CognitiveRouter:
                     task_id=arguments.get("task_id", 0),
                     new_status=arguments.get("new_status", "completed")
                 )
+            elif tool_name == "get_system_info":
+                return await get_system_info()
+            elif tool_name in self.dynamic_tools:
+                fn = self.dynamic_tools[tool_name]
+                return await fn(**arguments)
             else:
                 return f"Error: Unknown tool {tool_name}."
         except Exception as e:
@@ -149,6 +162,10 @@ class CognitiveRouter:
     def __init__(self, model_name: str = "gemini-2.0-flash", local_model: str = "gemma4:e4b") -> None:
         self.model_name = model_name
         self.local_model = local_model
+
+        # Dynamic tools registered at runtime after Admin approval
+        # key: tool_name  →  value: async callable
+        self.dynamic_tools: dict = {}
 
         # System 2 provider selection: Groq takes priority over Gemini
         self.groq_client = None
@@ -266,6 +283,13 @@ class CognitiveRouter:
                         context_summary = arguments.get("context_summary", "")
                         specific_question = arguments.get("specific_question", "")
                         raise RequiresHITLError(f"Guidance Needed: {context_summary}\nQuestion: {specific_question}")
+
+                    # Intercept capability gap signals — hand off to orchestrator
+                    if tool_name == "request_capability":
+                        raise RequiresCapabilitySynthesisError(
+                            gap_description=arguments.get("gap_description", "unspecified gap"),
+                            suggested_tool_name=arguments.get("suggested_tool_name", "new_tool"),
+                        )
 
                     # Pause, call execute tool
                     tool_result = await self._execute_tool(tool_name, arguments)
@@ -453,13 +477,142 @@ class CognitiveRouter:
             logger.error(error_msg, exc_info=True)
             raise
 
-    def get_system_1_available(self) -> bool:
+    async def synthesize_tool(
+        self,
+        gap_description: str,
+        suggested_tool_name: str,
+        user_query: str,
+    ) -> Dict[str, str]:
         """
-        Check if System 1 (local model) is available.
+        Ask System 2 to draft a new Python tool for a capability gap.
 
-        Returns:
-            bool: True if System 1 is available (always true for placeholder).
+        Returns a dict with keys: tool_name, description, code, schema_json.
+        Raises RuntimeError if System 2 is unavailable or parsing fails.
         """
+        logger.info(f"Synthesising tool for gap: {gap_description!r}")
+
+        synthesis_prompt = f"""You are the Tool Synthesis Engine for a local autonomous AI agent.
+
+The agent's System 1 (local model) identified a capability gap:
+  Gap: {gap_description}
+  Suggested tool name: {suggested_tool_name}
+  Original user query that triggered the gap: {user_query}
+
+Write a safe, minimal, async Python tool to fill this gap.
+
+STRICT OUTPUT FORMAT — use exactly these delimiters, no extra text:
+
+TOOL_NAME: {suggested_tool_name}
+DESCRIPTION: <one-sentence description>
+PYTHON_CODE:
+```python
+import asyncio  # add any stdlib imports needed
+async def {suggested_tool_name}() -> str:
+    \"\"\"Docstring here.\"\"\"
+    try:
+        # implementation
+        return "result string"
+    except Exception as e:
+        return f"Error: {{e}}"
+```
+TOOL_SCHEMA:
+```json
+{{
+  "name": "{suggested_tool_name}",
+  "description": "<same one-sentence description>",
+  "parameters": {{
+    "type": "object",
+    "properties": {{}},
+    "required": []
+  }}
+}}
+```
+
+Rules:
+- Only use Python standard library (no pip installs).
+- Function must be async.
+- Must return a plain string.
+- No file writes, no network calls to external services unless the gap explicitly requires it.
+- Parameters dict may have properties if the tool needs arguments; otherwise keep empty.
+"""
+
+        messages = [
+            {"role": "system", "content": "You are a precise code generation engine. Follow the output format exactly."},
+            {"role": "user", "content": synthesis_prompt},
+        ]
+
+        raw = await self.route_to_system_2(messages)
+        return self._parse_synthesis_output(raw, suggested_tool_name)
+
+    @staticmethod
+    def _parse_synthesis_output(raw: str, fallback_name: str) -> Dict[str, str]:
+        """Extract tool_name, description, code, and schema_json from synthesis output."""
+        import json as _json
+
+        result = {"tool_name": fallback_name, "description": "", "code": "", "schema_json": ""}
+
+        # tool_name
+        m = re.search(r'TOOL_NAME:\s*(\S+)', raw)
+        if m:
+            result["tool_name"] = m.group(1).strip()
+
+        # description
+        m = re.search(r'DESCRIPTION:\s*(.+)', raw)
+        if m:
+            result["description"] = m.group(1).strip()
+
+        # python code block
+        m = re.search(r'PYTHON_CODE:\s*```python\s*(.*?)```', raw, re.DOTALL)
+        if m:
+            result["code"] = m.group(1).strip()
+
+        # json schema block
+        m = re.search(r'TOOL_SCHEMA:\s*```json\s*(.*?)```', raw, re.DOTALL)
+        if m:
+            schema_str = m.group(1).strip()
+            try:
+                _json.loads(schema_str)  # validate
+                result["schema_json"] = schema_str
+            except _json.JSONDecodeError:
+                logger.warning("Synthesis: schema JSON invalid — using minimal fallback")
+                result["schema_json"] = _json.dumps({
+                    "name": result["tool_name"],
+                    "description": result["description"],
+                    "parameters": {"type": "object", "properties": {}, "required": []}
+                })
+
+        if not result["code"]:
+            raise RuntimeError(f"Tool synthesis failed: no Python code block found in output.\nRaw:\n{raw[:500]}")
+
+        return result
+
+    def register_dynamic_tool(self, tool_name: str, code: str, schema_json: str) -> None:
+        """
+        Load synthesised Python code into the runtime and register the tool for dispatch.
+        Also appends the schema to SYSTEM_TOOLS_SCHEMA so future LLM calls see it.
+        """
+        import importlib, types, json as _json
+
+        # Execute the code in an isolated module namespace
+        module = types.ModuleType(f"dynamic_tool_{tool_name}")
+        exec(compile(code, f"<dynamic:{tool_name}>", "exec"), module.__dict__)
+
+        fn = getattr(module, tool_name, None)
+        if fn is None:
+            raise RuntimeError(f"Synthesised code does not define function '{tool_name}'")
+
+        self.dynamic_tools[tool_name] = fn
+        logger.info(f"Dynamic tool '{tool_name}' registered in runtime")
+
+        # Append schema so the LLM sees the new tool in the next call
+        try:
+            schema = _json.loads(schema_json)
+            SYSTEM_TOOLS_SCHEMA.append(schema)
+        except Exception as e:
+            logger.warning(f"Could not append schema for '{tool_name}': {e}")
+
+    def get_system_1_available(self) -> bool:
+        """System 1 (local Ollama) is always considered available."""
         return True
 
     def get_system_2_available(self) -> bool:

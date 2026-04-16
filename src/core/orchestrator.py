@@ -17,7 +17,7 @@ from typing import Dict, Any, List, Optional
 from src.memory.vector_db import VectorMemory
 from src.memory.ledger_db import LedgerMemory, LogLevel
 from src.memory.core_memory import CoreMemory
-from src.core.llm_router import CognitiveRouter, RequiresMFAError, RequiresHITLError
+from src.core.llm_router import CognitiveRouter, RequiresMFAError, RequiresHITLError, RequiresCapabilitySynthesisError
 from src.core.security import verify_mfa_challenge
 
 try:
@@ -63,10 +63,14 @@ class Orchestrator:
             self.charter_text = self._load_charter()
             self.pending_mfa = {}
             self.pending_hitl_state = {}
+            self.pending_tool_approval: dict = {}   # user_id → synthesis payload
             self.outbound_queue: Optional[asyncio.Queue] = None
 
             # Seed initial goals if backlog is empty (Sprint 7)
             self.ledger_memory.seed_initial_goals()
+
+            # Re-load any tools approved in previous sessions
+            self._load_approved_tools()
 
             logger.info("Orchestrator initialized successfully")
         except Exception as e:
@@ -192,6 +196,76 @@ class Orchestrator:
                 )
         except Exception as e:
             logger.warning(f"Async memory save failed: {e}")
+
+    def _load_approved_tools(self) -> None:
+        """Re-register all previously approved dynamic tools from the DB at startup."""
+        try:
+            approved = self.ledger_memory.get_approved_tools()
+            for tool in approved:
+                try:
+                    self.cognitive_router.register_dynamic_tool(
+                        tool["name"], tool["code"], tool["schema_json"]
+                    )
+                    logger.info(f"Restored dynamic tool '{tool['name']}' from registry")
+                except Exception as e:
+                    logger.error(f"Failed to restore tool '{tool['name']}': {e}")
+        except Exception as e:
+            logger.warning(f"_load_approved_tools failed: {e}")
+
+    async def tool_synthesis_node(
+        self,
+        state: Dict[str, Any],
+        gap_error: "RequiresCapabilitySynthesisError",
+    ) -> str:
+        """
+        Cognitive handoff: System 1 flagged a gap → System 2 synthesises a tool
+        → Admin approves via HITL → tool registered → original query retried.
+
+        Returns a HITL prompt string for the Admin; the orchestrator stores the
+        synthesis payload in pending_tool_approval until the Admin replies.
+        """
+        user_id = state["user_id"]
+        logger.info(f"Tool synthesis triggered: gap='{gap_error.gap_description}'")
+
+        if not self.cognitive_router.get_system_2_available():
+            return (
+                "System 1 identified a capability gap but System 2 is offline — "
+                "cannot synthesise a new tool right now. Please configure GROQ_API_KEY."
+            )
+
+        try:
+            synthesis = await asyncio.wait_for(
+                self.cognitive_router.synthesize_tool(
+                    gap_description=gap_error.gap_description,
+                    suggested_tool_name=gap_error.suggested_tool_name,
+                    user_query=state["user_input"],
+                ),
+                timeout=60.0,
+            )
+        except Exception as e:
+            logger.error(f"Tool synthesis failed: {e}", exc_info=True)
+            return f"System 2 failed to synthesise a tool for '{gap_error.gap_description}': {e}"
+
+        # Store payload for approval resumption
+        self.pending_tool_approval[user_id] = {
+            "synthesis": synthesis,
+            "original_state": state,
+        }
+
+        # Build Admin-facing HITL prompt with the proposed code
+        hitl_msg = (
+            f"🔧 TOOL SYNTHESIS REQUEST\n\n"
+            f"System 1 could not answer: \"{state['user_input']}\"\n"
+            f"Gap identified: {gap_error.gap_description}\n\n"
+            f"System 2 has drafted the following tool:\n"
+            f"─────────────────────────────\n"
+            f"Name: {synthesis['tool_name']}\n"
+            f"Description: {synthesis['description']}\n\n"
+            f"Code:\n```python\n{synthesis['code']}\n```\n"
+            f"─────────────────────────────\n"
+            f"Reply YES to approve and deploy, or NO to reject."
+        )
+        return hitl_msg
 
     async def supervisor_node(self, state: Dict[str, Any]) -> Dict[str, Any]:
         """Plans execution. Uses System 2 (Gemini) if available, falls back to System 1."""
@@ -416,6 +490,46 @@ class Orchestrator:
                 del self.pending_mfa[user_id]
                 return "Error: MFA authorization failed. Action aborted."
 
+        # Tool approval resumption (Admin replies YES/NO to a synthesis proposal)
+        if user_id in self.pending_tool_approval:
+            payload = self.pending_tool_approval.pop(user_id)
+            synthesis = payload["synthesis"]
+            original_state = payload["original_state"]
+
+            if user_message.strip().upper().startswith("YES"):
+                tool_name = synthesis["tool_name"]
+                try:
+                    # 1. Register in runtime
+                    self.cognitive_router.register_dynamic_tool(
+                        tool_name, synthesis["code"], synthesis["schema_json"]
+                    )
+                    # 2. Persist to DB
+                    import json as _json
+                    self.ledger_memory.register_tool(
+                        name=tool_name,
+                        description=synthesis["description"],
+                        code=synthesis["code"],
+                        schema_json=synthesis["schema_json"],
+                    )
+                    self.ledger_memory.approve_tool(tool_name)
+                    # 3. Log capability to core memory
+                    core = self.core_memory.get_all()
+                    caps = core.get("known_capabilities", "")
+                    updated_caps = f"{caps}, {tool_name}".lstrip(", ")
+                    self.core_memory.update("known_capabilities", updated_caps)
+                    logger.info(f"Tool '{tool_name}' approved, registered, and logged to core memory")
+                    # 4. Retry original query with the new tool available
+                    retry_response = await self.process_message(
+                        original_state["user_input"], user_id
+                    )
+                    return f"✅ Tool '{tool_name}' deployed.\n\n{retry_response}"
+                except Exception as e:
+                    logger.error(f"Tool registration failed: {e}", exc_info=True)
+                    return f"Error deploying tool '{tool_name}': {e}"
+            else:
+                logger.info(f"Admin rejected tool synthesis for user {user_id}")
+                return f"Tool proposal rejected. The capability gap remains: {synthesis['description']}"
+
         # HITL resumption
         if user_id in self.pending_hitl_state:
             state = self.pending_hitl_state.pop(user_id)
@@ -498,6 +612,9 @@ class Orchestrator:
         except RequiresHITLError as hitl_err:
             self.pending_hitl_state[user_id] = state
             return str(hitl_err)
+        except RequiresCapabilitySynthesisError as gap_err:
+            hitl_prompt = await self.tool_synthesis_node(state, gap_err)
+            return hitl_prompt
         except Exception as e:
             logger.error(f"Graph execution failed: {e}", exc_info=True)
             return "An internal error occurred."

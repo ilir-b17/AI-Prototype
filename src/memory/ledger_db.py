@@ -163,6 +163,20 @@ class LedgerMemory:
                 ON chat_history(user_id, timestamp)
             """)
 
+            # Tool registry — persists System-2-synthesised tools
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS tool_registry (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    name TEXT NOT NULL UNIQUE,
+                    description TEXT NOT NULL,
+                    code TEXT NOT NULL,
+                    schema_json TEXT NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'pending_approval',
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    approved_at TIMESTAMP
+                )
+            """)
+
             self.connection.commit()
             logger.debug("Database tables initialized")
         except sqlite3.Error as e:
@@ -535,6 +549,47 @@ class LedgerMemory:
             (user_id, limit),
         )
         return [{"role": row["role"], "content": row["content"]} for row in cursor.fetchall()]
+
+    # ─────────────────────────────────────────────────────────────
+    # Tool Registry  (System-2-synthesised dynamic tools)
+    # ─────────────────────────────────────────────────────────────
+
+    def register_tool(self, name: str, description: str, code: str, schema_json: str) -> int:
+        """Insert or replace a pending tool into the registry."""
+        cursor = self.connection.cursor()
+        cursor.execute("""
+            INSERT INTO tool_registry (name, description, code, schema_json, status)
+            VALUES (?, ?, ?, ?, 'pending_approval')
+            ON CONFLICT(name) DO UPDATE SET
+                description=excluded.description,
+                code=excluded.code,
+                schema_json=excluded.schema_json,
+                status='pending_approval',
+                approved_at=NULL
+        """, (name, description, code, schema_json))
+        self.connection.commit()
+        return cursor.lastrowid
+
+    def approve_tool(self, name: str) -> None:
+        """Mark a tool as approved and record the approval timestamp."""
+        cursor = self.connection.cursor()
+        cursor.execute("""
+            UPDATE tool_registry
+            SET status='approved', approved_at=CURRENT_TIMESTAMP
+            WHERE name=?
+        """, (name,))
+        self.connection.commit()
+        logger.info(f"Tool '{name}' approved")
+
+    def get_approved_tools(self) -> List[Dict[str, Any]]:
+        """Return all approved tools (name, code, schema_json)."""
+        cursor = self.connection.cursor()
+        cursor.execute("""
+            SELECT name, description, code, schema_json
+            FROM tool_registry WHERE status='approved'
+            ORDER BY approved_at ASC
+        """)
+        return [dict(row) for row in cursor.fetchall()]
 
     def close(self) -> None:
         """Close the database connection."""
