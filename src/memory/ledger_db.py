@@ -525,12 +525,12 @@ class LedgerMemory:
         cursor.execute(
             """
             SELECT role, content FROM (
-                SELECT role, content, timestamp
+                SELECT id, role, content
                 FROM chat_history
                 WHERE user_id = ?
-                ORDER BY timestamp DESC
+                ORDER BY id DESC
                 LIMIT ?
-            ) ORDER BY timestamp ASC
+            ) ORDER BY id ASC
             """,
             (user_id, limit),
         )
