@@ -488,14 +488,15 @@ class LedgerMemory:
 
     def seed_initial_goals(self) -> None:
         """
-        Populate the backlog with the first 3 operational Tasks if it is empty.
-        Safe to call on every startup — no-op if tasks already exist.
+        Populate the backlog with operational Tasks and a Meta-Reflection Epic hierarchy
+        if it is empty. Safe to call on every startup — no-op if tasks already exist.
         """
         cursor = self.connection.cursor()
         cursor.execute("SELECT COUNT(*) FROM objective_backlog")
         if cursor.fetchone()[0] > 0:
             return
 
+        # 3 initial operational Tasks
         seeds = [
             ("Task", "Scan the /src/ directory and summarize the Python architecture to Archival Memory.", 15, 1),
             ("Task", "Update core_memory.json with Admin timezone (Vienna) and basic formatting preferences.", 5, 2),
@@ -504,7 +505,32 @@ class LedgerMemory:
         for tier, title, energy, prio in seeds:
             self.add_objective(tier=tier, title=title, estimated_energy=energy,
                                origin="System", priority=prio)
-        logger.info("Seeded 3 initial objectives into objective_backlog.")
+
+        # Sprint 11 — Meta-Reflection Epic hierarchy
+        epic_id = self.add_objective(
+            tier="Epic",
+            title="Continuous System Optimization",
+            estimated_energy=50,
+            origin="System",
+            priority=5,
+        )
+        story_id = self.add_objective(
+            tier="Story",
+            title="Analyze System Logs for Tool Failures",
+            estimated_energy=20,
+            origin="System",
+            priority=5,
+            parent_id=epic_id,
+        )
+        self.add_objective(
+            tier="Task",
+            title="Run memory consolidation on recent chat history",
+            estimated_energy=15,
+            origin="System",
+            priority=4,
+            parent_id=story_id,
+        )
+        logger.info("Seeded 3 operational Tasks + Meta-Reflection Epic hierarchy into objective_backlog.")
 
     # ─────────────────────────────────────────────────────────────
     # Chat History  (short-term conversational memory)

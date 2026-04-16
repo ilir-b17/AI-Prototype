@@ -525,6 +525,23 @@ class Orchestrator:
                 state["final_response"] = output_to_eval
 
         if state["iteration_count"] >= 3 and state["critic_feedback"] != "PASS":
+            # Sprint 11: inject a high-priority debug Task into the backlog
+            try:
+                last_worker = list(state["worker_outputs"].keys())[-1] if state.get("worker_outputs") else "unknown"
+                task_title = (
+                    f"Debug failing [{last_worker}] logic for: "
+                    f"{state.get('user_input', '')[:80]}"
+                )
+                self.ledger_memory.add_objective(
+                    tier="Task",
+                    title=task_title,
+                    estimated_energy=20,
+                    origin="Critic",
+                    priority=2,
+                )
+                logger.info(f"Critic: injected debug Task into backlog after 3 failures: {task_title!r}")
+            except Exception as spawn_err:
+                logger.warning(f"Critic: failed to spawn debug objective: {spawn_err}")
             raise RequiresHITLError(
                 f"Critic rejected output 3 times. Guidance needed.\n"
                 f"Question: How should I proceed to satisfy the charter?"
