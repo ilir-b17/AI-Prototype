@@ -121,6 +121,48 @@ class LedgerMemory:
                 ON system_logs(timestamp)
             """)
 
+            # Create objective_backlog table (3-tier: Epic > Story > Task)
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS objective_backlog (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    tier TEXT NOT NULL,
+                    title TEXT NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'pending',
+                    priority INTEGER NOT NULL DEFAULT 5,
+                    estimated_energy INTEGER NOT NULL DEFAULT 10,
+                    origin TEXT NOT NULL DEFAULT 'Admin',
+                    parent_id INTEGER,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    FOREIGN KEY (parent_id) REFERENCES objective_backlog(id)
+                )
+            """)
+
+            cursor.execute("""
+                CREATE INDEX IF NOT EXISTS idx_objective_status
+                ON objective_backlog(status)
+            """)
+            cursor.execute("""
+                CREATE INDEX IF NOT EXISTS idx_objective_tier
+                ON objective_backlog(tier)
+            """)
+
+            # Create chat_history table for conversational memory
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS chat_history (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    user_id TEXT NOT NULL,
+                    role TEXT NOT NULL,
+                    content TEXT NOT NULL,
+                    timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            """)
+
+            cursor.execute("""
+                CREATE INDEX IF NOT EXISTS idx_chat_user_id
+                ON chat_history(user_id, timestamp)
+            """)
+
             self.connection.commit()
             logger.debug("Database tables initialized")
         except sqlite3.Error as e:
@@ -182,12 +224,13 @@ class LedgerMemory:
             self.connection.rollback()
             raise
 
-    def get_pending_tasks(self, order_by_priority: bool = True) -> List[Dict[str, Any]]:
+    def get_pending_tasks(self, order_by_priority: bool = True, limit: int = 50) -> List[Dict[str, Any]]:
         """
-        Retrieve all pending tasks from the queue.
+        Retrieve pending tasks from the queue.
 
         Args:
             order_by_priority: If True, order by priority (ascending). Defaults to True.
+            limit: Maximum number of tasks to return. Defaults to 50.
 
         Returns:
             List of dictionaries representing pending tasks with keys:
@@ -209,6 +252,8 @@ class LedgerMemory:
                 query += " ORDER BY priority ASC, created_at ASC"
             else:
                 query += " ORDER BY created_at ASC"
+
+            query += f" LIMIT {int(limit)}"
 
             cursor.execute(query)
             rows = cursor.fetchall()
@@ -353,12 +398,146 @@ class LedgerMemory:
             logger.error(f"Failed to retrieve logs: {e}")
             raise
 
-    def close(self) -> None:
-        """
-        Close the database connection.
+    # ─────────────────────────────────────────────────────────────
+    # Objective Backlog  (3-tier: Epic > Story > Task)
+    # ─────────────────────────────────────────────────────────────
 
-        This should be called when the application is shutting down.
+    def add_objective(
+        self,
+        tier: str,
+        title: str,
+        estimated_energy: int = 10,
+        origin: str = "Admin",
+        priority: int = 5,
+        parent_id: int = None,
+    ) -> int:
+        """Insert a new Epic/Story/Task into the objective_backlog."""
+        if tier not in ("Epic", "Story", "Task"):
+            raise ValueError("tier must be Epic, Story, or Task")
+        cursor = self.connection.cursor()
+        cursor.execute("""
+            INSERT INTO objective_backlog
+                (tier, title, status, priority, estimated_energy, origin, parent_id)
+            VALUES (?, ?, 'pending', ?, ?, ?, ?)
+        """, (tier, title, priority, estimated_energy, origin, parent_id))
+        self.connection.commit()
+        obj_id = cursor.lastrowid
+        logger.info(f"Objective added: [{tier}] {title!r} (id={obj_id})")
+        return obj_id
+
+    def get_highest_priority_task(self) -> dict | None:
         """
+        Return the single highest-priority pending Task.
+        Sorted by priority ASC (lower = more urgent), then estimated_energy ASC.
+        Returns None if no pending Tasks exist.
+        """
+        cursor = self.connection.cursor()
+        cursor.execute("""
+            SELECT id, tier, title, status, priority, estimated_energy, origin, parent_id, created_at
+            FROM objective_backlog
+            WHERE tier = 'Task' AND status = 'pending'
+            ORDER BY priority ASC, estimated_energy ASC
+            LIMIT 1
+        """)
+        row = cursor.fetchone()
+        return dict(row) if row else None
+
+    def update_objective_status(self, obj_id: int, new_status: str) -> None:
+        """Update status of an objective. Valid: pending, active, completed, suspended."""
+        valid = {"pending", "active", "completed", "suspended"}
+        if new_status not in valid:
+            raise ValueError(f"status must be one of {valid}")
+        cursor = self.connection.cursor()
+        cursor.execute("""
+            UPDATE objective_backlog
+            SET status = ?, updated_at = CURRENT_TIMESTAMP
+            WHERE id = ?
+        """, (new_status, obj_id))
+        self.connection.commit()
+        logger.info(f"Objective {obj_id} status -> {new_status}")
+
+    def get_all_active_goals(self) -> list:
+        """
+        Return all non-completed, non-suspended objectives grouped by tier.
+        Ordered: Epic first, then Story, then Task; within tier by priority.
+        """
+        cursor = self.connection.cursor()
+        cursor.execute("""
+            SELECT id, tier, title, status, priority, estimated_energy, origin, parent_id, created_at
+            FROM objective_backlog
+            WHERE status NOT IN ('completed', 'suspended')
+            ORDER BY
+                CASE tier WHEN 'Epic' THEN 1 WHEN 'Story' THEN 2 WHEN 'Task' THEN 3 END,
+                priority ASC
+        """)
+        return [dict(row) for row in cursor.fetchall()]
+
+    def seed_initial_goals(self) -> None:
+        """
+        Populate the backlog with the first 3 operational Tasks if it is empty.
+        Safe to call on every startup — no-op if tasks already exist.
+        """
+        cursor = self.connection.cursor()
+        cursor.execute("SELECT COUNT(*) FROM objective_backlog")
+        if cursor.fetchone()[0] > 0:
+            return
+
+        seeds = [
+            ("Task", "Scan the /src/ directory and summarize the Python architecture to Archival Memory.", 15, 1),
+            ("Task", "Update core_memory.json with Admin timezone (Vienna) and basic formatting preferences.", 5, 2),
+            ("Task", "Execute a test read/write on the SQLite Ledger and log the latency.", 10, 3),
+        ]
+        for tier, title, energy, prio in seeds:
+            self.add_objective(tier=tier, title=title, estimated_energy=energy,
+                               origin="System", priority=prio)
+        logger.info("Seeded 3 initial objectives into objective_backlog.")
+
+    # ─────────────────────────────────────────────────────────────
+    # Chat History  (short-term conversational memory)
+    # ─────────────────────────────────────────────────────────────
+
+    def save_chat_turn(self, user_id: str, role: str, content: str) -> None:
+        """
+        Persist one conversational turn.
+
+        Args:
+            user_id: Telegram user ID (as string).
+            role:    'user' or 'assistant'.
+            content: The message text.
+        """
+        if role not in ("user", "assistant"):
+            raise ValueError("role must be 'user' or 'assistant'")
+        cursor = self.connection.cursor()
+        cursor.execute(
+            "INSERT INTO chat_history (user_id, role, content) VALUES (?, ?, ?)",
+            (user_id, role, content),
+        )
+        self.connection.commit()
+
+    def get_chat_history(self, user_id: str, limit: int = 10) -> List[Dict[str, str]]:
+        """
+        Retrieve the most recent *limit* turns for a user in chronological order.
+
+        Returns:
+            List of dicts with keys 'role' and 'content', oldest first.
+        """
+        cursor = self.connection.cursor()
+        cursor.execute(
+            """
+            SELECT role, content FROM (
+                SELECT role, content, timestamp
+                FROM chat_history
+                WHERE user_id = ?
+                ORDER BY timestamp DESC
+                LIMIT ?
+            ) ORDER BY timestamp ASC
+            """,
+            (user_id, limit),
+        )
+        return [{"role": row["role"], "content": row["content"]} for row in cursor.fetchall()]
+
+    def close(self) -> None:
+        """Close the database connection."""
         try:
             self.connection.close()
             logger.info("LedgerMemory connection closed")

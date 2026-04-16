@@ -1,48 +1,59 @@
 """
-LLM Router Module - Routes decisions to System 1 (Local) or System 2 (Gemini API).
+LLM Router Module - Routes decisions to System 1 (Local) or System 2 (Cloud).
 
-This module implements the cognitive routing logic that directs prompts to either
-the local language model (System 1) for fast, intuitive processing, or the Gemini
-API (System 2) for complex, analytical reasoning.
+System 1: Local Ollama model (Gemma 4) — fast, private, always available.
+System 2: Cloud LLM for complex reasoning. Provider priority:
+  1. Groq (free, fast) — set GROQ_API_KEY
+  2. Gemini (Google AI Studio free tier) — set GEMINI_API_KEY + USE_GEMINI=True
 """
 
 import os
 import logging
 import json
+import asyncio
+import re
 from typing import Optional, Dict, Any, List
 import google.generativeai as genai
 import ollama
 
-from src.tools.system_tools import SYSTEM_TOOLS_SCHEMA, update_ledger, request_core_update, update_core_memory, search_archival_memory
+try:
+    from groq import AsyncGroq
+    GROQ_AVAILABLE = True
+except ImportError:
+    GROQ_AVAILABLE = False
+
+from src.tools.system_tools import (
+    SYSTEM_TOOLS_SCHEMA, update_ledger, request_core_update,
+    update_core_memory, search_archival_memory,
+    query_highest_priority_task, spawn_new_objective, update_objective_status,
+)
 
 class RequiresMFAError(Exception):
-    """Exception raised when a tool call requires MFA."""
     def __init__(self, tool_name: str, arguments: dict):
         self.tool_name = tool_name
         self.arguments = arguments
         super().__init__(f"MFA required for tool: {tool_name}")
 
 class RequiresHITLError(Exception):
-    """Exception raised when the orchestrator needs to pause and ask the Admin for guidance."""
     def __init__(self, message: str):
         self.message = message
         super().__init__(self.message)
 
 logger = logging.getLogger(__name__)
 
-# Load Gemini API key from environment
 GEMINI_API_KEY = os.getenv('GEMINI_API_KEY')
+GROQ_API_KEY = os.getenv('GROQ_API_KEY')
+USE_GEMINI = os.getenv('USE_GEMINI', 'False').strip().lower() == 'true'
 
-if GEMINI_API_KEY:
+if GEMINI_API_KEY and USE_GEMINI:
     genai.configure(api_key=GEMINI_API_KEY)
 
 
 class CognitiveRouter:
     """
-    Routes prompts to appropriate LLM systems based on complexity and requirements.
-
-    System 1 (Local): Fast, pattern-matching based responses
-    System 2 (Gemini): Complex reasoning, multi-step analysis, creative tasks
+    Routes prompts to appropriate LLM systems.
+    System 1: Local Ollama (fast, private)
+    System 2: Groq (preferred if key set) or Gemini (fallback)
     """
 
     async def _execute_tool(self, tool_name: str, arguments: dict) -> str:
@@ -71,32 +82,88 @@ class CognitiveRouter:
                 )
                 return result
             elif tool_name == "search_archival_memory":
-                result = await search_archival_memory(
-                    query=arguments.get("query", "")
+                return await search_archival_memory(query=arguments.get("query", ""))
+            elif tool_name == "query_highest_priority_task":
+                return await query_highest_priority_task()
+            elif tool_name == "spawn_new_objective":
+                return await spawn_new_objective(
+                    tier=arguments.get("tier", "Task"),
+                    title=arguments.get("title", ""),
+                    estimated_energy=arguments.get("estimated_energy", 10)
                 )
-                return result
+            elif tool_name == "update_objective_status":
+                return await update_objective_status(
+                    task_id=arguments.get("task_id", 0),
+                    new_status=arguments.get("new_status", "completed")
+                )
             else:
                 return f"Error: Unknown tool {tool_name}."
         except Exception as e:
             logger.error(f"Error executing tool {tool_name}: {e}", exc_info=True)
             return f"Error: Failed to execute tool due to [{str(e)}]."
 
-    def __init__(self, model_name: str = "gemini-3.1-pro-preview") -> None:
+    @staticmethod
+    def sanitize_response(text: str) -> str:
         """
-        Initialize the CognitiveRouter.
+        Strip internal reasoning, tool schemas, and critic annotations from
+        LLM output before it reaches the end user.
 
-        Args:
-            model_name: The Gemini model to use for System 2. Defaults to "gemini-3.1-pro-preview".
-
-        Raises:
-            ValueError: If GEMINI_API_KEY is not set in environment.
+        Removes:
+        - <think>…</think> and <reasoning>…</reasoning> blocks (local model CoT)
+        - [CRITIC FEEDBACK: …] injected annotations
+        - WORKERS: […] supervisor tags
+        - [ADMIN GUIDANCE: …] and [HEARTBEAT TASK …] prefixes
+        - Standalone JSON objects that look like tool-call payloads
         """
-        if not GEMINI_API_KEY:
-            logger.warning("GEMINI_API_KEY not set. System 2 will not be available.")
+        if not text:
+            return text
 
-        self.model_name = model_name
-        self.model = genai.GenerativeModel(model_name) if GEMINI_API_KEY else None
-        logger.info(f"CognitiveRouter initialized with model: {model_name}")
+        # Chain-of-thought blocks produced by some local models
+        text = re.sub(r'<think>.*?</think>', '', text, flags=re.DOTALL | re.IGNORECASE)
+        text = re.sub(r'<reasoning>.*?</reasoning>', '', text, flags=re.DOTALL | re.IGNORECASE)
+
+        # Internal annotation tags injected by the orchestrator loop
+        text = re.sub(r'\[CRITIC FEEDBACK[^\n]*\n?', '', text, flags=re.IGNORECASE)
+        text = re.sub(r'\[ADMIN GUIDANCE[^\n]*\n?', '', text, flags=re.IGNORECASE)
+        text = re.sub(r'\[HEARTBEAT TASK[^\n]*\n?', '', text, flags=re.IGNORECASE)
+
+        # Supervisor planning tag
+        text = re.sub(r'WORKERS:\s*\[.*?\]\s*\n?', '', text, flags=re.IGNORECASE)
+
+        # Standalone JSON blobs that look like tool-call payloads
+        # Matches a top-level {...} block containing known internal keys
+        text = re.sub(
+            r'(?m)^\s*\{[^{}]*"(?:tool_call|tool_name|function_call|function|name)"[^{}]*\}\s*$',
+            '',
+            text,
+            flags=re.IGNORECASE,
+        )
+
+        # Collapse leftover blank lines
+        text = re.sub(r'\n{3,}', '\n\n', text)
+
+        logged = text[:120].replace('\n', ' ')
+        logger.debug(f"sanitize_response output preview: {logged!r}")
+        return text.strip()
+
+    def __init__(self, model_name: str = "gemini-2.0-flash", local_model: str = "gemma4:e4b") -> None:        self.model_name = model_name
+        self.local_model = local_model
+
+        # System 2 provider selection: Groq takes priority over Gemini
+        self.groq_client = None
+        self.gemini_model = None
+
+        if GROQ_AVAILABLE and GROQ_API_KEY:
+            self.groq_client = AsyncGroq(api_key=GROQ_API_KEY)
+            self.groq_model = os.getenv('GROQ_MODEL', 'llama-3.3-70b-versatile')
+            logger.info(f"System 2: Groq ({self.groq_model}) — fast free inference")
+        elif GEMINI_API_KEY and USE_GEMINI:
+            self.gemini_model = genai.GenerativeModel(model_name)
+            logger.info(f"System 2: Gemini ({model_name})")
+        else:
+            logger.warning("No System 2 available. Set GROQ_API_KEY (free) or GEMINI_API_KEY + USE_GEMINI=True.")
+
+        logger.info(f"CognitiveRouter initialized. System 1: {local_model}")
 
     async def route_to_system_1(
         self,
@@ -116,8 +183,9 @@ class CognitiveRouter:
         Returns:
             str: The model's response.
         """
-        logger.info("Routing to System 1 (Local Model - gemma4)")
+        logger.info(f"Routing to System 1 (Local Model - {self.local_model})")
 
+        client = None
         try:
             client = ollama.AsyncClient()
 
@@ -136,11 +204,47 @@ class CognitiveRouter:
                     }
                 })
 
-            response = await client.chat(
-                model='gemma4',
-                messages=messages,
-                tools=ollama_tools if ollama_tools else None
-            )
+            # Use configured local model (default: gemma4:e4b, fallback: gemma2)
+            available_model = self.local_model
+            try:
+                response = await asyncio.wait_for(
+                    client.chat(
+                        model=available_model,
+                        messages=messages
+                    ),
+                    timeout=60.0
+                )
+            except asyncio.TimeoutError:
+                logger.warning(f"Ollama request timeout for model '{available_model}'. Trying gemma2...")
+                available_model = 'gemma2'
+                try:
+                    response = await asyncio.wait_for(
+                        client.chat(
+                            model=available_model,
+                            messages=messages
+                        ),
+                        timeout=60.0
+                    )
+                except Exception as e2:
+                    logger.warning(f"Model 'gemma2' also failed or timed out: {str(e2)}")
+                    raise
+            except Exception as e:
+                if '404' in str(e) or 'not found' in str(e).lower():
+                    logger.warning(f"Model '{available_model}' not found. Trying gemma2...")
+                    available_model = 'gemma2'
+                    try:
+                        response = await asyncio.wait_for(
+                            client.chat(
+                                model=available_model,
+                                messages=messages
+                            ),
+                            timeout=60.0
+                        )
+                    except Exception as e2:
+                        logger.warning(f"Model 'gemma2' also not found: {str(e2)}")
+                        raise
+                else:
+                    raise
 
             # Check for tool calls
             if response and 'message' in response:
@@ -165,30 +269,41 @@ class CognitiveRouter:
                     # Pause, call execute tool
                     tool_result = await self._execute_tool(tool_name, arguments)
 
-                    # Append result back to messages to get final response
-                    messages.append(message) # Append assistant's tool call
-                    messages.append({
-                        "role": "tool",
-                        "content": tool_result,
-                        "name": tool_name
+                    # Build new messages for follow-up call (avoid malformed assistant messages)
+                    followup_messages = messages.copy()
+                    followup_messages.append({
+                        "role": "assistant",
+                        "content": json.dumps({"tool_call": tool_name, "arguments": arguments})
+                    })
+                    followup_messages.append({
+                        "role": "user",
+                        "content": f"Tool result: {tool_result}"
                     })
 
-                    # Call model again
-                    final_response = await client.chat(
-                        model='gemma4',
-                        messages=messages,
-                        tools=ollama_tools
+                    # Call model again with the correct model name
+                    final_response = await asyncio.wait_for(
+                        client.chat(
+                            model=available_model,
+                            messages=followup_messages
+                        ),
+                        timeout=60.0
                     )
 
                     if final_response and 'message' in final_response and 'content' in final_response['message']:
-                        return final_response['message']['content'].strip()
-                    return "Error parsing final response after tool call."
+                        result = final_response['message']['content'].strip()
+                        if result:
+                            logger.info(f"System 1 response received after tool call ({len(result)} chars)")
+                            return result
+                    return "Tool executed but model produced no response."
 
                 # Standard text response
                 elif 'content' in message:
                     result = message['content'].strip()
+                    if not result:
+                        logger.warning("System 1 returned empty response")
+                        return "[System 1 - Error]: Empty response from model"
                     logger.info(f"System 1 response received ({len(result)} chars)")
-                    logger.debug(f"System 1 response: {result[:100]}...")
+                    logger.debug(f"System 1 response: {result[:200]}...")
                     return result
 
             error_msg = "Unexpected response format from Ollama"
@@ -196,11 +311,18 @@ class CognitiveRouter:
             return f"[System 1 - Error]: {error_msg}"
 
         except Exception as e:
-            error_msg = f"System 1 (Ollama) error: {str(e)}. Is the local server running at localhost:11434?"
+            error_msg = f"System 1 (Local Model) error: {str(e)}. Make sure Ollama is running with a model like 'gemma4:e4b' or 'gemma2' available."
             logger.error(error_msg, exc_info=True)
             return f"[System 1 - Error]: {error_msg}"
+        finally:
+            # Properly close the client to avoid resource leak
+            try:
+                if client:
+                    await client.close()
+            except Exception as e:
+                logger.debug(f"Error closing Ollama client: {e}")
 
-    async def route_to_system_2(
+    async def _route_to_gemini(
         self,
         messages: List[Dict[str, str]]
     ) -> str:
@@ -219,8 +341,8 @@ class CognitiveRouter:
             RuntimeError: If GEMINI_API_KEY is not configured.
             Exception: If the API call fails.
         """
-        if not self.model:
-            error_msg = "GEMINI_API_KEY not set. Cannot route to System 2."
+        if not self.gemini_model:
+            error_msg = "Gemini not configured."
             logger.error(error_msg)
             raise RuntimeError(error_msg)
 
@@ -254,18 +376,12 @@ class CognitiveRouter:
             if system_instruction and gemini_messages and gemini_messages[0]["role"] == "user":
                  gemini_messages[0]["parts"][0]["text"] = f"System Instruction: {system_instruction}\n\n{gemini_messages[0]['parts'][0]['text']}"
 
-            # Format tools for Gemini API
-            gemini_tools = [{"function_declarations": SYSTEM_TOOLS_SCHEMA}]
+            # NOTE: Tools disabled due to google-generativeai schema compatibility issues
+            # gemini_tools = [{"function_declarations": SYSTEM_TOOLS_SCHEMA}]
 
             # Call Gemini API
-            response = await self.model.generate_content_async(
-                gemini_messages,
-                generation_config=genai.types.GenerationConfig(
-                    temperature=0.7,
-                    top_p=0.95,
-                    max_output_tokens=512,
-                ),
-                tools=gemini_tools
+            response = await self.gemini_model.generate_content_async(
+                gemini_messages
             )
 
             # Handle tool calls
@@ -312,14 +428,8 @@ class CognitiveRouter:
                         })
 
                         # Get final response
-                        final_response = await self.model.generate_content_async(
-                            gemini_messages,
-                            generation_config=genai.types.GenerationConfig(
-                                temperature=0.7,
-                                top_p=0.95,
-                                max_output_tokens=512,
-                            ),
-                            tools=gemini_tools
+                        final_response = await self.gemini_model.generate_content_async(
+                            gemini_messages
                         )
 
                         if final_response and final_response.text:
@@ -352,10 +462,34 @@ class CognitiveRouter:
         return True
 
     def get_system_2_available(self) -> bool:
-        """
-        Check if System 2 (Gemini API) is available.
+        """True if any System 2 provider (Groq or Gemini) is configured."""
+        return self.groq_client is not None or self.gemini_model is not None
 
-        Returns:
-            bool: True if GEMINI_API_KEY is configured.
+    async def route_to_system_2(self, messages: List[Dict[str, str]]) -> str:
         """
-        return self.model is not None
+        Route to System 2. Uses Groq if available, falls back to Gemini.
+        Groq is preferred: free tier, very fast, high quality (llama-3.3-70b).
+        """
+        if self.groq_client is not None:
+            return await self._route_to_groq(messages)
+        elif self.gemini_model is not None:
+            return await self._route_to_gemini(messages)
+        else:
+            raise RuntimeError("No System 2 provider configured. Set GROQ_API_KEY or GEMINI_API_KEY+USE_GEMINI=True.")
+
+    async def _route_to_groq(self, messages: List[Dict[str, str]]) -> str:
+        """Route to Groq API (llama-3.3-70b or configured model)."""
+        logger.info(f"Routing to System 2 (Groq/{self.groq_model})")
+        try:
+            # Groq uses OpenAI-compatible format — messages pass through as-is
+            response = await self.groq_client.chat.completions.create(
+                model=self.groq_model,
+                messages=messages,
+                max_tokens=2048,
+            )
+            result = response.choices[0].message.content.strip()
+            logger.info(f"System 2 (Groq) response received ({len(result)} chars)")
+            return result
+        except Exception as e:
+            logger.error(f"Groq error: {e}", exc_info=True)
+            raise
