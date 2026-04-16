@@ -27,7 +27,7 @@ from src.tools.system_tools import (
     SYSTEM_TOOLS_SCHEMA, update_ledger, request_core_update,
     update_core_memory, search_archival_memory,
     query_highest_priority_task, spawn_new_objective, update_objective_status,
-    get_system_info,
+    get_system_info, web_search,
 )
 
 class RequiresMFAError(Exception):
@@ -104,6 +104,11 @@ class CognitiveRouter:
                 )
             elif tool_name == "get_system_info":
                 return await get_system_info()
+            elif tool_name == "web_search":
+                return await web_search(
+                    query=arguments.get("query", ""),
+                    max_results=arguments.get("max_results", 3)
+                )
             elif tool_name in self.dynamic_tools:
                 fn = self.dynamic_tools[tool_name]
                 return await fn(**arguments)

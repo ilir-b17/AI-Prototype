@@ -136,6 +136,27 @@ SYSTEM_TOOLS_SCHEMA = [
             },
             "required": ["gap_description", "suggested_tool_name"]
         }
+    },
+    {
+        "name": "web_search",
+        "description": (
+            "Search the web using DuckDuckGo. Returns up to max_results results with title, URL, and snippet. "
+            "Use this whenever the user asks for current information, news, or anything that requires looking up external data."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "query": {
+                    "type": "string",
+                    "description": "The search query string."
+                },
+                "max_results": {
+                    "type": "integer",
+                    "description": "Maximum number of results to return (default 3, max 10)."
+                }
+            },
+            "required": ["query"]
+        }
     }
 ]
 
@@ -283,3 +304,29 @@ def _sync_update_objective_status(task_id: int, new_status: str) -> str:
 async def update_objective_status(task_id: int, new_status: str) -> str:
     logger.info(f"update_objective_status: id={task_id} -> {new_status}")
     return await asyncio.to_thread(_sync_update_objective_status, task_id, new_status)
+
+# ─────────────────────────────────────────────────────────────
+# Web Search Tool (DuckDuckGo — zero cost, no API key required)
+# ─────────────────────────────────────────────────────────────
+
+def _sync_web_search(query: str, max_results: int) -> str:
+    try:
+        from ddgs import DDGS
+        results = DDGS().text(query, max_results=max_results)
+        if not results:
+            return f"No results found for: {query}"
+        lines = []
+        for i, r in enumerate(results, 1):
+            lines.append(
+                f"{i}. {r.get('title', 'No title')}\n"
+                f"   URL: {r.get('href', 'N/A')}\n"
+                f"   {r.get('body', '')[:200]}"
+            )
+        return "\n\n".join(lines)
+    except Exception as e:
+        return f"Error: Web search failed — {e}"
+
+async def web_search(query: str, max_results: int = 3) -> str:
+    logger.info(f"web_search: {query!r} (max={max_results})")
+    max_results = min(max(1, max_results), 10)
+    return await asyncio.to_thread(_sync_web_search, query, max_results)

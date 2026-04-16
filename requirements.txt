@@ -9,3 +9,4 @@ langgraph==0.1.17
 langchain==0.1.0
 httpx~=0.25.2
 psutil
+ddgs
