@@ -2,11 +2,10 @@ python-telegram-bot==20.7
 python-dotenv==1.0.0
 chromadb==0.4.24
 numpy==1.26.4
-google-generativeai
+google-genai
 ollama
 groq
 langgraph==0.1.17
 langchain==0.1.0
-langchain-google-genai
 httpx~=0.25.2
 psutil

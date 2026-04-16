@@ -13,7 +13,8 @@ import json
 import asyncio
 import re
 from typing import Optional, Dict, Any, List
-import google.generativeai as genai
+from google import genai
+from google.genai import types as genai_types
 import ollama
 
 try:
@@ -52,9 +53,6 @@ logger = logging.getLogger(__name__)
 GEMINI_API_KEY = os.getenv('GEMINI_API_KEY')
 GROQ_API_KEY = os.getenv('GROQ_API_KEY')
 USE_GEMINI = os.getenv('USE_GEMINI', 'False').strip().lower() == 'true'
-
-if GEMINI_API_KEY and USE_GEMINI:
-    genai.configure(api_key=GEMINI_API_KEY)
 
 
 class CognitiveRouter:
@@ -180,15 +178,15 @@ class CognitiveRouter:
 
         # System 2 provider selection: Groq takes priority over Gemini
         self.groq_client = None
-        self.gemini_model = None
+        self.gemini_client = None
 
         if GROQ_AVAILABLE and GROQ_API_KEY:
             self.groq_client = AsyncGroq(api_key=GROQ_API_KEY)
             self.groq_model = os.getenv('GROQ_MODEL', 'llama-3.3-70b-versatile')
             logger.info(f"System 2: Groq ({self.groq_model}) — fast free inference")
         elif GEMINI_API_KEY and USE_GEMINI:
-            self.gemini_model = genai.GenerativeModel(model_name)
-            logger.info(f"System 2: Gemini ({model_name})")
+            self.gemini_client = genai.Client(api_key=GEMINI_API_KEY)
+            logger.info(f"System 2: Gemini ({model_name}) via google-genai SDK")
         else:
             logger.warning("No System 2 available. Set GROQ_API_KEY (free) or GEMINI_API_KEY + USE_GEMINI=True.")
 
@@ -372,129 +370,52 @@ class CognitiveRouter:
         messages: List[Dict[str, str]]
     ) -> str:
         """
-        Route to System 2 (Gemini API) - Complex reasoning and analysis.
-
-        Sends the messages to the Gemini API for advanced reasoning tasks.
-
-        Args:
-            messages: List of message dictionaries.
-
-        Returns:
-            str: The model's response from Gemini.
-
-        Raises:
-            RuntimeError: If GEMINI_API_KEY is not configured.
-            Exception: If the API call fails.
+        Route to System 2 (Gemini API) via the google-genai SDK.
+        Tools are disabled on this path — Groq handles tool calling.
         """
-        if not self.gemini_model:
-            error_msg = "Gemini not configured."
-            logger.error(error_msg)
-            raise RuntimeError(error_msg)
+        if not self.gemini_client:
+            raise RuntimeError("Gemini not configured.")
 
-        logger.info("Routing to System 2 (Gemini API)")
+        logger.info("Routing to System 2 (Gemini API / google-genai)")
 
         try:
             system_instruction = None
-            history = []
+            contents: List[genai_types.Content] = []
 
-            # Extract system instruction
-            if messages and messages[0].get("role") == "system":
-                system_instruction = messages[0].get("content")
-                # Gemini generative model supports system_instruction on init,
-                # but we can also prepend it to the first user message or configure it if needed.
-                # For `GenerativeModel`, we can set `system_instruction` parameter in `generate_content` or constructor.
-                # Since we initialize it in __init__ without system prompt, we will use it here.
-                # A common pattern is to just prepend it to the first user message if system_instruction is not configured globally.
-
-            # Format messages for Gemini
-            gemini_messages = []
             for msg in messages:
-                if msg["role"] == "system":
-                    continue # handled above
+                role = msg["role"]
+                text = msg["content"]
+                if role == "system":
+                    system_instruction = text
+                elif role == "user":
+                    contents.append(
+                        genai_types.Content(role="user", parts=[genai_types.Part(text=text)])
+                    )
+                elif role in ("assistant", "model"):
+                    contents.append(
+                        genai_types.Content(role="model", parts=[genai_types.Part(text=text)])
+                    )
 
-                role = "user" if msg["role"] == "user" else "model"
-                gemini_messages.append({
-                    "role": role,
-                    "parts": [{"text": msg["content"]}]
-                })
+            config = genai_types.GenerateContentConfig(
+                system_instruction=system_instruction,
+            ) if system_instruction else None
 
-            if system_instruction and gemini_messages and gemini_messages[0]["role"] == "user":
-                 gemini_messages[0]["parts"][0]["text"] = f"System Instruction: {system_instruction}\n\n{gemini_messages[0]['parts'][0]['text']}"
-
-            # NOTE: Tools disabled due to google-generativeai schema compatibility issues
-            # gemini_tools = [{"function_declarations": SYSTEM_TOOLS_SCHEMA}]
-
-            # Call Gemini API
-            response = await self.gemini_model.generate_content_async(
-                gemini_messages
+            response = await self.gemini_client.aio.models.generate_content(
+                model=self.model_name,
+                contents=contents,
+                config=config,
             )
 
-            # Handle tool calls
-            if response and response.candidates and response.candidates[0].content.parts:
-                parts = response.candidates[0].content.parts
-
-                # Check if it's a function call
-                for part in parts:
-                    if "function_call" in part:
-                        func_call = part.function_call
-                        tool_name = func_call.name
-
-                        # Convert protobuf mapping to dict
-                        arguments = {k: v for k, v in func_call.args.items()}
-
-                        logger.info(f"System 2 requested tool call: {tool_name}")
-
-                        if tool_name == "request_core_update":
-                            raise RequiresMFAError(tool_name, arguments)
-
-                        if tool_name == "ask_admin_for_guidance":
-                            context_summary = arguments.get("context_summary", "")
-                            specific_question = arguments.get("specific_question", "")
-                            raise RequiresHITLError(f"Guidance Needed: {context_summary}\nQuestion: {specific_question}")
-
-                        # Execute tool
-                        tool_result = await self._execute_tool(tool_name, arguments)
-
-                        # Append the function call from the model
-                        gemini_messages.append({
-                            "role": "model",
-                            "parts": [part]
-                        })
-
-                        # Append the function response
-                        gemini_messages.append({
-                            "role": "user",
-                            "parts": [{
-                                "function_response": {
-                                    "name": tool_name,
-                                    "response": {"result": tool_result}
-                                }
-                            }]
-                        })
-
-                        # Get final response
-                        final_response = await self.gemini_model.generate_content_async(
-                            gemini_messages
-                        )
-
-                        if final_response and final_response.text:
-                            return final_response.text.strip()
-                        return "Error extracting final response from Gemini."
-
-            # Extract text from response (if no tool calls)
             if response and response.text:
                 result = response.text.strip()
-                logger.info(f"System 2 response received ({len(result)} chars)")
-                logger.debug(f"System 2 response: {result[:100]}...")
+                logger.info(f"System 2 (Gemini) response received ({len(result)} chars)")
                 return result
-            else:
-                error_msg = "Empty response from Gemini API"
-                logger.warning(error_msg)
-                return f"[System 2 - No Response]: {error_msg}"
+
+            logger.warning("Empty response from Gemini API")
+            return "[System 2 - No Response]: Empty response from Gemini API"
 
         except Exception as e:
-            error_msg = f"System 2 error: {str(e)}"
-            logger.error(error_msg, exc_info=True)
+            logger.error(f"System 2 (Gemini) error: {str(e)}", exc_info=True)
             raise
 
     async def synthesize_tool(
@@ -637,7 +558,7 @@ Rules:
 
     def get_system_2_available(self) -> bool:
         """True if any System 2 provider (Groq or Gemini) is configured."""
-        return self.groq_client is not None or self.gemini_model is not None
+        return self.groq_client is not None or self.gemini_client is not None
 
     async def route_to_system_2(self, messages: List[Dict[str, str]]) -> str:
         """
@@ -646,7 +567,7 @@ Rules:
         """
         if self.groq_client is not None:
             return await self._route_to_groq(messages)
-        elif self.gemini_model is not None:
+        elif self.gemini_client is not None:
             return await self._route_to_gemini(messages)
         else:
             raise RuntimeError("No System 2 provider configured. Set GROQ_API_KEY or GEMINI_API_KEY+USE_GEMINI=True.")
