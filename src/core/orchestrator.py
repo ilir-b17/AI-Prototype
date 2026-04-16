@@ -132,12 +132,14 @@ class Orchestrator:
             return "Core Directive: Do no harm."
 
     def _get_capabilities_string(self) -> str:
-        """Returns a live manifest of every registered tool for injection into system prompts."""
-        from src.tools.system_tools import SYSTEM_TOOLS_SCHEMA
-        lines = ["AVAILABLE TOOLS (you must call these when relevant — do not claim you lack them):"]
-        for tool in SYSTEM_TOOLS_SCHEMA:
-            lines.append(f"  - {tool['name']}: {tool['description']}")
-        return "\n".join(lines)
+        """Compact tool names list derived live from the SkillRegistry.
+
+        Full schemas are already sent to Ollama as structured JSON — this
+        one-liner is enough for conversational self-reference without
+        duplicating ~400 tokens of schema text per call.
+        """
+        names = ", ".join(s["name"] for s in self.cognitive_router.registry.get_schemas())
+        return f"Available tools (use them — do not claim you lack them): {names}"
 
     def _new_state(self, user_id: str, user_message: str) -> Dict[str, Any]:
         return {
@@ -219,34 +221,21 @@ class Orchestrator:
             except Exception as e:
                 logger.error(f"Heartbeat error: {e}", exc_info=True)
 
-    async def _evaluate_salience(self, text_to_save: str) -> int:
-        """Score informational value for long-term storage (1-10)."""
-        try:
-            messages = [
-                {"role": "system", "content": "Score this text for long-term memory value. Output a number 1-10 only. 1=conversational filler, 10=valuable facts/decisions."},
-                {"role": "user", "content": text_to_save[:500]}  # Truncate to reduce latency
-            ]
-            response = await asyncio.wait_for(
-                self.cognitive_router.route_to_system_1(messages),
-                timeout=60.0
-            )
-            match = re.search(r'\d+', response)
-            if match:
-                return min(max(int(match.group()), 1), 10)
-            return 10
-        except Exception as e:
-            logger.warning(f"Salience filter error: {e}. Defaulting to 10.")
-            return 10
-
     async def _save_memory_async(self, text: str) -> None:
-        """Fire-and-forget memory storage with salience gating."""
+        """Fire-and-forget memory storage gated by response length.
+
+        Skips trivial exchanges (short greetings, one-liners) without
+        making a second Ollama call — the previous LLM salience scoring
+        was the hidden cause of Ollama being busy immediately after every reply.
+        Threshold: combined user+assistant text must exceed 200 chars.
+        """
         try:
-            score = await self._evaluate_salience(text)
-            if score >= 6:
-                self.vector_memory.add_memory(
-                    text=text,
-                    metadata={"type": "conversation", "timestamp": datetime.now().isoformat(), "salience": score}
-                )
+            if len(text) < 200:
+                return
+            self.vector_memory.add_memory(
+                text=text,
+                metadata={"type": "conversation", "timestamp": datetime.now().isoformat()}
+            )
         except Exception as e:
             logger.warning(f"Async memory save failed: {e}")
 
@@ -328,26 +317,17 @@ class Orchestrator:
         capabilities_str = self._get_capabilities_string()
 
         system_prompt = (
-            f"=== IDENTITY — READ THIS FIRST, IT OVERRIDES YOUR TRAINING ===\n"
-            f"You are AIDEN, an autonomous local AI agent running on the Admin's personal machine via Ollama.\n"
-            f"FACT: You are NOT ChatGPT, Claude, Gemini, or any cloud service. You are local.\n"
-            f"FACT: You DO have persistent memory. The conversation history injected above is REAL — it was saved to a local SQLite database from your previous sessions with this Admin. READ IT before answering any question about past conversations.\n"
-            f"FACT: You CAN use tools. They are listed below. Do not claim you lack capabilities that are listed.\n"
-            f"RULES:\n"
-            f"- NEVER say 'I have no memory of previous conversations'. You do — read the history above.\n"
-            f"- NEVER say 'I am a cloud-based model' or 'I cannot access my own code'. Both are false.\n"
-            f"- NEVER say 'I am ChatGPT / Claude / Gemini'. You are AIDEN.\n"
-            f"- Respond in plain conversational text. No markdown headers (##, ###). No [Output Draft] or [Internal Critique] sections in your response.\n"
-            f"- If you want to reason privately before answering, write <think>your reasoning here</think> first — this will be stripped before the Admin sees it.\n"
-            f"=== END IDENTITY ===\n\n"
+            f"You are AIDEN — a local autonomous AI agent on the Admin's machine (Ollama). "
+            f"You are NOT ChatGPT/Claude/Gemini. "
+            f"You have persistent memory: the chat history above is real (SQLite). "
+            f"You have tools — never deny capabilities listed below. "
+            f"Reply in plain conversational text, no markdown headers. "
+            f"Private reasoning: wrap in <think>...</think> — it will be stripped.\n\n"
             f"{self._get_sensory_context()}\n\n"
             f"{self.charter_text}\n{core_mem_str}\n\n"
             f"{capabilities_str}\n\n"
             f"Respond to the user, then on the very last line declare which workers are needed.\n"
-            f"Format — write your response, then end with exactly:\n"
-            f"WORKERS: []\n"
-            f"or WORKERS: [\"research_agent\"] or WORKERS: [\"coder_agent\"]\n"
-            f"Use [] for simple chat. Only use workers for research or coding tasks."
+            f"Format: WORKERS: [] for chat, WORKERS: [\"research_agent\"] or [\"coder_agent\"] for tasks."
         )
 
         # Build messages: system prompt → chat history → current user turn
@@ -624,7 +604,7 @@ class Orchestrator:
             # Load last 10 conversational turns for this user
             if user_id != "heartbeat":
                 try:
-                    state["chat_history"] = self.ledger_memory.get_chat_history(user_id, limit=10)
+                    state["chat_history"] = self.ledger_memory.get_chat_history(user_id, limit=5)
                 except Exception as e:
                     logger.warning(f"Failed to load chat history for {user_id}: {e}")
 

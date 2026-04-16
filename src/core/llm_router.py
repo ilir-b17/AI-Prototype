@@ -23,12 +23,7 @@ try:
 except ImportError:
     GROQ_AVAILABLE = False
 
-from src.tools.system_tools import (
-    SYSTEM_TOOLS_SCHEMA, update_ledger, request_core_update,
-    update_core_memory, search_archival_memory,
-    query_highest_priority_task, spawn_new_objective, update_objective_status,
-    get_system_info, web_search,
-)
+from src.core.skill_manager import SkillRegistry
 
 class RequiresMFAError(Exception):
     def __init__(self, tool_name: str, arguments: dict):
@@ -63,60 +58,31 @@ class CognitiveRouter:
     """
 
     async def _execute_tool(self, tool_name: str, arguments: dict) -> str:
-        """
-        Executes the specified tool locally and returns the result.
-        """
-        logger.info(f"Executing tool: {tool_name} with arguments: {arguments}")
+        """Dispatch a tool call through the SkillRegistry.
 
-        try:
-            if tool_name == "update_ledger":
-                result = await update_ledger(
-                    task_description=arguments.get("task_description", ""),
-                    priority=arguments.get("priority", 5)
-                )
-                return result
-            elif tool_name == "request_core_update":
-                result = await request_core_update(
-                    component=arguments.get("component", ""),
-                    proposed_change=arguments.get("proposed_change", "")
-                )
-                return result
-            elif tool_name == "update_core_memory":
-                result = await update_core_memory(
-                    key=arguments.get("key", ""),
-                    value=arguments.get("value", "")
-                )
-                return result
-            elif tool_name == "search_archival_memory":
-                return await search_archival_memory(query=arguments.get("query", ""))
-            elif tool_name == "query_highest_priority_task":
-                return await query_highest_priority_task()
-            elif tool_name == "spawn_new_objective":
-                return await spawn_new_objective(
-                    tier=arguments.get("tier", "Task"),
-                    title=arguments.get("title", ""),
-                    estimated_energy=arguments.get("estimated_energy", 10)
-                )
-            elif tool_name == "update_objective_status":
-                return await update_objective_status(
-                    task_id=arguments.get("task_id", 0),
-                    new_status=arguments.get("new_status", "completed")
-                )
-            elif tool_name == "get_system_info":
-                return await get_system_info()
-            elif tool_name == "web_search":
-                return await web_search(
-                    query=arguments.get("query", ""),
-                    max_results=arguments.get("max_results", 3)
-                )
-            elif tool_name in self.dynamic_tools:
-                fn = self.dynamic_tools[tool_name]
-                return await fn(**arguments)
-            else:
-                return f"Error: Unknown tool {tool_name}."
-        except Exception as e:
-            logger.error(f"Error executing tool {tool_name}: {e}", exc_info=True)
-            return f"Error: Failed to execute tool due to [{str(e)}]."
+        Security intercepts (MFA / HITL / capability synthesis) are raised
+        here before the registry is consulted, keeping security logic centralised.
+        """
+        logger.info(f"Executing tool: {tool_name} with args: {list(arguments.keys())}")
+
+        # ── Security intercepts ──────────────────────────────────────────────
+        if tool_name == "request_core_update":
+            raise RequiresMFAError(tool_name, arguments)
+
+        if tool_name == "ask_admin_for_guidance":
+            raise RequiresHITLError(
+                f"Guidance Needed: {arguments.get('context_summary', '')}\n"
+                f"Question: {arguments.get('specific_question', '')}"
+            )
+
+        if tool_name == "request_capability":
+            raise RequiresCapabilitySynthesisError(
+                gap_description=arguments.get("gap_description", "unspecified gap"),
+                suggested_tool_name=arguments.get("suggested_tool_name", "new_tool"),
+            )
+
+        # ── Registry dispatch ────────────────────────────────────────────────
+        return await self.registry.execute(tool_name, arguments)
 
     @staticmethod
     def sanitize_response(text: str) -> str:
@@ -174,9 +140,8 @@ class CognitiveRouter:
         self.model_name = model_name
         self.local_model = local_model
 
-        # Dynamic tools registered at runtime after Admin approval
-        # key: tool_name  →  value: async callable
-        self.dynamic_tools: dict = {}
+        # SkillRegistry — single source of truth for all tool schemas and callables
+        self.registry = SkillRegistry()
 
         # System 1: cached Ollama client — created once, reused across all calls
         self._ollama_client: Optional[ollama.AsyncClient] = None
@@ -232,12 +197,11 @@ class CognitiveRouter:
                 self._ollama_client = ollama.AsyncClient()
             client = self._ollama_client
 
-            # Format tools for Ollama
+            # Format tools for Ollama from the SkillRegistry
             ollama_tools = []
-            for tool in SYSTEM_TOOLS_SCHEMA:
+            for tool in self.registry.get_schemas():
                 if allowed_tools is not None and tool["name"] not in allowed_tools:
                     continue
-                # Ollama format requires 'type': 'function' and 'function': {schema}
                 ollama_tools.append({
                     "type": "function",
                     "function": {
@@ -533,13 +497,10 @@ Rules:
         return result
 
     def register_dynamic_tool(self, tool_name: str, code: str, schema_json: str) -> None:
-        """
-        Load synthesised Python code into the runtime and register the tool for dispatch.
-        Also appends the schema to SYSTEM_TOOLS_SCHEMA so future LLM calls see it.
-        """
-        import importlib, types, json as _json
+        """Load synthesised Python code into the runtime via the SkillRegistry."""
+        import types
+        import json as _json
 
-        # Execute the code in an isolated module namespace
         module = types.ModuleType(f"dynamic_tool_{tool_name}")
         exec(compile(code, f"<dynamic:{tool_name}>", "exec"), module.__dict__)
 
@@ -547,15 +508,13 @@ Rules:
         if fn is None:
             raise RuntimeError(f"Synthesised code does not define function '{tool_name}'")
 
-        self.dynamic_tools[tool_name] = fn
-        logger.info(f"Dynamic tool '{tool_name}' registered in runtime")
-
-        # Append schema so the LLM sees the new tool in the next call
         try:
             schema = _json.loads(schema_json)
-            SYSTEM_TOOLS_SCHEMA.append(schema)
-        except Exception as e:
-            logger.warning(f"Could not append schema for '{tool_name}': {e}")
+        except Exception as exc:
+            raise RuntimeError(f"Invalid schema JSON for '{tool_name}': {exc}")
+
+        self.registry.register_dynamic(tool_name, fn, schema)
+        logger.info(f"Dynamic tool '{tool_name}' registered via SkillRegistry")
 
     def get_system_1_available(self) -> bool:
         """System 1 (local Ollama) is always considered available."""
@@ -591,7 +550,7 @@ Rules:
                         "parameters": tool["parameters"],
                     }
                 }
-                for tool in SYSTEM_TOOLS_SCHEMA
+                for tool in self.registry.get_schemas()
             ]
 
             response = await self.groq_client.chat.completions.create(
