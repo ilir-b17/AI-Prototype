@@ -563,6 +563,26 @@ Rules:
         self._validate_tool_code_ast(code, tool_name)
 
         module = types.ModuleType(f"dynamic_tool_{tool_name}")
+        # Restrict built-ins to a safe subset so that exec() cannot reach
+        # open(), eval(), __import__(), exec(), compile(), etc. even if the
+        # AST check is somehow bypassed.
+        _safe_builtins = {
+            "None": None, "True": True, "False": False,
+            "abs": abs, "all": all, "any": any, "bool": bool,
+            "bytes": bytes, "chr": chr, "dict": dict, "dir": dir,
+            "divmod": divmod, "enumerate": enumerate, "filter": filter,
+            "float": float, "format": format, "frozenset": frozenset,
+            "getattr": getattr, "hasattr": hasattr, "hash": hash,
+            "int": int, "isinstance": isinstance, "issubclass": issubclass,
+            "iter": iter, "len": len, "list": list, "map": map,
+            "max": max, "min": min, "next": next, "object": object,
+            "ord": ord, "pow": pow, "print": print, "range": range,
+            "repr": repr, "reversed": reversed, "round": round,
+            "set": set, "slice": slice, "sorted": sorted, "str": str,
+            "sum": sum, "tuple": tuple, "type": type, "vars": vars,
+            "zip": zip,
+        }
+        module.__dict__["__builtins__"] = _safe_builtins
         exec(compile(code, f"<dynamic:{tool_name}>", "exec"), module.__dict__)
 
         fn = getattr(module, tool_name, None)

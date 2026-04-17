@@ -31,29 +31,29 @@ class CoreMemory:
         os.makedirs(os.path.dirname(self.memory_file_path), exist_ok=True)
         # Synchronous bootstrap: create the file if it does not yet exist so
         # the Orchestrator's sync __init__ path still works.
-        if not os.path.exists(self.memory_file_path):
-            default_state = {"current_focus": "", "user_preferences": ""}
-            try:
-                with open(self.memory_file_path, 'w') as f:
-                    json.dump(default_state, f, indent=4)
-                logger.info(f"Initialized new Core Working Memory at {self.memory_file_path}")
-            except Exception as e:
-                logger.error(f"Failed to bootstrap core memory: {e}")
-        else:
-            # Validate the file is non-corrupt; reset if needed.
+        default_state = {"current_focus": "", "user_preferences": ""}
+        try:
+            # Atomic create: open with 'x' fails if the file already exists,
+            # avoiding a TOCTOU race between existence check and creation.
+            with open(self.memory_file_path, 'x') as f:
+                json.dump(default_state, f, indent=4)
+            logger.info(f"Initialized new Core Working Memory at {self.memory_file_path}")
+        except FileExistsError:
+            # File already exists — validate it is not corrupt.
             try:
                 with open(self.memory_file_path, 'r') as f:
                     json.load(f)
-            except json.JSONDecodeError:
+            except (json.JSONDecodeError, OSError):
                 logger.warning(
                     f"Core Working Memory at {self.memory_file_path} corrupted. Re-initializing."
                 )
-                default_state = {"current_focus": "", "user_preferences": ""}
                 try:
                     with open(self.memory_file_path, 'w') as f:
                         json.dump(default_state, f, indent=4)
                 except Exception as e:
                     logger.error(f"Failed to re-initialize core memory: {e}")
+        except Exception as e:
+            logger.error(f"Failed to bootstrap core memory: {e}")
 
     # ──────────────────────────────────────────────────────────────
     # Async I/O  (primary API — use these in the async event loop)

@@ -201,13 +201,16 @@ class LedgerMemory:
         limit: int = 50,
     ) -> List[Dict[str, Any]]:
         """Retrieve pending tasks from the queue."""
-        order = "priority ASC, created_at ASC" if order_by_priority else "created_at ASC"
+        # Use a whitelist instead of interpolating user-controlled strings into SQL
+        order = (
+            "priority ASC, created_at ASC" if order_by_priority else "created_at ASC"
+        )
+        query = (
+            "SELECT id, priority, task_description, status, created_at, updated_at "
+            f"FROM task_queue WHERE status = 'PENDING' ORDER BY {order} LIMIT ?"
+        )
         async with self._lock:
-            cursor = await self._db.execute(
-                f"SELECT id, priority, task_description, status, created_at, updated_at "
-                f"FROM task_queue WHERE status = 'PENDING' ORDER BY {order} LIMIT ?",
-                (int(limit),),
-            )
+            cursor = await self._db.execute(query, (int(limit),))
             rows = await cursor.fetchall()
         tasks = [dict(r) for r in rows]
         logger.info(f"Retrieved {len(tasks)} pending tasks")
