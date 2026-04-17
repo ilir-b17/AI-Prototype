@@ -94,6 +94,73 @@ def test_vector_memory() -> bool:
         return False
 
 
+import concurrent.futures
+import threading
+
+def test_ledger_memory_concurrency() -> bool:
+    """
+    Stress test LedgerMemory for multi-threading safety without locking errors.
+    """
+    print("\n" + "=" * 80)
+    print("TESTING LEDGER MEMORY CONCURRENCY (Threading/WAL Mode)")
+    print("=" * 80)
+
+    try:
+        ledger_mem = LedgerMemory(db_path="data/ledger_stress.db")
+        print(f"{CHECK} LedgerMemory (Stress) initialized successfully")
+
+        def worker_task(thread_id: int, iterations: int):
+            for i in range(iterations):
+                # Write operation
+                task_id = ledger_mem.add_task(
+                    task_description=f"Task {i} from thread {thread_id}",
+                    priority=max(1, thread_id),
+                    status="PENDING"
+                )
+                # Read operation
+                _ = ledger_mem.get_pending_tasks(limit=5)
+                # Update operation
+                ledger_mem.update_task_status(task_id, "COMPLETED")
+                # Log operation
+                ledger_mem.log_event(
+                    log_level=LogLevel.INFO,
+                    message=f"Thread {thread_id} completed iteration {i}"
+                )
+            # Ensure the connection is closed for this thread
+            ledger_mem.close()
+
+        num_threads = 10
+        iterations_per_thread = 20
+
+        print(f"\n--- Running {num_threads} threads with {iterations_per_thread} iterations each ---")
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=num_threads) as executor:
+            futures = [
+                executor.submit(worker_task, t_id, iterations_per_thread)
+                for t_id in range(num_threads)
+            ]
+
+            # Wait for all to complete
+            for future in concurrent.futures.as_completed(futures):
+                future.result() # Will raise any exception caught in thread
+
+        print(f"{CHECK} All threads completed without OperationalError or locking issues.")
+
+        # Verify total logs and tasks
+        total_logs = len(ledger_mem.get_logs(limit=1000))
+        # Depending on when logs are flushed, it should be at least num_threads * iterations
+        if total_logs >= num_threads * iterations_per_thread:
+            print(f"{CHECK} Data verification passed (Logs count: {total_logs})")
+        else:
+            print(f"{FAIL} Data verification failed (Logs count: {total_logs})")
+            return False
+
+        return True
+    except Exception as e:
+        logger.error(f"LedgerMemory concurrency test failed: {e}")
+        print(f"\n{FAIL} LedgerMemory concurrency test FAILED: {e}")
+        return False
+
 def test_ledger_memory() -> bool:
     """
     Test the LedgerMemory (SQLite) functionality.
@@ -228,14 +295,18 @@ def main() -> int:
         # Run LedgerMemory tests
         ledger_passed = test_ledger_memory()
 
+        # Run concurrency stress test
+        concurrency_passed = test_ledger_memory_concurrency()
+
         # Summary
         print("\n" + "=" * 80)
         print("TEST SUMMARY")
         print("=" * 80)
         print(f"VectorMemory (ChromaDB):  {'PASSED' if vector_passed else 'FAILED'}")
         print(f"LedgerMemory (SQLite):    {'PASSED' if ledger_passed else 'FAILED'}")
+        print(f"LedgerMemory Concurrency: {'PASSED' if concurrency_passed else 'FAILED'}")
 
-        if vector_passed and ledger_passed:
+        if vector_passed and ledger_passed and concurrency_passed:
             print(f"\n{CHECK} All memory architecture tests PASSED!")
             print("The Hippocampus is ready for integration with the Telegram interface.")
             return 0
