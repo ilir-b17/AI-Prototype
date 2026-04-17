@@ -24,7 +24,7 @@ except ImportError:
 from src.memory.vector_db import VectorMemory
 from src.memory.ledger_db import LedgerMemory, LogLevel
 from src.memory.core_memory import CoreMemory
-from src.core.llm_router import CognitiveRouter, RequiresMFAError, RequiresHITLError, RequiresCapabilitySynthesisError
+from src.core.llm_router import CognitiveRouter, RouterResult, RequiresMFAError, RequiresHITLError, RequiresCapabilitySynthesisError
 from src.core.security import verify_mfa_challenge
 
 try:
@@ -41,6 +41,9 @@ ENERGY_COST_CRITIC = 10
 ENERGY_COST_TOOL = 5
 HEARTBEAT_INTERVAL = 1800  # 30 minutes
 
+# Key used in the state dict to signal a blocked (non-ok) router result
+_BLOCKED_KEY = "_blocked_result"
+
 
 class Orchestrator:
     """
@@ -49,6 +52,12 @@ class Orchestrator:
     State Dictionary schema:
         user_id, user_input, current_plan, worker_outputs,
         final_response, iteration_count, admin_guidance, energy_remaining
+
+    Lifecycle:
+        1. ``__init__`` — synchronous; creates memory objects (no DB I/O yet).
+        2. ``await async_init()`` — must be called once from an async context
+           (the Telegram bot's ``post_init`` hook) to open the aiosqlite
+           connection and seed initial goals.
     """
 
     def __init__(
@@ -68,23 +77,28 @@ class Orchestrator:
             self.cognitive_router = CognitiveRouter(model_name=gemini_model, local_model=local_model)
 
             self.charter_text = self._load_charter()
-            self.pending_mfa = {}
-            self.pending_hitl_state = {}
-            self.pending_tool_approval: dict = {}   # user_id → synthesis payload
+            self.pending_mfa: Dict[str, dict] = {}
+            self.pending_hitl_state: Dict[str, dict] = {}
+            self.pending_tool_approval: Dict[str, dict] = {}
             self.outbound_queue: Optional[asyncio.Queue] = None
             self.sensory_state: Dict[str, str] = {}
-            self._refresh_sensory_state()   # populate immediately on start
+            self._refresh_sensory_state()
 
-            # Seed initial goals if backlog is empty (Sprint 7)
-            self.ledger_memory.seed_initial_goals()
-
-            # Re-load any tools approved in previous sessions
-            self._load_approved_tools()
-
-            logger.info("Orchestrator initialized successfully")
+            logger.info("Orchestrator __init__ complete — call async_init() to finish setup")
         except Exception as e:
             logger.error(f"Failed to initialize Orchestrator: {e}", exc_info=True)
             raise
+
+    async def async_init(self) -> None:
+        """
+        Async second-phase initialisation.  Must be awaited before any messages
+        are processed.  Opens the aiosqlite ledger, seeds initial goals, and
+        reloads previously approved dynamic tools.
+        """
+        await self.ledger_memory.initialize()
+        await self.ledger_memory.seed_initial_goals()
+        await self._load_approved_tools()
+        logger.info("Orchestrator async_init complete")
 
     def _refresh_sensory_state(self) -> None:
         """Snapshot current machine state into self.sensory_state."""
@@ -183,7 +197,7 @@ class Orchestrator:
             await asyncio.sleep(HEARTBEAT_INTERVAL)
             try:
                 logger.info("Heartbeat: Querying objective backlog...")
-                task = self.ledger_memory.get_highest_priority_task()
+                task = await self.ledger_memory.get_highest_priority_task()
 
                 if not task:
                     logger.info("Heartbeat: Backlog is empty. Nothing to do.")
@@ -198,7 +212,7 @@ class Orchestrator:
                     continue
 
                 logger.info(f"Heartbeat: Accepting task #{task['id']}: {task['title'][:60]}")
-                self.ledger_memory.update_objective_status(task["id"], "active")
+                await self.ledger_memory.update_objective_status(task["id"], "active")
 
                 result = await self.process_message(
                     user_message=(
@@ -208,7 +222,7 @@ class Orchestrator:
                     user_id="heartbeat"
                 )
 
-                self.ledger_memory.update_objective_status(task["id"], "completed")
+                await self.ledger_memory.update_objective_status(task["id"], "completed")
 
                 summary = (
                     f"Heartbeat completed task #{task['id']}:\n"
@@ -224,25 +238,25 @@ class Orchestrator:
     async def _save_memory_async(self, text: str) -> None:
         """Fire-and-forget memory storage gated by response length.
 
-        Skips trivial exchanges (short greetings, one-liners) without
-        making a second Ollama call — the previous LLM salience scoring
-        was the hidden cause of Ollama being busy immediately after every reply.
+        Skips trivial exchanges (short greetings, one-liners).
         Threshold: combined user+assistant text must exceed 200 chars.
+        Uses asyncio.to_thread() so the blocking ChromaDB call does not
+        stall the event loop.
         """
         try:
             if len(text) < 200:
                 return
-            self.vector_memory.add_memory(
+            await self.vector_memory.add_memory_async(
                 text=text,
                 metadata={"type": "conversation", "timestamp": datetime.now().isoformat()}
             )
         except Exception as e:
             logger.warning(f"Async memory save failed: {e}")
 
-    def _load_approved_tools(self) -> None:
+    async def _load_approved_tools(self) -> None:
         """Re-register all previously approved dynamic tools from the DB at startup."""
         try:
-            approved = self.ledger_memory.get_approved_tools()
+            approved = await self.ledger_memory.get_approved_tools()
             for tool in approved:
                 try:
                     self.cognitive_router.register_dynamic_tool(
@@ -257,17 +271,19 @@ class Orchestrator:
     async def tool_synthesis_node(
         self,
         state: Dict[str, Any],
-        gap_error: "RequiresCapabilitySynthesisError",
+        router_result: RouterResult,
     ) -> str:
         """
-        Cognitive handoff: System 1 flagged a gap → System 2 synthesises a tool
+        Cognitive handoff: router flagged a gap → System 2 synthesises a tool
         → Admin approves via HITL → tool registered → original query retried.
 
         Returns a HITL prompt string for the Admin; the orchestrator stores the
         synthesis payload in pending_tool_approval until the Admin replies.
         """
         user_id = state["user_id"]
-        logger.info(f"Tool synthesis triggered: gap='{gap_error.gap_description}'")
+        gap_description = router_result.gap_description
+        suggested_tool_name = router_result.suggested_tool_name
+        logger.info(f"Tool synthesis triggered: gap='{gap_description}'")
 
         if not self.cognitive_router.get_system_2_available():
             return (
@@ -278,15 +294,15 @@ class Orchestrator:
         try:
             synthesis = await asyncio.wait_for(
                 self.cognitive_router.synthesize_tool(
-                    gap_description=gap_error.gap_description,
-                    suggested_tool_name=gap_error.suggested_tool_name,
+                    gap_description=gap_description,
+                    suggested_tool_name=suggested_tool_name,
                     user_query=state["user_input"],
                 ),
                 timeout=60.0,
             )
         except Exception as e:
             logger.error(f"Tool synthesis failed: {e}", exc_info=True)
-            return f"System 2 failed to synthesise a tool for '{gap_error.gap_description}': {e}"
+            return f"System 2 failed to synthesise a tool for '{gap_description}': {e}"
 
         # Store payload for approval resumption
         self.pending_tool_approval[user_id] = {
@@ -298,7 +314,7 @@ class Orchestrator:
         hitl_msg = (
             f"🔧 TOOL SYNTHESIS REQUEST\n\n"
             f"System 1 could not answer: \"{state['user_input']}\"\n"
-            f"Gap identified: {gap_error.gap_description}\n\n"
+            f"Gap identified: {gap_description}\n\n"
             f"System 2 has drafted the following tool:\n"
             f"─────────────────────────────\n"
             f"Name: {synthesis['tool_name']}\n"
@@ -309,11 +325,21 @@ class Orchestrator:
         )
         return hitl_msg
 
+    def _extract_router_content(self, result: RouterResult) -> Optional[str]:
+        """
+        Return the string content from an "ok" RouterResult, or None if it is
+        a non-ok result (MFA / HITL / capability-gap).  Non-ok results should
+        be stored in state[_BLOCKED_KEY] by the caller.
+        """
+        if result.status == "ok":
+            return result.content
+        return None
+
     async def supervisor_node(self, state: Dict[str, Any]) -> Dict[str, Any]:
         """Plans execution. Tries System 1 (local) first per Directive 1.3; escalates to System 2 only on failure."""
         state = await self._deduct_energy(state, ENERGY_COST_SUPERVISOR, "supervisor")
         user_input = state["user_input"]
-        core_mem_str = self.core_memory.get_context_string()
+        core_mem_str = await self.core_memory.get_context_string()
         capabilities_str = self._get_capabilities_string()
 
         system_prompt = (
@@ -330,37 +356,46 @@ class Orchestrator:
             f"Format: WORKERS: [] for chat, WORKERS: [\"research_agent\"] or [\"coder_agent\"] for tasks."
         )
 
-        # Build messages: system prompt → chat history → current user turn
+        # Build messages: system prompt → chat history → sanitized user turn
         messages = [{"role": "system", "content": system_prompt}]
         for turn in state.get("chat_history", []):
             messages.append({"role": turn["role"], "content": turn["content"]})
-        messages.append({"role": "user", "content": user_input})
+        # Wrap user input in XML tags to isolate it from system directives
+        messages.append({"role": "user", "content": f"<user_input>{user_input}</user_input>"})
 
         try:
             # Local-first per Directive 1.3 — try System 1, escalate to System 2 only on failure
-            response = None
+            router_result: Optional[RouterResult] = None
             try:
                 logger.info("Routing Supervisor through System 1 (Local Model)")
-                response = await asyncio.wait_for(
+                router_result = await asyncio.wait_for(
                     self.cognitive_router.route_to_system_1(messages),
                     timeout=60.0
                 )
-            except (RequiresHITLError, RequiresMFAError, RequiresCapabilitySynthesisError):
-                raise
             except Exception as s1_err:
                 logger.warning(f"System 1 failed in supervisor ({s1_err}). Escalating to System 2.")
-                response = None
+                router_result = None
+
+            # Propagate non-ok RouterResult immediately (MFA / HITL / capability gap)
+            if router_result is not None and router_result.status != "ok":
+                state[_BLOCKED_KEY] = router_result
+                return state
+
+            response = router_result.content if router_result else None
 
             if not response or response.startswith("[System 1 - Error]"):
                 if self.cognitive_router.get_system_2_available():
                     try:
                         logger.info("Escalating Supervisor to System 2")
-                        response = await asyncio.wait_for(
+                        router_result = await asyncio.wait_for(
                             self.cognitive_router.route_to_system_2(messages),
                             timeout=30.0
                         )
-                    except (RequiresHITLError, RequiresMFAError, RequiresCapabilitySynthesisError):
-                        raise
+                        # Propagate non-ok results from System 2 as well
+                        if router_result.status != "ok":
+                            state[_BLOCKED_KEY] = router_result
+                            return state
+                        response = router_result.content
                     except Exception as s2_err:
                         logger.warning(f"System 2 also failed in supervisor ({s2_err}).")
                         response = None
@@ -428,21 +463,22 @@ class Orchestrator:
     async def research_agent(self, state: Dict[str, Any]) -> Dict[str, Any]:
         """Worker: searches archival memory for relevant context."""
         state = await self._deduct_energy(state, ENERGY_COST_WORKER, "research_agent")
-        core_mem_str = self.core_memory.get_context_string()
+        core_mem_str = await self.core_memory.get_context_string()
 
         capabilities_str = self._get_capabilities_string()
         messages = [
             {"role": "system", "content": f"You are the Research Agent. Search archival memory for relevant context and provide findings.\n{self.charter_text}\n{core_mem_str}\n\n{capabilities_str}"},
-            {"role": "user", "content": state["user_input"]}
+            {"role": "user", "content": f"<user_input>{state['user_input']}</user_input>"}
         ]
         try:
-            response = await asyncio.wait_for(
+            router_result = await asyncio.wait_for(
                 self.cognitive_router.route_to_system_1(messages, allowed_tools=["search_archival_memory"]),
                 timeout=60.0
             )
-            state["worker_outputs"]["research"] = response
-        except RequiresHITLError:
-            raise
+            if router_result.status != "ok":
+                state[_BLOCKED_KEY] = router_result
+            else:
+                state["worker_outputs"]["research"] = router_result.content
         except Exception as e:
             logger.error(f"Research Agent failed: {e}")
             state["worker_outputs"]["research"] = f"Error: {e}"
@@ -452,7 +488,7 @@ class Orchestrator:
     async def coder_agent(self, state: Dict[str, Any]) -> Dict[str, Any]:
         """Worker: executes coding tasks, updates memory/ledger."""
         state = await self._deduct_energy(state, ENERGY_COST_WORKER, "coder_agent")
-        core_mem_str = self.core_memory.get_context_string()
+        core_mem_str = await self.core_memory.get_context_string()
         research_context = state["worker_outputs"].get("research", "")
 
         content = f"User Input: {state['user_input']}\n"
@@ -462,16 +498,17 @@ class Orchestrator:
         capabilities_str = self._get_capabilities_string()
         messages = [
             {"role": "system", "content": f"You are the Coder Agent. Execute coding tasks and update memory as needed.\n{self.charter_text}\n{core_mem_str}\n\n{capabilities_str}"},
-            {"role": "user", "content": content}
+            {"role": "user", "content": f"<user_input>{content}</user_input>"}
         ]
         try:
-            response = await asyncio.wait_for(
+            router_result = await asyncio.wait_for(
                 self.cognitive_router.route_to_system_1(messages, allowed_tools=["update_ledger", "update_core_memory", "request_core_update", "spawn_new_objective", "update_objective_status"]),
                 timeout=60.0
             )
-            state["worker_outputs"]["coder"] = response
-        except RequiresHITLError:
-            raise
+            if router_result.status != "ok":
+                state[_BLOCKED_KEY] = router_result
+            else:
+                state["worker_outputs"]["coder"] = router_result.content
         except Exception as e:
             logger.error(f"Coder Agent failed: {e}")
             state["worker_outputs"]["coder"] = f"Error: {e}"
@@ -502,15 +539,20 @@ class Orchestrator:
             use_system2 = self.cognitive_router.get_system_2_available()
             if use_system2:
                 logger.info("Routing Critic through System 2 (Gemini)")
-                response = await asyncio.wait_for(
+                router_result = await asyncio.wait_for(
                     self.cognitive_router.route_to_system_2(messages),
                     timeout=30.0
                 )
             else:
-                response = await asyncio.wait_for(
+                router_result = await asyncio.wait_for(
                     self.cognitive_router.route_to_system_1(messages, allowed_tools=[]),
                     timeout=60.0
                 )
+            # Non-ok router results (e.g. HITL during critic) are propagated via state
+            if router_result.status != "ok":
+                state[_BLOCKED_KEY] = router_result
+                return state
+            response = router_result.content
             if "FAIL" in response.upper():
                 state["iteration_count"] += 1
                 state["critic_feedback"] = response
@@ -532,7 +574,7 @@ class Orchestrator:
                     f"Debug failing [{last_worker}] logic for: "
                     f"{state.get('user_input', '')[:80]}"
                 )
-                self.ledger_memory.add_objective(
+                await self.ledger_memory.add_objective(
                     tier="Task",
                     title=task_title,
                     estimated_energy=20,
@@ -549,6 +591,33 @@ class Orchestrator:
 
         return state
 
+    async def _consolidate_memory(self, user_id: str) -> None:
+        """
+        Memory Consolidation Skill: summarise the last 10 chat turns for
+        *user_id* into a single paragraph, update core_memory under
+        ``conversation_summary``, and trim the stored raw turns to the most
+        recent 5.  Runs fire-and-forget; errors are swallowed.
+        """
+        try:
+            turns = await self.ledger_memory.get_chat_history(user_id, limit=10)
+            if len(turns) < 10:
+                return  # Not enough turns to warrant consolidation
+
+            convo_text = "\n".join(f"{t['role'].capitalize()}: {t['content']}" for t in turns)
+            messages = [
+                {"role": "system", "content": "You are a memory consolidation engine. Summarise the conversation concisely in 2–3 sentences."},
+                {"role": "user", "content": convo_text},
+            ]
+            result = await asyncio.wait_for(
+                self.cognitive_router.route_to_system_1(messages, allowed_tools=[]),
+                timeout=30.0,
+            )
+            if result.status == "ok" and result.content:
+                await self.core_memory.update("conversation_summary", result.content.strip())
+                logger.info(f"Memory consolidation complete for user {user_id}")
+        except Exception as e:
+            logger.warning(f"Memory consolidation failed: {e}")
+
     async def process_message(self, user_message: str, user_id: str) -> str:
         """Main entry point: State Graph execution with Energy Budget."""
         if not user_message:
@@ -559,11 +628,15 @@ class Orchestrator:
             pending_tool = self.pending_mfa[user_id]
             if verify_mfa_challenge(user_message):
                 del self.pending_mfa[user_id]
-                result = await self.cognitive_router._execute_tool(
+                exec_result = await self.cognitive_router._execute_tool(
                     pending_tool["name"],
                     pending_tool["arguments"]
                 )
-                return result
+                # _execute_tool returns RouterResult; extract content
+                if exec_result.status == "ok":
+                    return exec_result.content
+                # If another security gate fires during MFA execution, surface it
+                return self._handle_blocked_result(exec_result, pending_tool.get("user_id", user_id), {})
             else:
                 del self.pending_mfa[user_id]
                 return "Error: MFA authorization failed. Action aborted."
@@ -577,24 +650,23 @@ class Orchestrator:
             if user_message.strip().upper().startswith("YES"):
                 tool_name = synthesis["tool_name"]
                 try:
-                    # 1. Register in runtime
+                    # 1. Register in runtime (includes AST sandbox)
                     self.cognitive_router.register_dynamic_tool(
                         tool_name, synthesis["code"], synthesis["schema_json"]
                     )
                     # 2. Persist to DB
-                    import json as _json
-                    self.ledger_memory.register_tool(
+                    await self.ledger_memory.register_tool(
                         name=tool_name,
                         description=synthesis["description"],
                         code=synthesis["code"],
                         schema_json=synthesis["schema_json"],
                     )
-                    self.ledger_memory.approve_tool(tool_name)
+                    await self.ledger_memory.approve_tool(tool_name)
                     # 3. Log capability to core memory
-                    core = self.core_memory.get_all()
+                    core = await self.core_memory.get_all()
                     caps = core.get("known_capabilities", "")
                     updated_caps = f"{caps}, {tool_name}".lstrip(", ")
-                    self.core_memory.update("known_capabilities", updated_caps)
+                    await self.core_memory.update("known_capabilities", updated_caps)
                     logger.info(f"Tool '{tool_name}' approved, registered, and logged to core memory")
                     # 4. Retry original query with the new tool available
                     retry_response = await self.process_message(
@@ -621,7 +693,7 @@ class Orchestrator:
             # Load last 10 conversational turns for this user
             if user_id != "heartbeat":
                 try:
-                    state["chat_history"] = self.ledger_memory.get_chat_history(user_id, limit=5)
+                    state["chat_history"] = await self.ledger_memory.get_chat_history(user_id, limit=5)
                 except Exception as e:
                     logger.warning(f"Failed to load chat history for {user_id}: {e}")
 
@@ -630,11 +702,23 @@ class Orchestrator:
 
             while state["iteration_count"] < max_iterations:
 
+                # Check for a blocked result set by a previous node
+                if state.get(_BLOCKED_KEY):
+                    return self._handle_blocked_result(
+                        state.pop(_BLOCKED_KEY), user_id, state
+                    )
+
                 # 1. Supervisor (first iteration only, or after HITL guidance)
                 if not state["current_plan"] and state["iteration_count"] == 0:
                     state = await self.supervisor_node(state)
                 else:
                     state["user_input"] += f"\n[CRITIC FEEDBACK: {state['critic_feedback']}. Fix your output.]"
+
+                # Check for blocked result after supervisor
+                if state.get(_BLOCKED_KEY):
+                    return self._handle_blocked_result(
+                        state.pop(_BLOCKED_KEY), user_id, state
+                    )
 
                 # If supervisor handled it directly (no workers), skip critic to reduce latency
                 if not state["current_plan"] and state.get("final_response"):
@@ -646,6 +730,11 @@ class Orchestrator:
                         state = await self.research_agent(state)
                     elif "coder" in task.lower():
                         state = await self.coder_agent(state)
+                    # Check after each worker
+                    if state.get(_BLOCKED_KEY):
+                        return self._handle_blocked_result(
+                            state.pop(_BLOCKED_KEY), user_id, state
+                        )
 
                 if not state["current_plan"] and not state.get("final_response"):
                     state["final_response"] = "No response could be generated. Please try again."
@@ -653,6 +742,11 @@ class Orchestrator:
 
                 # 3. Critic (only when workers were called)
                 state = await self.critic_node(state)
+
+                if state.get(_BLOCKED_KEY):
+                    return self._handle_blocked_result(
+                        state.pop(_BLOCKED_KEY), user_id, state
+                    )
 
                 if state["critic_feedback"] == "PASS":
                     break
@@ -683,45 +777,89 @@ class Orchestrator:
 
             if user_id != "heartbeat" and not is_error_response:
                 try:
-                    self.ledger_memory.save_chat_turn(user_id, "user", user_message)
-                    self.ledger_memory.save_chat_turn(user_id, "assistant", final_resp)
+                    await self.ledger_memory.save_chat_turn(user_id, "user", user_message)
+                    await self.ledger_memory.save_chat_turn(user_id, "assistant", final_resp)
                 except Exception as e:
                     logger.warning(f"Failed to save chat turn for {user_id}: {e}")
 
-            # 4. Memory storage (non-blocking fire-and-forget)
+                # Fire-and-forget memory consolidation and vector store write
+                asyncio.create_task(self._consolidate_memory(user_id))
+
+            # Vector memory storage (non-blocking fire-and-forget)
             asyncio.create_task(
                 self._save_memory_async(f"User: {user_message}\nAssistant: {final_resp}")
             )
 
             return final_resp
 
-        except RequiresMFAError as mfa_err:
-            self.pending_mfa[user_id] = {"name": mfa_err.tool_name, "arguments": mfa_err.arguments}
-            return "SECURITY LOCK: To authorize this core change, complete the phrase: 'The sky is...'"
         except RequiresHITLError as hitl_err:
             self.pending_hitl_state[user_id] = state
             return str(hitl_err)
-        except RequiresCapabilitySynthesisError as gap_err:
-            hitl_prompt = await self.tool_synthesis_node(state, gap_err)
-            return hitl_prompt
         except Exception as e:
             logger.error(f"Graph execution failed: {e}", exc_info=True)
             return "An internal error occurred."
+
+    def _handle_blocked_result(
+        self,
+        result: RouterResult,
+        user_id: str,
+        state: Dict[str, Any],
+    ) -> str:
+        """
+        Convert a non-ok RouterResult into the appropriate user-facing string,
+        registering any pending MFA / HITL / tool-synthesis state as needed.
+        """
+        if result.status == "mfa_required":
+            self.pending_mfa[user_id] = {
+                "name": result.mfa_tool_name,
+                "arguments": result.mfa_arguments,
+            }
+            return "SECURITY LOCK: To authorize this core change, complete the phrase: 'The sky is...'"
+
+        if result.status == "hitl_required":
+            self.pending_hitl_state[user_id] = state
+            return result.hitl_message
+
+        if result.status == "capability_gap":
+            # Run synthesis synchronously via create_task — result will come back
+            # in a follow-up message after the Admin approves/rejects.
+            asyncio.create_task(self._async_tool_synthesis(user_id, result, state))
+            return (
+                f"I identified a capability gap: {result.gap_description}. "
+                f"Requesting tool synthesis from System 2..."
+            )
+
+        # Fallback
+        return f"An unexpected router status was received: {result.status}"
+
+    async def _async_tool_synthesis(
+        self,
+        user_id: str,
+        result: RouterResult,
+        state: Dict[str, Any],
+    ) -> None:
+        """Background task: run tool synthesis and send the HITL prompt to admin."""
+        try:
+            hitl_prompt = await self.tool_synthesis_node(state, result)
+            if self.outbound_queue is not None:
+                await self.outbound_queue.put(hitl_prompt)
+        except Exception as e:
+            logger.error(f"Background tool synthesis failed: {e}", exc_info=True)
 
     def close(self) -> None:
         try:
             if hasattr(self, 'vector_memory') and self.vector_memory:
                 self.vector_memory.close()
-            if hasattr(self, 'ledger_memory') and self.ledger_memory:
-                self.ledger_memory.close()
             if hasattr(self, 'cognitive_router') and self.cognitive_router:
                 # Schedule async close — best-effort at shutdown time
                 try:
                     loop = asyncio.get_event_loop()
                     if loop.is_running():
                         loop.create_task(self.cognitive_router.close())
+                        loop.create_task(self.ledger_memory.close())
                     else:
                         loop.run_until_complete(self.cognitive_router.close())
+                        loop.run_until_complete(self.ledger_memory.close())
                 except Exception:
                     pass
             logger.info("Orchestrator resources cleaned up")
