@@ -7,11 +7,13 @@ System 2: Cloud LLM for complex reasoning. Provider priority:
   2. Gemini (Google AI Studio free tier) — set GEMINI_API_KEY + USE_GEMINI=True
 """
 
+import ast
 import os
 import logging
 import json
 import asyncio
 import re
+from dataclasses import dataclass, field
 from typing import Optional, Dict, Any, List
 from google import genai
 from google.genai import types as genai_types
@@ -25,6 +27,35 @@ except ImportError:
 
 from src.core.skill_manager import SkillRegistry
 
+# ── Structured result returned by all router methods ─────────────────────────
+
+@dataclass
+class RouterResult:
+    """
+    Structured result from the CognitiveRouter.
+
+    ``status`` is always one of:
+      - "ok"               — normal text response in ``content``
+      - "mfa_required"     — the model requested a privileged core update
+      - "hitl_required"    — human-in-the-loop guidance is needed
+      - "capability_gap"   — System 1 cannot fulfil the request; synthesis needed
+    """
+    status: str  # "ok" | "mfa_required" | "hitl_required" | "capability_gap"
+    content: str = ""
+    # MFA fields
+    mfa_tool_name: str = ""
+    mfa_arguments: dict = field(default_factory=dict)
+    # HITL fields
+    hitl_message: str = ""
+    # Capability-gap fields
+    gap_description: str = ""
+    suggested_tool_name: str = ""
+
+
+# ── Legacy exception classes kept for backward compatibility ─────────────────
+# These are no longer raised by the router itself; they may still be raised
+# by orchestrator-internal code (e.g. energy exhaustion in _deduct_energy).
+
 class RequiresMFAError(Exception):
     def __init__(self, tool_name: str, arguments: dict):
         self.tool_name = tool_name
@@ -37,11 +68,19 @@ class RequiresHITLError(Exception):
         super().__init__(self.message)
 
 class RequiresCapabilitySynthesisError(Exception):
-    """Raised when System 1 calls request_capability — signals a tool gap to the orchestrator."""
+    """Raised by orchestrator-internal code (e.g. energy exhaustion)."""
     def __init__(self, gap_description: str, suggested_tool_name: str):
         self.gap_description = gap_description
         self.suggested_tool_name = suggested_tool_name
         super().__init__(f"Capability gap: {gap_description}")
+
+# ── AST sandbox configuration ─────────────────────────────────────────────────
+
+_BLOCKED_TOP_LEVEL_MODULES = {
+    "os", "sys", "subprocess", "shutil", "pathlib", "socket",
+    "importlib", "builtins", "ctypes", "multiprocessing", "threading",
+    "signal", "pty", "popen", "pexpect", "atexit", "gc",
+}
 
 logger = logging.getLogger(__name__)
 
@@ -57,51 +96,39 @@ class CognitiveRouter:
     System 2: Groq (preferred if key set) or Gemini (fallback)
     """
 
-    async def _execute_tool(self, tool_name: str, arguments: dict) -> str:
+    async def _execute_tool(self, tool_name: str, arguments: dict) -> RouterResult:
         """Dispatch a tool call through the SkillRegistry.
 
-        Security intercepts (MFA / HITL / capability synthesis) are raised
-        here before the registry is consulted, keeping security logic centralised.
+        Security intercepts (MFA / HITL / capability synthesis) are handled
+        here, returning a structured :class:`RouterResult` rather than raising.
         """
         logger.info(f"Executing tool: {tool_name} with args: {list(arguments.keys())}")
 
         # ── Security intercepts ──────────────────────────────────────────────
         if tool_name == "request_core_update":
-            raise RequiresMFAError(tool_name, arguments)
+            return RouterResult(
+                status="mfa_required",
+                mfa_tool_name=tool_name,
+                mfa_arguments=arguments,
+            )
 
         if tool_name == "ask_admin_for_guidance":
-            raise RequiresHITLError(
+            msg = (
                 f"Guidance Needed: {arguments.get('context_summary', '')}\n"
                 f"Question: {arguments.get('specific_question', '')}"
             )
+            return RouterResult(status="hitl_required", hitl_message=msg)
 
         if tool_name == "request_capability":
-            raise RequiresCapabilitySynthesisError(
+            return RouterResult(
+                status="capability_gap",
                 gap_description=arguments.get("gap_description", "unspecified gap"),
                 suggested_tool_name=arguments.get("suggested_tool_name", "new_tool"),
             )
 
         # ── Registry dispatch ────────────────────────────────────────────────
-        return await self.registry.execute(tool_name, arguments)
-
-    @staticmethod
-    def _try_parse_text_tool_call(text: str) -> Optional[Dict[str, Any]]:
-        """Detect if the LLM returned a text-based JSON tool call instead of a structured call.
-
-        Local models (e.g. Gemma) sometimes emit the tool invocation as raw JSON text
-        rather than a structured tool_calls object. This method detects that pattern.
-        Returns a dict with 'tool_call' and 'arguments' keys, or None.
-        """
-        stripped = text.strip()
-        if not (stripped.startswith('{') and stripped.endswith('}')):
-            return None
-        try:
-            parsed = json.loads(stripped)
-            if isinstance(parsed, dict) and 'tool_call' in parsed:
-                return parsed
-        except (json.JSONDecodeError, ValueError):
-            pass
-        return None
+        content = await self.registry.execute(tool_name, arguments)
+        return RouterResult(status="ok", content=content)
 
     @staticmethod
     def sanitize_response(text: str) -> str:
@@ -132,35 +159,13 @@ class CognitiveRouter:
         text = re.sub(r'WORKERS:\s*\[.*?\]\s*\n?', '', text, flags=re.IGNORECASE)
 
         # Standalone JSON blobs that look like tool-call payloads
-        # First try: entire response is a JSON tool call (handles nested objects)
-        stripped = text.strip()
-        if stripped.startswith('{') and stripped.endswith('}'):
-            try:
-                _parsed = json.loads(stripped)
-                if isinstance(_parsed, dict) and any(
-                    k in _parsed for k in ('tool_call', 'tool_name', 'function_call')
-                ):
-                    return ""  # entire response was a raw tool-call JSON blob
-            except (json.JSONDecodeError, ValueError):
-                pass
-        # Second try: scan line-by-line for single-line JSON tool-call blobs
-        _clean_lines = []
-        for _line in text.split('\n'):
-            _s = _line.strip()
-            if (
-                _s.startswith('{') and _s.endswith('}')
-                and any(k in _s for k in ('"tool_call"', '"tool_name"', '"function_call"'))
-            ):
-                try:
-                    _lp = json.loads(_s)
-                    if isinstance(_lp, dict) and any(
-                        k in _lp for k in ('tool_call', 'tool_name', 'function_call')
-                    ):
-                        continue  # skip this line
-                except (json.JSONDecodeError, ValueError):
-                    pass
-            _clean_lines.append(_line)
-        text = '\n'.join(_clean_lines)
+        # Matches a top-level {...} block containing known internal keys
+        text = re.sub(
+            r'(?m)^\s*\{[^{}]*"(?:tool_call|tool_name|function_call|function|name)"[^{}]*\}\s*$',
+            '',
+            text,
+            flags=re.IGNORECASE,
+        )
 
         # Internal planning/scratchpad sections the model sometimes generates
         # Strips: ## ⚙️ Section Title, [Output Draft], [Internal Critique], [Finalized Deliverable]
@@ -190,16 +195,29 @@ class CognitiveRouter:
         # System 2 provider selection: Groq takes priority over Gemini
         self.groq_client = None
         self.gemini_client = None
+        self.groq_model = os.getenv('GROQ_MODEL', 'llama-3.3-70b-versatile')
 
         if GROQ_AVAILABLE and GROQ_API_KEY:
             self.groq_client = AsyncGroq(api_key=GROQ_API_KEY)
-            self.groq_model = os.getenv('GROQ_MODEL', 'llama-3.3-70b-versatile')
-            logger.info(f"System 2: Groq ({self.groq_model}) — fast free inference")
+            logger.info(f"System 2: Groq ({self.groq_model}) — API key configured")
+        elif not GROQ_AVAILABLE and GROQ_API_KEY:
+            logger.warning(
+                "GROQ_API_KEY is set but the 'groq' package is not installed. "
+                "Run: pip install groq"
+            )
         elif GEMINI_API_KEY and USE_GEMINI:
             self.gemini_client = genai.Client(api_key=GEMINI_API_KEY)
-            logger.info(f"System 2: Gemini ({model_name}) via google-genai SDK")
+            logger.info(f"System 2: Gemini ({model_name}) — API key configured")
+        elif GEMINI_API_KEY and not USE_GEMINI:
+            logger.warning(
+                "GEMINI_API_KEY is set but USE_GEMINI is not 'True'. "
+                "Set USE_GEMINI=True in .env to activate Gemini as System 2."
+            )
         else:
-            logger.warning("No System 2 available. Set GROQ_API_KEY (free) or GEMINI_API_KEY + USE_GEMINI=True.")
+            logger.warning(
+                "No System 2 provider configured — capability synthesis will be unavailable. "
+                "Set GROQ_API_KEY (free at console.groq.com) or GEMINI_API_KEY + USE_GEMINI=True."
+            )
 
         logger.info(f"CognitiveRouter initialized. System 1: {local_model}")
 
@@ -212,23 +230,91 @@ class CognitiveRouter:
                 logger.debug(f"Error closing Ollama client: {e}")
             self._ollama_client = None
 
+    @staticmethod
+    def _extract_inline_tool_call(text: str) -> Optional[tuple]:
+        """
+        Fallback parser for models that embed tool call JSON inside the text
+        ``content`` field instead of using the native ``tool_calls`` array.
+
+        Looks for a top-level JSON object containing a ``tool_name`` (or
+        ``name``) key whose value matches a known meta-tool pattern, plus an
+        optional ``arguments`` / ``parameters`` block.
+
+        Returns ``(tool_name, arguments_dict)`` on success, or ``None`` if no
+        recognisable inline tool call is found.
+        """
+        if not text:
+            return None
+
+        # Extract all top-level JSON objects, including those with nested braces,
+        # by scanning for balanced brace pairs.
+        blobs: List[str] = []
+        depth = 0
+        start = -1
+        for i, ch in enumerate(text):
+            if ch == '{':
+                if depth == 0:
+                    start = i
+                depth += 1
+            elif ch == '}':
+                depth -= 1
+                if depth == 0 and start != -1:
+                    blobs.append(text[start:i + 1])
+                    start = -1
+
+        for raw in blobs:
+            try:
+                obj = json.loads(raw)
+            except (json.JSONDecodeError, ValueError):
+                continue
+
+            if not isinstance(obj, dict):
+                continue
+
+            # Accept keys like "tool_name", "name", "function_call", "tool_call"
+            name_val = (
+                obj.get("tool_name")
+                or obj.get("name")
+                or obj.get("function_call")
+                or obj.get("tool_call")
+            )
+            if not isinstance(name_val, str) or not name_val.strip():
+                continue
+
+            # Extract arguments from common key variations
+            raw_args = (
+                obj.get("arguments")
+                or obj.get("parameters")
+                or obj.get("args")
+                or {}
+            )
+            if isinstance(raw_args, str):
+                try:
+                    raw_args = json.loads(raw_args)
+                except (json.JSONDecodeError, ValueError):
+                    raw_args = {}
+            if not isinstance(raw_args, dict):
+                # Arguments might be spread flat in the same object
+                # (e.g. {"tool_name": "x", "gap_description": "...", ...})
+                known_meta = {"tool_name", "name", "function_call", "tool_call",
+                              "arguments", "parameters", "args"}
+                raw_args = {k: v for k, v in obj.items() if k not in known_meta}
+
+            logger.debug(f"_extract_inline_tool_call: found '{name_val}' in content text")
+            return (name_val.strip(), raw_args)
+
+        return None
+
     async def route_to_system_1(
         self,
         messages: List[Dict[str, str]],
         allowed_tools: Optional[List[str]] = None
-    ) -> str:
+    ) -> RouterResult:
         """
         Route to System 1 (Local Model) - Fast, pattern-based responses.
 
-        Uses local Gemma 4 model via Ollama.
-
-        Args:
-            messages: List of message dictionaries, formatted for chat.
-                e.g., [{"role": "system", "content": "..."}, {"role": "user", "content": "..."}]
-            allowed_tools: Optional list of tool names allowed for this call.
-
-        Returns:
-            str: The model's response.
+        Returns a :class:`RouterResult` whose ``status`` is "ok" on success,
+        or a non-ok status when a security intercept fires.
         """
         logger.info(f"Routing to System 1 (Local Model - {self.local_model})")
 
@@ -298,149 +384,137 @@ class CognitiveRouter:
                 else:
                     raise
 
-            # ReAct loop — max 5 tool executions per turn to prevent infinite chaining
-            MAX_TOOL_ITERATIONS = 5
-            tool_iterations = 0
-            current_messages = list(messages)
-            current_response = response
-
-            while True:
-                if not (current_response and 'message' in current_response):
-                    error_msg = "Unexpected response format from Ollama"
-                    logger.warning(error_msg)
-                    return f"[System 1 - Error]: {error_msg}"
-
-                message = current_response['message']
+            # Check for tool calls
+            if response and 'message' in response:
+                message = response['message']
 
                 if 'tool_calls' in message and message['tool_calls']:
-                    if tool_iterations >= MAX_TOOL_ITERATIONS:
-                        logger.warning("ReAct loop: max tool iterations (%d) reached", MAX_TOOL_ITERATIONS)
-                        return "Tool execution limit reached without a final response."
+                    # Robust extraction: Ollama returns ToolCall Pydantic objects that
+                    # support both attribute access (.function) and dict-like access
+                    # (['function']).  Some model/library combinations may omit the
+                    # 'function' wrapper or serialize 'arguments' as a JSON string
+                    # rather than a plain dict.  Handle all variants gracefully.
+                    tool_name = ""
+                    arguments: dict = {}
+                    tc_parse_ok = False
+                    try:
+                        raw_tc = message['tool_calls'][0]
+                        # Support both {'function': {...}} and bare {'name': ..., 'arguments': ...}
+                        if hasattr(raw_tc, 'function'):
+                            fn_data = raw_tc.function
+                        elif isinstance(raw_tc, dict) and 'function' in raw_tc:
+                            fn_data = raw_tc['function']
+                        else:
+                            fn_data = raw_tc  # bare format
 
-                    tool_call = message['tool_calls'][0]['function']
-                    tool_name = tool_call['name']
-                    arguments = tool_call.get('arguments', {})
+                        tool_name = (
+                            fn_data.get('name', '') if isinstance(fn_data, dict)
+                            else getattr(fn_data, 'name', '')
+                        )
+                        raw_args = (
+                            fn_data.get('arguments', {}) if isinstance(fn_data, dict)
+                            else getattr(fn_data, 'arguments', {})
+                        )
+                        # Some models return arguments as a JSON string instead of a dict
+                        if isinstance(raw_args, str):
+                            try:
+                                arguments = json.loads(raw_args)
+                            except (json.JSONDecodeError, ValueError):
+                                logger.warning(
+                                    f"System 1 tool call arguments could not be JSON-parsed: {raw_args!r}"
+                                )
+                                arguments = {}
+                        elif isinstance(raw_args, dict):
+                            arguments = raw_args
+                        else:
+                            arguments = dict(raw_args) if raw_args else {}
 
-                    # Intercept sensitive core updates
-                    if tool_name == "request_core_update":
-                        raise RequiresMFAError(tool_name, arguments)
+                        if not tool_name:
+                            raise ValueError(f"Tool call is missing the 'name' field: {raw_tc!r}")
 
-                    # Intercept HITL requests
-                    if tool_name == "ask_admin_for_guidance":
-                        context_summary = arguments.get("context_summary", "")
-                        specific_question = arguments.get("specific_question", "")
-                        raise RequiresHITLError(f"Guidance Needed: {context_summary}\nQuestion: {specific_question}")
+                        tc_parse_ok = True
 
-                    # Intercept capability gap signals — hand off to orchestrator
-                    if tool_name == "request_capability":
-                        raise RequiresCapabilitySynthesisError(
-                            gap_description=arguments.get("gap_description", "unspecified gap"),
-                            suggested_tool_name=arguments.get("suggested_tool_name", "new_tool"),
+                    except Exception as tc_parse_err:
+                        logger.error(
+                            f"Failed to parse tool_calls from System 1 response: {tc_parse_err!r}",
+                            exc_info=True,
                         )
 
-                    tool_result = await self._execute_tool(tool_name, arguments)
-                    tool_iterations += 1
+                    if tc_parse_ok:
+                        # Delegate to _execute_tool — returns RouterResult
+                        exec_result = await self._execute_tool(tool_name, arguments)
+                        if exec_result.status != "ok":
+                            return exec_result  # Propagate MFA / HITL / capability-gap
 
-                    current_messages.append({
-                        "role": "assistant",
-                        "content": json.dumps({"tool_call": tool_name, "arguments": arguments})
-                    })
-                    current_messages.append({
-                        "role": "user",
-                        "content": f"Tool result: {tool_result}"
-                    })
-
-                    current_response = await asyncio.wait_for(
-                        client.chat(
-                            model=available_model,
-                            messages=current_messages,
-                            tools=active_tools
-                        ),
-                        timeout=60.0
-                    )
-                    continue
-
-                elif 'content' in message:
-                    result = message['content'].strip() if message['content'] else ''
-
-                    # Detect text-based tool call (Gemma/local models sometimes emit JSON instead of structured calls)
-                    if result:
-                        text_call = self._try_parse_text_tool_call(result)
-                        if text_call:
-                            text_tool_name = text_call.get('tool_call', '')
-                            text_arguments = text_call.get('arguments', {})
-                            if text_tool_name and tool_iterations < MAX_TOOL_ITERATIONS:
-                                logger.info(f"ReAct loop: detected text-based tool call for '{text_tool_name}'")
-                                if text_tool_name == "request_core_update":
-                                    raise RequiresMFAError(text_tool_name, text_arguments)
-                                if text_tool_name == "ask_admin_for_guidance":
-                                    raise RequiresHITLError(
-                                        f"Guidance Needed: {text_arguments.get('context_summary', '')}\n"
-                                        f"Question: {text_arguments.get('specific_question', '')}"
-                                    )
-                                if text_tool_name == "request_capability":
-                                    raise RequiresCapabilitySynthesisError(
-                                        gap_description=text_arguments.get('gap_description', 'unspecified gap'),
-                                        suggested_tool_name=text_arguments.get('suggested_tool_name', 'new_tool'),
-                                    )
-                                tool_result = await self._execute_tool(text_tool_name, text_arguments)
-                                tool_iterations += 1
-                                current_messages.append({"role": "assistant", "content": result})
-                                current_messages.append({"role": "user", "content": f"Tool result: {tool_result}"})
-                                current_response = await asyncio.wait_for(
-                                    client.chat(
-                                        model=available_model,
-                                        messages=current_messages,
-                                        tools=active_tools
-                                    ),
-                                    timeout=60.0
-                                )
-                                continue
-                            elif not text_tool_name:
-                                logger.warning("ReAct loop: text-based call missing tool_call name, skipping")
-
-                    if not result and tool_iterations > 0:
-                        # Silent crash fix: LLM returned empty after a tool call — force continuation
-                        logger.info("ReAct loop: empty response after tool call, injecting continuation prompt")
-                        if tool_iterations >= MAX_TOOL_ITERATIONS:
-                            return "Tool execution limit reached without a final response."
-                        current_messages.append({
-                            "role": "user",
-                            "content": "Tool execution successful. Please continue with the next logical step or provide your final response to the user."
+                        # Build follow-up messages and get a final answer
+                        followup_messages = messages.copy()
+                        followup_messages.append({
+                            "role": "assistant",
+                            "content": json.dumps({"tool_call": tool_name, "arguments": arguments})
                         })
-                        tool_iterations += 1
-                        current_response = await asyncio.wait_for(
+                        followup_messages.append({
+                            "role": "user",
+                            "content": f"Tool result: {exec_result.content}"
+                        })
+
+                        final_response = await asyncio.wait_for(
                             client.chat(
                                 model=available_model,
-                                messages=current_messages,
+                                messages=followup_messages,
                                 tools=active_tools
                             ),
                             timeout=60.0
                         )
-                        continue
 
+                        if final_response and 'message' in final_response and 'content' in final_response['message']:
+                            result = final_response['message']['content'].strip()
+                            if result:
+                                logger.info(f"System 1 response received after tool call ({len(result)} chars)")
+                                return RouterResult(status="ok", content=result)
+                        return RouterResult(status="ok", content="Tool executed but model produced no response.")
+                    # tc_parse_ok is False: fall through to content handling below
+
+                # Standard text response.
+                # Note: intentionally `if` (not `elif`) so that a tool_calls parse
+                # failure above can fall through here and still return the content.
+                # When a tool_calls parse succeeds the block above always returns
+                # early, so double-processing cannot occur.
+                if 'content' in message:
+                    result = message['content'].strip() if message['content'] else ""
                     if not result:
                         logger.warning("System 1 returned empty response")
-                        return "[System 1 - Error]: Empty response from model"
+                        return RouterResult(status="ok", content="[System 1 - Error]: Empty response from model")
 
-                    logger.info(f"System 1 response received after {tool_iterations} tool call(s) ({len(result)} chars)")
+                    # Fallback: detect in-text tool calls that some models embed as JSON
+                    # in the content field instead of using the native tool_calls array.
+                    inline_tc = self._extract_inline_tool_call(result)
+                    if inline_tc:
+                        inline_name, inline_args = inline_tc
+                        logger.info(
+                            f"System 1 in-text tool call detected: {inline_name} — delegating to _execute_tool"
+                        )
+                        exec_result = await self._execute_tool(inline_name, inline_args)
+                        if exec_result.status != "ok":
+                            return exec_result  # Propagate MFA / HITL / capability-gap
+                        return RouterResult(status="ok", content=exec_result.content)
+
+                    logger.info(f"System 1 response received ({len(result)} chars)")
                     logger.debug(f"System 1 response: {result[:200]}...")
-                    return result
+                    return RouterResult(status="ok", content=result)
 
-                else:
-                    error_msg = "Unexpected response format from Ollama"
-                    logger.warning(error_msg)
-                    return f"[System 1 - Error]: {error_msg}"
+            error_msg = "Unexpected response format from Ollama"
+            logger.warning(error_msg)
+            return RouterResult(status="ok", content=f"[System 1 - Error]: {error_msg}")
 
         except Exception as e:
             error_msg = f"System 1 (Local Model) error: {str(e)}. Make sure Ollama is running with a model like 'gemma4:e4b' or 'gemma2' available."
             logger.error(error_msg, exc_info=True)
-            return f"[System 1 - Error]: {error_msg}"
+            return RouterResult(status="ok", content=f"[System 1 - Error]: {error_msg}")
 
     async def _route_to_gemini(
         self,
         messages: List[Dict[str, str]]
-    ) -> str:
+    ) -> RouterResult:
         """
         Route to System 2 (Gemini API) via the google-genai SDK.
         Tools are disabled on this path — Groq handles tool calling.
@@ -481,10 +555,10 @@ class CognitiveRouter:
             if response and response.text:
                 result = response.text.strip()
                 logger.info(f"System 2 (Gemini) response received ({len(result)} chars)")
-                return result
+                return RouterResult(status="ok", content=result)
 
             logger.warning("Empty response from Gemini API")
-            return "[System 2 - No Response]: Empty response from Gemini API"
+            return RouterResult(status="ok", content="[System 2 - No Response]: Empty response from Gemini API")
 
         except Exception as e:
             logger.error(f"System 2 (Gemini) error: {str(e)}", exc_info=True)
@@ -554,8 +628,8 @@ Rules:
             {"role": "user", "content": synthesis_prompt},
         ]
 
-        raw = await self.route_to_system_2(messages)
-        return self._parse_synthesis_output(raw, suggested_tool_name)
+        raw_result = await self.route_to_system_2(messages)
+        return self._parse_synthesis_output(raw_result.content, suggested_tool_name)
 
     @staticmethod
     def _parse_synthesis_output(raw: str, fallback_name: str) -> Dict[str, str]:
@@ -599,12 +673,71 @@ Rules:
 
         return result
 
+    @staticmethod
+    def _validate_tool_code_ast(code: str, tool_name: str) -> None:
+        """
+        Parse the synthesised code as an AST and reject any import that
+        touches a dangerous top-level module.
+
+        Raises ``ValueError`` with a human-readable message if the code fails
+        the sandbox check.
+        """
+        try:
+            tree = ast.parse(code)
+        except SyntaxError as exc:
+            raise ValueError(f"Synthesised code for '{tool_name}' has a syntax error: {exc}") from exc
+
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                for alias in node.names:
+                    base = alias.name.split(".")[0]
+                    if base in _BLOCKED_TOP_LEVEL_MODULES:
+                        raise ValueError(
+                            f"Synthesised tool '{tool_name}' imports blocked module '{alias.name}'. "
+                            f"Blocked modules: {sorted(_BLOCKED_TOP_LEVEL_MODULES)}"
+                        )
+            elif isinstance(node, ast.ImportFrom):
+                if node.module:
+                    base = node.module.split(".")[0]
+                    if base in _BLOCKED_TOP_LEVEL_MODULES:
+                        raise ValueError(
+                            f"Synthesised tool '{tool_name}' imports from blocked module '{node.module}'. "
+                            f"Blocked modules: {sorted(_BLOCKED_TOP_LEVEL_MODULES)}"
+                        )
+
     def register_dynamic_tool(self, tool_name: str, code: str, schema_json: str) -> None:
-        """Load synthesised Python code into the runtime via the SkillRegistry."""
+        """Load synthesised Python code into the runtime via the SkillRegistry.
+
+        The code is first validated through an AST sandbox that blocks imports
+        of dangerous modules (os, sys, subprocess, etc.) before execution.
+        """
         import types
         import json as _json
 
+        # ── AST sandbox check ──────────────────────────────────────────────
+        self._validate_tool_code_ast(code, tool_name)
+
         module = types.ModuleType(f"dynamic_tool_{tool_name}")
+        # Restrict built-ins to a safe subset so that exec() cannot reach
+        # open(), eval(), __import__(), exec(), compile(), etc. even if the
+        # AST check is somehow bypassed.
+        _safe_builtins = {
+            "None": None, "True": True, "False": False,
+            "abs": abs, "all": all, "any": any, "bool": bool,
+            "bytes": bytes, "chr": chr, "dict": dict, "dir": dir,
+            "divmod": divmod, "enumerate": enumerate, "filter": filter,
+            "float": float, "format": format, "frozenset": frozenset,
+            "getattr": getattr, "hasattr": hasattr, "hash": hash,
+            "int": int, "isinstance": isinstance, "issubclass": issubclass,
+            "iter": iter, "len": len, "list": list, "map": map,
+            "max": max, "min": min, "next": next, "object": object,
+            "ord": ord, "pow": pow, "print": print, "range": range,
+            "repr": repr, "reversed": reversed, "round": round,
+            "set": set, "slice": slice, "sorted": sorted, "str": str,
+            "sum": sum, "tuple": tuple, "type": type, "vars": vars,
+            "zip": zip,
+        }
+        module.__dict__["__builtins__"] = _safe_builtins
         exec(compile(code, f"<dynamic:{tool_name}>", "exec"), module.__dict__)
 
         fn = getattr(module, tool_name, None)
@@ -627,10 +760,11 @@ Rules:
         """True if any System 2 provider (Groq or Gemini) is configured."""
         return self.groq_client is not None or self.gemini_client is not None
 
-    async def route_to_system_2(self, messages: List[Dict[str, str]]) -> str:
+    async def route_to_system_2(self, messages: List[Dict[str, str]]) -> RouterResult:
         """
         Route to System 2. Uses Groq if available, falls back to Gemini.
         Groq is preferred: free tier, very fast, high quality (llama-3.3-70b).
+        Returns a :class:`RouterResult` — never raises for security intercepts.
         """
         if self.groq_client is not None:
             return await self._route_to_groq(messages)
@@ -639,7 +773,7 @@ Rules:
         else:
             raise RuntimeError("No System 2 provider configured. Set GROQ_API_KEY or GEMINI_API_KEY+USE_GEMINI=True.")
 
-    async def _route_to_groq(self, messages: List[Dict[str, str]]) -> str:
+    async def _route_to_groq(self, messages: List[Dict[str, str]]) -> RouterResult:
         """Route to Groq API (llama-3.3-70b or configured model) with full tool calling."""
         logger.info(f"Routing to System 2 (Groq/{self.groq_model})")
         try:
@@ -656,57 +790,37 @@ Rules:
                 for tool in self.registry.get_schemas()
             ]
 
-            # ReAct loop — max 5 tool executions per turn to prevent infinite chaining
-            MAX_TOOL_ITERATIONS = 5
-            tool_iterations = 0
-            current_messages = list(messages)
-
             response = await self.groq_client.chat.completions.create(
                 model=self.groq_model,
-                messages=current_messages,
+                messages=messages,
                 tools=groq_tools,
                 tool_choice="auto",
                 max_tokens=2048,
             )
 
-            while True:
-                choice = response.choices[0]
+            choice = response.choices[0]
 
-                # Handle tool calls
-                if choice.finish_reason == "tool_calls" and choice.message.tool_calls:
-                    if tool_iterations >= MAX_TOOL_ITERATIONS:
-                        logger.warning("ReAct loop: max tool iterations (%d) reached", MAX_TOOL_ITERATIONS)
-                        return "Tool execution limit reached without a final response."
+            # Handle tool calls
+            if choice.finish_reason == "tool_calls" and choice.message.tool_calls:
+                tool_call = choice.message.tool_calls[0]
+                tool_name = tool_call.function.name
+                try:
+                    arguments = json.loads(tool_call.function.arguments)
+                except (json.JSONDecodeError, TypeError):
+                    arguments = {}
 
-                    tool_call = choice.message.tool_calls[0]
-                    tool_name = tool_call.function.name
-                    try:
-                        arguments = json.loads(tool_call.function.arguments)
-                    except (json.JSONDecodeError, TypeError):
-                        arguments = {}
+                logger.info(f"Groq requested tool call: {tool_name}")
 
-                    logger.info(f"Groq requested tool call: {tool_name}")
+                # Delegate to _execute_tool — returns RouterResult
+                exec_result = await self._execute_tool(tool_name, arguments)
+                if exec_result.status != "ok":
+                    return exec_result  # Propagate MFA / HITL / capability-gap
 
-                    # Security intercepts (same as System 1)
-                    if tool_name == "request_core_update":
-                        raise RequiresMFAError(tool_name, arguments)
-                    if tool_name == "ask_admin_for_guidance":
-                        raise RequiresHITLError(
-                            f"Guidance Needed: {arguments.get('context_summary', '')}\n"
-                            f"Question: {arguments.get('specific_question', '')}"
-                        )
-                    if tool_name == "request_capability":
-                        raise RequiresCapabilitySynthesisError(
-                            gap_description=arguments.get("gap_description", "unspecified gap"),
-                            suggested_tool_name=arguments.get("suggested_tool_name", "new_tool"),
-                        )
+                logger.info(f"Groq tool '{tool_name}' executed: {exec_result.content[:100]}")
 
-                    tool_result = await self._execute_tool(tool_name, arguments)
-                    tool_iterations += 1
-                    logger.info(f"Groq tool '{tool_name}' executed: {tool_result[:100]}")
-
-                    # Append tool call + result in proper OpenAI format
-                    current_messages.append({
+                # Follow-up in proper OpenAI tool-result format
+                followup_messages = list(messages) + [
+                    {
                         "role": "assistant",
                         "content": None,
                         "tool_calls": [{
@@ -714,51 +828,28 @@ Rules:
                             "type": "function",
                             "function": {"name": tool_name, "arguments": tool_call.function.arguments}
                         }]
-                    })
-                    current_messages.append({
+                    },
+                    {
                         "role": "tool",
                         "tool_call_id": tool_call.id,
-                        "content": tool_result
-                    })
+                        "content": exec_result.content
+                    }
+                ]
 
-                    response = await self.groq_client.chat.completions.create(
-                        model=self.groq_model,
-                        messages=current_messages,
-                        tools=groq_tools,
-                        tool_choice="auto",
-                        max_tokens=2048,
-                    )
-                    continue
+                final_response = await self.groq_client.chat.completions.create(
+                    model=self.groq_model,
+                    messages=followup_messages,
+                    max_tokens=2048,
+                )
+                result = final_response.choices[0].message.content.strip()
+                logger.info(f"System 2 (Groq) response after tool call ({len(result)} chars)")
+                return RouterResult(status="ok", content=result)
 
-                # Standard text response
-                result = choice.message.content
-                if result:
-                    result = result.strip()
+            # Standard text response
+            result = choice.message.content.strip()
+            logger.info(f"System 2 (Groq) response received ({len(result)} chars)")
+            return RouterResult(status="ok", content=result)
 
-                if not result and tool_iterations > 0:
-                    # Silent crash fix: LLM returned empty after a tool call — force continuation
-                    logger.info("ReAct loop: empty response after tool call, injecting continuation prompt")
-                    if tool_iterations >= MAX_TOOL_ITERATIONS:
-                        return "Tool execution limit reached without a final response."
-                    current_messages.append({
-                        "role": "user",
-                        "content": "Tool execution successful. Please continue with the next logical step or provide your final response to the user."
-                    })
-                    tool_iterations += 1
-                    response = await self.groq_client.chat.completions.create(
-                        model=self.groq_model,
-                        messages=current_messages,
-                        tools=groq_tools,
-                        tool_choice="auto",
-                        max_tokens=2048,
-                    )
-                    continue
-
-                logger.info(f"System 2 (Groq) response received after {tool_iterations} tool call(s) ({len(result or '')} chars)")
-                return result or ""
-
-        except (RequiresMFAError, RequiresHITLError, RequiresCapabilitySynthesisError):
-            raise
         except Exception as e:
             logger.error(f"Groq error: {e}", exc_info=True)
             raise

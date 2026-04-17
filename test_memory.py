@@ -9,6 +9,7 @@ Run this script to validate the memory layer before integrating with the
 main bot interface.
 """
 
+import asyncio
 import sys
 import logging
 from pprint import pprint
@@ -94,40 +95,100 @@ def test_vector_memory() -> bool:
         return False
 
 
-def test_ledger_memory() -> bool:
+async def test_ledger_memory_concurrency() -> bool:
     """
-    Test the LedgerMemory (SQLite) functionality.
+    Stress test LedgerMemory for async concurrency safety.
+
+    With aiosqlite + asyncio.Lock, concurrent coroutines share a single
+    connection without database-lock errors.
+    """
+    print("\n" + "=" * 80)
+    print("TESTING LEDGER MEMORY CONCURRENCY (aiosqlite / asyncio.Lock)")
+    print("=" * 80)
+
+    try:
+        ledger_mem = LedgerMemory(db_path="data/ledger_stress.db")
+        await ledger_mem.initialize()
+        print(f"{CHECK} LedgerMemory (Stress) initialized successfully")
+
+        num_coroutines = 10
+        iterations_per_coro = 20
+
+        async def worker_task(coro_id: int, iterations: int):
+            for i in range(iterations):
+                task_id = await ledger_mem.add_task(
+                    task_description=f"Task {i} from coroutine {coro_id}",
+                    priority=max(1, min(coro_id, 10)),
+                    status="PENDING"
+                )
+                _ = await ledger_mem.get_pending_tasks(limit=5)
+                await ledger_mem.update_task_status(task_id, "COMPLETED")
+                await ledger_mem.log_event(
+                    log_level=LogLevel.INFO,
+                    message=f"Coroutine {coro_id} completed iteration {i}"
+                )
+
+        print(f"\n--- Running {num_coroutines} coroutines with {iterations_per_coro} iterations each ---")
+
+        await asyncio.gather(*[
+            worker_task(c_id, iterations_per_coro)
+            for c_id in range(num_coroutines)
+        ])
+
+        print(f"{CHECK} All coroutines completed without OperationalError or locking issues.")
+
+        # Verify total logs
+        total_logs = len(await ledger_mem.get_logs(limit=1000))
+        if total_logs >= num_coroutines * iterations_per_coro:
+            print(f"{CHECK} Data verification passed (Logs count: {total_logs})")
+        else:
+            print(f"{FAIL} Data verification failed (Logs count: {total_logs})")
+            await ledger_mem.close()
+            return False
+
+        await ledger_mem.close()
+        return True
+    except Exception as e:
+        logger.error(f"LedgerMemory concurrency test failed: {e}")
+        print(f"\n{FAIL} LedgerMemory concurrency test FAILED: {e}")
+        return False
+
+
+async def test_ledger_memory() -> bool:
+    """
+    Test the LedgerMemory (aiosqlite) functionality.
 
     Returns:
         bool: True if all tests pass, False otherwise.
     """
     print("\n" + "=" * 80)
-    print("TESTING LEDGER MEMORY (SQLite - Short-Term Operational State)")
+    print("TESTING LEDGER MEMORY (aiosqlite - Short-Term Operational State)")
     print("=" * 80)
 
     try:
         # Initialize LedgerMemory
         logger.info("Initializing LedgerMemory...")
         ledger_mem = LedgerMemory(db_path="data/ledger.db")
+        await ledger_mem.initialize()
         print(f"{CHECK} LedgerMemory initialized successfully")
 
         # Test 1: Add tasks
         print("\n--- Test 1: Adding Tasks ---")
-        task_1_id = ledger_mem.add_task(
+        task_1_id = await ledger_mem.add_task(
             task_description="Process user input from Telegram",
             priority=1,
             status="PENDING"
         )
         print(f"{CHECK} Added task 1 (High Priority): ID {task_1_id}")
 
-        task_2_id = ledger_mem.add_task(
+        task_2_id = await ledger_mem.add_task(
             task_description="Query vector memory for relevant context",
             priority=3,
             status="PENDING"
         )
         print(f"{CHECK} Added task 2 (Medium Priority): ID {task_2_id}")
 
-        task_3_id = ledger_mem.add_task(
+        task_3_id = await ledger_mem.add_task(
             task_description="Generate response using LLM",
             priority=2,
             status="PENDING"
@@ -136,7 +197,7 @@ def test_ledger_memory() -> bool:
 
         # Test 2: Retrieve pending tasks
         print("\n--- Test 2: Retrieving Pending Tasks ---")
-        pending_tasks = ledger_mem.get_pending_tasks(order_by_priority=True)
+        pending_tasks = await ledger_mem.get_pending_tasks(order_by_priority=True)
         print(f"{CHECK} Retrieved {len(pending_tasks)} pending tasks (ordered by priority):")
         for i, task in enumerate(pending_tasks, 1):
             print(f"\n  Task {i}:")
@@ -148,29 +209,29 @@ def test_ledger_memory() -> bool:
 
         # Test 3: Update task status
         print("\n--- Test 3: Updating Task Status ---")
-        success = ledger_mem.update_task_status(task_1_id, "IN_PROGRESS")
+        success = await ledger_mem.update_task_status(task_1_id, "IN_PROGRESS")
         print(f"{CHECK} Task {task_1_id} updated to IN_PROGRESS: {success}")
 
-        success = ledger_mem.update_task_status(task_2_id, "COMPLETED")
+        success = await ledger_mem.update_task_status(task_2_id, "COMPLETED")
         print(f"{CHECK} Task {task_2_id} updated to COMPLETED: {success}")
 
         # Test 4: Log events
         print("\n--- Test 4: Logging Events ---")
-        log_1_id = ledger_mem.log_event(
+        log_1_id = await ledger_mem.log_event(
             log_level=LogLevel.INFO,
             message="Bot started and connected to Telegram",
             context={"event": "startup", "connection": "telegram"}
         )
         print(f"{CHECK} Logged INFO event: {log_1_id}")
 
-        log_2_id = ledger_mem.log_event(
+        log_2_id = await ledger_mem.log_event(
             log_level=LogLevel.DEBUG,
             message="Memory systems initialized",
             context={"components": ["VectorMemory", "LedgerMemory"]}
         )
         print(f"{CHECK} Logged DEBUG event: {log_2_id}")
 
-        log_3_id = ledger_mem.log_event(
+        log_3_id = await ledger_mem.log_event(
             log_level=LogLevel.WARNING,
             message="High task queue depth detected",
             context={"queue_size": 3, "recommendation": "increase_processing_rate"}
@@ -179,7 +240,7 @@ def test_ledger_memory() -> bool:
 
         # Test 5: Retrieve logs
         print("\n--- Test 5: Retrieving System Logs ---")
-        all_logs = ledger_mem.get_logs(limit=10)
+        all_logs = await ledger_mem.get_logs(limit=10)
         print(f"{CHECK} Retrieved {len(all_logs)} recent log entries:")
         for i, log in enumerate(all_logs, 1):
             print(f"\n  Log {i}:")
@@ -192,12 +253,12 @@ def test_ledger_memory() -> bool:
 
         # Test 6: Retrieve filtered logs
         print("\n--- Test 6: Filtering Logs by Level ---")
-        info_logs = ledger_mem.get_logs(log_level=LogLevel.INFO, limit=5)
+        info_logs = await ledger_mem.get_logs(log_level=LogLevel.INFO, limit=5)
         print(f"{CHECK} Retrieved {len(info_logs)} INFO level logs")
 
         # Test 7: Close connection
         print("\n--- Test 7: Closing Database Connection ---")
-        ledger_mem.close()
+        await ledger_mem.close()
         print(f"{CHECK} LedgerMemory connection closed gracefully")
 
         print(f"\n{CHECK} LedgerMemory tests PASSED")
@@ -209,7 +270,7 @@ def test_ledger_memory() -> bool:
         return False
 
 
-def main() -> int:
+async def main_async() -> int:
     """
     Run all integration tests for the memory architecture.
 
@@ -222,20 +283,24 @@ def main() -> int:
     print("=" * 80)
 
     try:
-        # Run VectorMemory tests
+        # Run VectorMemory tests (sync — ChromaDB has no async client)
         vector_passed = test_vector_memory()
 
-        # Run LedgerMemory tests
-        ledger_passed = test_ledger_memory()
+        # Run LedgerMemory tests (async — aiosqlite)
+        ledger_passed = await test_ledger_memory()
+
+        # Run concurrency stress test (async — asyncio.gather)
+        concurrency_passed = await test_ledger_memory_concurrency()
 
         # Summary
         print("\n" + "=" * 80)
         print("TEST SUMMARY")
         print("=" * 80)
         print(f"VectorMemory (ChromaDB):  {'PASSED' if vector_passed else 'FAILED'}")
-        print(f"LedgerMemory (SQLite):    {'PASSED' if ledger_passed else 'FAILED'}")
+        print(f"LedgerMemory (aiosqlite): {'PASSED' if ledger_passed else 'FAILED'}")
+        print(f"LedgerMemory Concurrency: {'PASSED' if concurrency_passed else 'FAILED'}")
 
-        if vector_passed and ledger_passed:
+        if vector_passed and ledger_passed and concurrency_passed:
             print(f"\n{CHECK} All memory architecture tests PASSED!")
             print("The Hippocampus is ready for integration with the Telegram interface.")
             return 0
@@ -247,6 +312,10 @@ def main() -> int:
         logger.error(f"Test suite failed: {e}")
         print(f"\n{FAIL} Test suite encountered a critical error: {e}")
         return 1
+
+
+def main() -> int:
+    return asyncio.run(main_async())
 
 
 if __name__ == "__main__":

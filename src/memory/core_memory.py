@@ -8,83 +8,93 @@ and Worker Nodes.
 
 import json
 import os
+import asyncio
 import logging
 from typing import Dict, Any
+
+import aiofiles
 
 logger = logging.getLogger(__name__)
 
 class CoreMemory:
     """
     Manages short-term working memory stored in a local JSON file.
+
+    All runtime I/O is non-blocking via aiofiles.  The constructor only creates
+    the directory; call ``initialize()`` (or let the Orchestrator's async_init
+    do it) before the first read/write in an async context.
     """
 
     def __init__(self, memory_file_path: str = "data/core_memory.json"):
         self.memory_file_path = memory_file_path
-        self._initialize_memory()
-
-    def _initialize_memory(self):
-        """Ensures the core memory file exists with default schema."""
+        self._lock = asyncio.Lock()
         os.makedirs(os.path.dirname(self.memory_file_path), exist_ok=True)
-
-        if not os.path.exists(self.memory_file_path):
-            default_state = {
-                "current_focus": "",
-                "user_preferences": ""
-            }
-            self._save_memory(default_state)
-            logger.info(f"Initialized new Core Working Memory at {self.memory_file_path}")
-        else:
-            try:
-                self.get_all()
-            except json.JSONDecodeError:
-                # Re-initialize if corrupted
-                logger.warning(f"Core Working Memory at {self.memory_file_path} corrupted. Re-initializing.")
-                default_state = {
-                    "current_focus": "",
-                    "user_preferences": ""
-                }
-                self._save_memory(default_state)
-
-    def _save_memory(self, state: Dict[str, Any]):
-        """Saves state dict to JSON file."""
+        # Synchronous bootstrap: create the file if it does not yet exist so
+        # the Orchestrator's sync __init__ path still works.
+        default_state = {"current_focus": "", "user_preferences": ""}
         try:
-            with open(self.memory_file_path, 'w') as f:
-                json.dump(state, f, indent=4)
+            # Atomic create: open with 'x' fails if the file already exists,
+            # avoiding a TOCTOU race between existence check and creation.
+            with open(self.memory_file_path, 'x') as f:
+                json.dump(default_state, f, indent=4)
+            logger.info(f"Initialized new Core Working Memory at {self.memory_file_path}")
+        except FileExistsError:
+            # File already exists — validate it is not corrupt.
+            try:
+                with open(self.memory_file_path, 'r') as f:
+                    json.load(f)
+            except (json.JSONDecodeError, OSError):
+                logger.warning(
+                    f"Core Working Memory at {self.memory_file_path} corrupted. Re-initializing."
+                )
+                try:
+                    with open(self.memory_file_path, 'w') as f:
+                        json.dump(default_state, f, indent=4)
+                except Exception as e:
+                    logger.error(f"Failed to re-initialize core memory: {e}")
+        except Exception as e:
+            logger.error(f"Failed to bootstrap core memory: {e}")
+
+    # ──────────────────────────────────────────────────────────────
+    # Async I/O  (primary API — use these in the async event loop)
+    # ──────────────────────────────────────────────────────────────
+
+    async def _save_memory_async(self, state: Dict[str, Any]) -> None:
+        """Write state dict to disk without blocking the event loop."""
+        try:
+            async with aiofiles.open(self.memory_file_path, 'w') as f:
+                await f.write(json.dumps(state, indent=4))
         except Exception as e:
             logger.error(f"Failed to save core memory: {e}")
 
-    def get_all(self) -> Dict[str, Any]:
-        """Retrieves entire memory state."""
+    async def get_all(self) -> Dict[str, Any]:
+        """Retrieve entire memory state (non-blocking)."""
         try:
-            with open(self.memory_file_path, 'r') as f:
-                return json.load(f)
+            async with aiofiles.open(self.memory_file_path, 'r') as f:
+                content = await f.read()
+            return json.loads(content)
         except Exception as e:
             logger.error(f"Failed to load core memory: {e}")
             return {"current_focus": "", "user_preferences": ""}
 
-    def get_context_string(self) -> str:
-        """Returns the core memory as a string formatted for Prompt injection."""
-        state = self.get_all()
+    async def get_context_string(self) -> str:
+        """Return the core memory formatted for prompt injection (non-blocking)."""
+        state = await self.get_all()
         host_os = state.get('host_os', '')
         os_line = f"\n  <Host_OS>{host_os}</Host_OS>" if host_os else ""
         return (
-            f"<Core_Working_Memory>"
-            f"\n  <Current_Focus>{state.get('current_focus', '')}</Current_Focus>"
-            f"\n  <User_Preferences>{state.get('user_preferences', '')}</User_Preferences>"
-            f"{os_line}"
-            f"\n</Core_Working_Memory>"
+            f"<Core_Working_Memory>\n"
+            f"  <Current_Focus>{state.get('current_focus', '')}</Current_Focus>\n"
+            f"  <User_Preferences>{state.get('user_preferences', '')}</User_Preferences>"
+            f"{os_line}\n"
+            f"</Core_Working_Memory>"
         )
 
-    def update(self, key: str, value: Any) -> bool:
-        """Updates a specific key in core memory."""
-        state = self.get_all()
-        if key not in state:
-            logger.warning(f"Attempted to update unknown core memory key: {key}")
-            # we can choose to allow new keys, but let's stick to schema
+    async def update(self, key: str, value: Any) -> bool:
+        """Update a specific key in core memory (non-blocking, concurrency-safe)."""
+        async with self._lock:
+            state = await self.get_all()
             state[key] = value
-        else:
-            state[key] = value
-
-        self._save_memory(state)
+            await self._save_memory_async(state)
         logger.info(f"Updated Core Memory: {key} = {value}")
         return True
