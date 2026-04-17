@@ -40,6 +40,7 @@ logger = logging.getLogger(__name__)
 # Load configuration from environment
 TELEGRAM_BOT_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN')
 ADMIN_USER_ID = int(os.getenv('ADMIN_USER_ID', 0))
+AGENT_TIMEOUT_SECONDS = float(os.getenv('AGENT_TIMEOUT_SECONDS', 30.0))
 
 if not TELEGRAM_BOT_TOKEN:
     raise ValueError("TELEGRAM_BOT_TOKEN environment variable not set")
@@ -156,13 +157,16 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             return
 
         # Process message (may call external APIs - handle timeouts)
-        ai_response = await orchestrator.process_message(user_message, str(user_id))
+        ai_response = await asyncio.wait_for(
+            orchestrator.process_message(user_message, str(user_id)),
+            timeout=AGENT_TIMEOUT_SECONDS
+        )
 
         # Send the response back to the user
         await update.message.reply_text(ai_response)
         logger.info(f"Response sent to user {user_id}")
 
-    except TimeoutError as e:
+    except (TimeoutError, asyncio.TimeoutError) as e:
         timeout_msg = "Request timed out. Please try again."
         logger.warning(f"Timeout error: {e}")
         await update.message.reply_text(timeout_msg)
