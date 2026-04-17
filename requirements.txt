@@ -10,5 +10,3 @@ langchain==0.1.0
 httpx~=0.25.2
 psutil
 ddgs
-aiosqlite==0.20.0
-aiofiles==23.2.1
