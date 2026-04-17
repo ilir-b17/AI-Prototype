@@ -180,8 +180,9 @@ async def goals(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
     try:
         ledger = LedgerMemory()
-        items = ledger.get_all_active_goals()
-        ledger.close()
+        await ledger.initialize()
+        items = await ledger.get_all_active_goals()
+        await ledger.close()
 
         if not items:
             await update.message.reply_text("Backlog is empty. Use /addgoal to add objectives.")
@@ -232,8 +233,9 @@ async def addgoal(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
     try:
         ledger = LedgerMemory()
-        obj_id = ledger.add_objective(tier=tier, title=title, estimated_energy=energy, origin="Admin")
-        ledger.close()
+        await ledger.initialize()
+        obj_id = await ledger.add_objective(tier=tier, title=title, estimated_energy=energy, origin="Admin")
+        await ledger.close()
         await update.message.reply_text(
             f"Added to backlog:\n  #{obj_id} [{tier}] {title}\n  Estimated Energy: {energy}"
         )
@@ -328,12 +330,14 @@ def main() -> None:
 
         # post_init: start heartbeat and outbound message queue drainer
         async def post_init(app) -> None:
+            # Complete async initialisation (opens aiosqlite connection, seeds goals)
+            await orchestrator.async_init()
             outbound_queue = asyncio.Queue()
             orchestrator.outbound_queue = outbound_queue
             asyncio.create_task(orchestrator._heartbeat_loop())
             asyncio.create_task(orchestrator._sensory_update_loop())
             asyncio.create_task(_drain_outbound_queue(app.bot, outbound_queue))
-            logger.info("Heartbeat loop, sensory update loop, and outbound queue drainer started.")
+            logger.info("Orchestrator async_init, heartbeat loop, sensory update loop, and outbound queue drainer started.")
 
         application.post_init = post_init
 

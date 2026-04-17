@@ -7,11 +7,13 @@ System 2: Cloud LLM for complex reasoning. Provider priority:
   2. Gemini (Google AI Studio free tier) — set GEMINI_API_KEY + USE_GEMINI=True
 """
 
+import ast
 import os
 import logging
 import json
 import asyncio
 import re
+from dataclasses import dataclass, field
 from typing import Optional, Dict, Any, List
 from google import genai
 from google.genai import types as genai_types
@@ -25,6 +27,35 @@ except ImportError:
 
 from src.core.skill_manager import SkillRegistry
 
+# ── Structured result returned by all router methods ─────────────────────────
+
+@dataclass
+class RouterResult:
+    """
+    Structured result from the CognitiveRouter.
+
+    ``status`` is always one of:
+      - "ok"               — normal text response in ``content``
+      - "mfa_required"     — the model requested a privileged core update
+      - "hitl_required"    — human-in-the-loop guidance is needed
+      - "capability_gap"   — System 1 cannot fulfil the request; synthesis needed
+    """
+    status: str  # "ok" | "mfa_required" | "hitl_required" | "capability_gap"
+    content: str = ""
+    # MFA fields
+    mfa_tool_name: str = ""
+    mfa_arguments: dict = field(default_factory=dict)
+    # HITL fields
+    hitl_message: str = ""
+    # Capability-gap fields
+    gap_description: str = ""
+    suggested_tool_name: str = ""
+
+
+# ── Legacy exception classes kept for backward compatibility ─────────────────
+# These are no longer raised by the router itself; they may still be raised
+# by orchestrator-internal code (e.g. energy exhaustion in _deduct_energy).
+
 class RequiresMFAError(Exception):
     def __init__(self, tool_name: str, arguments: dict):
         self.tool_name = tool_name
@@ -37,11 +68,19 @@ class RequiresHITLError(Exception):
         super().__init__(self.message)
 
 class RequiresCapabilitySynthesisError(Exception):
-    """Raised when System 1 calls request_capability — signals a tool gap to the orchestrator."""
+    """Raised by orchestrator-internal code (e.g. energy exhaustion)."""
     def __init__(self, gap_description: str, suggested_tool_name: str):
         self.gap_description = gap_description
         self.suggested_tool_name = suggested_tool_name
         super().__init__(f"Capability gap: {gap_description}")
+
+# ── AST sandbox configuration ─────────────────────────────────────────────────
+
+_BLOCKED_TOP_LEVEL_MODULES = {
+    "os", "sys", "subprocess", "shutil", "pathlib", "socket",
+    "importlib", "builtins", "ctypes", "multiprocessing", "threading",
+    "signal", "pty", "popen", "pexpect", "atexit", "gc",
+}
 
 logger = logging.getLogger(__name__)
 
@@ -57,32 +96,39 @@ class CognitiveRouter:
     System 2: Groq (preferred if key set) or Gemini (fallback)
     """
 
-    async def _execute_tool(self, tool_name: str, arguments: dict) -> str:
+    async def _execute_tool(self, tool_name: str, arguments: dict) -> RouterResult:
         """Dispatch a tool call through the SkillRegistry.
 
-        Security intercepts (MFA / HITL / capability synthesis) are raised
-        here before the registry is consulted, keeping security logic centralised.
+        Security intercepts (MFA / HITL / capability synthesis) are handled
+        here, returning a structured :class:`RouterResult` rather than raising.
         """
         logger.info(f"Executing tool: {tool_name} with args: {list(arguments.keys())}")
 
         # ── Security intercepts ──────────────────────────────────────────────
         if tool_name == "request_core_update":
-            raise RequiresMFAError(tool_name, arguments)
+            return RouterResult(
+                status="mfa_required",
+                mfa_tool_name=tool_name,
+                mfa_arguments=arguments,
+            )
 
         if tool_name == "ask_admin_for_guidance":
-            raise RequiresHITLError(
+            msg = (
                 f"Guidance Needed: {arguments.get('context_summary', '')}\n"
                 f"Question: {arguments.get('specific_question', '')}"
             )
+            return RouterResult(status="hitl_required", hitl_message=msg)
 
         if tool_name == "request_capability":
-            raise RequiresCapabilitySynthesisError(
+            return RouterResult(
+                status="capability_gap",
                 gap_description=arguments.get("gap_description", "unspecified gap"),
                 suggested_tool_name=arguments.get("suggested_tool_name", "new_tool"),
             )
 
         # ── Registry dispatch ────────────────────────────────────────────────
-        return await self.registry.execute(tool_name, arguments)
+        content = await self.registry.execute(tool_name, arguments)
+        return RouterResult(status="ok", content=content)
 
     @staticmethod
     def sanitize_response(text: str) -> str:
@@ -175,19 +221,12 @@ class CognitiveRouter:
         self,
         messages: List[Dict[str, str]],
         allowed_tools: Optional[List[str]] = None
-    ) -> str:
+    ) -> RouterResult:
         """
         Route to System 1 (Local Model) - Fast, pattern-based responses.
 
-        Uses local Gemma 4 model via Ollama.
-
-        Args:
-            messages: List of message dictionaries, formatted for chat.
-                e.g., [{"role": "system", "content": "..."}, {"role": "user", "content": "..."}]
-            allowed_tools: Optional list of tool names allowed for this call.
-
-        Returns:
-            str: The model's response.
+        Returns a :class:`RouterResult` whose ``status`` is "ok" on success,
+        or a non-ok status when a security intercept fires.
         """
         logger.info(f"Routing to System 1 (Local Model - {self.local_model})")
 
@@ -262,32 +301,16 @@ class CognitiveRouter:
                 message = response['message']
 
                 if 'tool_calls' in message and message['tool_calls']:
-                    # Handle tool calls
                     tool_call = message['tool_calls'][0]['function']
                     tool_name = tool_call['name']
                     arguments = tool_call.get('arguments', {})
 
-                    # Intercept sensitive core updates
-                    if tool_name == "request_core_update":
-                        raise RequiresMFAError(tool_name, arguments)
+                    # Delegate to _execute_tool — returns RouterResult
+                    exec_result = await self._execute_tool(tool_name, arguments)
+                    if exec_result.status != "ok":
+                        return exec_result  # Propagate MFA / HITL / capability-gap
 
-                    # Intercept HITL requests
-                    if tool_name == "ask_admin_for_guidance":
-                        context_summary = arguments.get("context_summary", "")
-                        specific_question = arguments.get("specific_question", "")
-                        raise RequiresHITLError(f"Guidance Needed: {context_summary}\nQuestion: {specific_question}")
-
-                    # Intercept capability gap signals — hand off to orchestrator
-                    if tool_name == "request_capability":
-                        raise RequiresCapabilitySynthesisError(
-                            gap_description=arguments.get("gap_description", "unspecified gap"),
-                            suggested_tool_name=arguments.get("suggested_tool_name", "new_tool"),
-                        )
-
-                    # Pause, call execute tool
-                    tool_result = await self._execute_tool(tool_name, arguments)
-
-                    # Build new messages for follow-up call (avoid malformed assistant messages)
+                    # Build follow-up messages and get a final answer
                     followup_messages = messages.copy()
                     followup_messages.append({
                         "role": "assistant",
@@ -295,10 +318,9 @@ class CognitiveRouter:
                     })
                     followup_messages.append({
                         "role": "user",
-                        "content": f"Tool result: {tool_result}"
+                        "content": f"Tool result: {exec_result.content}"
                     })
 
-                    # Call model again with the correct model name
                     final_response = await asyncio.wait_for(
                         client.chat(
                             model=available_model,
@@ -312,32 +334,32 @@ class CognitiveRouter:
                         result = final_response['message']['content'].strip()
                         if result:
                             logger.info(f"System 1 response received after tool call ({len(result)} chars)")
-                            return result
-                    return "Tool executed but model produced no response."
+                            return RouterResult(status="ok", content=result)
+                    return RouterResult(status="ok", content="Tool executed but model produced no response.")
 
                 # Standard text response
                 elif 'content' in message:
                     result = message['content'].strip()
                     if not result:
                         logger.warning("System 1 returned empty response")
-                        return "[System 1 - Error]: Empty response from model"
+                        return RouterResult(status="ok", content="[System 1 - Error]: Empty response from model")
                     logger.info(f"System 1 response received ({len(result)} chars)")
                     logger.debug(f"System 1 response: {result[:200]}...")
-                    return result
+                    return RouterResult(status="ok", content=result)
 
             error_msg = "Unexpected response format from Ollama"
             logger.warning(error_msg)
-            return f"[System 1 - Error]: {error_msg}"
+            return RouterResult(status="ok", content=f"[System 1 - Error]: {error_msg}")
 
         except Exception as e:
             error_msg = f"System 1 (Local Model) error: {str(e)}. Make sure Ollama is running with a model like 'gemma4:e4b' or 'gemma2' available."
             logger.error(error_msg, exc_info=True)
-            return f"[System 1 - Error]: {error_msg}"
+            return RouterResult(status="ok", content=f"[System 1 - Error]: {error_msg}")
 
     async def _route_to_gemini(
         self,
         messages: List[Dict[str, str]]
-    ) -> str:
+    ) -> RouterResult:
         """
         Route to System 2 (Gemini API) via the google-genai SDK.
         Tools are disabled on this path — Groq handles tool calling.
@@ -378,10 +400,10 @@ class CognitiveRouter:
             if response and response.text:
                 result = response.text.strip()
                 logger.info(f"System 2 (Gemini) response received ({len(result)} chars)")
-                return result
+                return RouterResult(status="ok", content=result)
 
             logger.warning("Empty response from Gemini API")
-            return "[System 2 - No Response]: Empty response from Gemini API"
+            return RouterResult(status="ok", content="[System 2 - No Response]: Empty response from Gemini API")
 
         except Exception as e:
             logger.error(f"System 2 (Gemini) error: {str(e)}", exc_info=True)
@@ -451,8 +473,8 @@ Rules:
             {"role": "user", "content": synthesis_prompt},
         ]
 
-        raw = await self.route_to_system_2(messages)
-        return self._parse_synthesis_output(raw, suggested_tool_name)
+        raw_result = await self.route_to_system_2(messages)
+        return self._parse_synthesis_output(raw_result.content, suggested_tool_name)
 
     @staticmethod
     def _parse_synthesis_output(raw: str, fallback_name: str) -> Dict[str, str]:
@@ -496,12 +518,71 @@ Rules:
 
         return result
 
+    @staticmethod
+    def _validate_tool_code_ast(code: str, tool_name: str) -> None:
+        """
+        Parse the synthesised code as an AST and reject any import that
+        touches a dangerous top-level module.
+
+        Raises ``ValueError`` with a human-readable message if the code fails
+        the sandbox check.
+        """
+        try:
+            tree = ast.parse(code)
+        except SyntaxError as exc:
+            raise ValueError(f"Synthesised code for '{tool_name}' has a syntax error: {exc}") from exc
+
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                for alias in node.names:
+                    base = alias.name.split(".")[0]
+                    if base in _BLOCKED_TOP_LEVEL_MODULES:
+                        raise ValueError(
+                            f"Synthesised tool '{tool_name}' imports blocked module '{alias.name}'. "
+                            f"Blocked modules: {sorted(_BLOCKED_TOP_LEVEL_MODULES)}"
+                        )
+            elif isinstance(node, ast.ImportFrom):
+                if node.module:
+                    base = node.module.split(".")[0]
+                    if base in _BLOCKED_TOP_LEVEL_MODULES:
+                        raise ValueError(
+                            f"Synthesised tool '{tool_name}' imports from blocked module '{node.module}'. "
+                            f"Blocked modules: {sorted(_BLOCKED_TOP_LEVEL_MODULES)}"
+                        )
+
     def register_dynamic_tool(self, tool_name: str, code: str, schema_json: str) -> None:
-        """Load synthesised Python code into the runtime via the SkillRegistry."""
+        """Load synthesised Python code into the runtime via the SkillRegistry.
+
+        The code is first validated through an AST sandbox that blocks imports
+        of dangerous modules (os, sys, subprocess, etc.) before execution.
+        """
         import types
         import json as _json
 
+        # ── AST sandbox check ──────────────────────────────────────────────
+        self._validate_tool_code_ast(code, tool_name)
+
         module = types.ModuleType(f"dynamic_tool_{tool_name}")
+        # Restrict built-ins to a safe subset so that exec() cannot reach
+        # open(), eval(), __import__(), exec(), compile(), etc. even if the
+        # AST check is somehow bypassed.
+        _safe_builtins = {
+            "None": None, "True": True, "False": False,
+            "abs": abs, "all": all, "any": any, "bool": bool,
+            "bytes": bytes, "chr": chr, "dict": dict, "dir": dir,
+            "divmod": divmod, "enumerate": enumerate, "filter": filter,
+            "float": float, "format": format, "frozenset": frozenset,
+            "getattr": getattr, "hasattr": hasattr, "hash": hash,
+            "int": int, "isinstance": isinstance, "issubclass": issubclass,
+            "iter": iter, "len": len, "list": list, "map": map,
+            "max": max, "min": min, "next": next, "object": object,
+            "ord": ord, "pow": pow, "print": print, "range": range,
+            "repr": repr, "reversed": reversed, "round": round,
+            "set": set, "slice": slice, "sorted": sorted, "str": str,
+            "sum": sum, "tuple": tuple, "type": type, "vars": vars,
+            "zip": zip,
+        }
+        module.__dict__["__builtins__"] = _safe_builtins
         exec(compile(code, f"<dynamic:{tool_name}>", "exec"), module.__dict__)
 
         fn = getattr(module, tool_name, None)
@@ -524,10 +605,11 @@ Rules:
         """True if any System 2 provider (Groq or Gemini) is configured."""
         return self.groq_client is not None or self.gemini_client is not None
 
-    async def route_to_system_2(self, messages: List[Dict[str, str]]) -> str:
+    async def route_to_system_2(self, messages: List[Dict[str, str]]) -> RouterResult:
         """
         Route to System 2. Uses Groq if available, falls back to Gemini.
         Groq is preferred: free tier, very fast, high quality (llama-3.3-70b).
+        Returns a :class:`RouterResult` — never raises for security intercepts.
         """
         if self.groq_client is not None:
             return await self._route_to_groq(messages)
@@ -536,7 +618,7 @@ Rules:
         else:
             raise RuntimeError("No System 2 provider configured. Set GROQ_API_KEY or GEMINI_API_KEY+USE_GEMINI=True.")
 
-    async def _route_to_groq(self, messages: List[Dict[str, str]]) -> str:
+    async def _route_to_groq(self, messages: List[Dict[str, str]]) -> RouterResult:
         """Route to Groq API (llama-3.3-70b or configured model) with full tool calling."""
         logger.info(f"Routing to System 2 (Groq/{self.groq_model})")
         try:
@@ -574,22 +656,12 @@ Rules:
 
                 logger.info(f"Groq requested tool call: {tool_name}")
 
-                # Security intercepts (same as System 1)
-                if tool_name == "request_core_update":
-                    raise RequiresMFAError(tool_name, arguments)
-                if tool_name == "ask_admin_for_guidance":
-                    raise RequiresHITLError(
-                        f"Guidance Needed: {arguments.get('context_summary', '')}\n"
-                        f"Question: {arguments.get('specific_question', '')}"
-                    )
-                if tool_name == "request_capability":
-                    raise RequiresCapabilitySynthesisError(
-                        gap_description=arguments.get("gap_description", "unspecified gap"),
-                        suggested_tool_name=arguments.get("suggested_tool_name", "new_tool"),
-                    )
+                # Delegate to _execute_tool — returns RouterResult
+                exec_result = await self._execute_tool(tool_name, arguments)
+                if exec_result.status != "ok":
+                    return exec_result  # Propagate MFA / HITL / capability-gap
 
-                tool_result = await self._execute_tool(tool_name, arguments)
-                logger.info(f"Groq tool '{tool_name}' executed: {tool_result[:100]}")
+                logger.info(f"Groq tool '{tool_name}' executed: {exec_result.content[:100]}")
 
                 # Follow-up in proper OpenAI tool-result format
                 followup_messages = list(messages) + [
@@ -605,7 +677,7 @@ Rules:
                     {
                         "role": "tool",
                         "tool_call_id": tool_call.id,
-                        "content": tool_result
+                        "content": exec_result.content
                     }
                 ]
 
@@ -616,15 +688,13 @@ Rules:
                 )
                 result = final_response.choices[0].message.content.strip()
                 logger.info(f"System 2 (Groq) response after tool call ({len(result)} chars)")
-                return result
+                return RouterResult(status="ok", content=result)
 
             # Standard text response
             result = choice.message.content.strip()
             logger.info(f"System 2 (Groq) response received ({len(result)} chars)")
-            return result
+            return RouterResult(status="ok", content=result)
 
-        except (RequiresMFAError, RequiresHITLError, RequiresCapabilitySynthesisError):
-            raise
         except Exception as e:
             logger.error(f"Groq error: {e}", exc_info=True)
             raise
