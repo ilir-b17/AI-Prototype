@@ -54,6 +54,23 @@ orchestrator: Orchestrator = None
 consecutive_conflicts = 0
 
 
+def sanitize_for_logging(text: str, max_length: int = 256) -> str:
+    """
+    Sanitize text for safe logging by escaping control characters
+    and truncating excessively long strings to prevent log injection
+    and DoS via log bloating.
+    """
+    if not text:
+        return ""
+
+    # Use repr() to escape special characters, but strip the enclosing quotes
+    sanitized = repr(text)[1:-1]
+
+    if len(sanitized) > max_length:
+        return sanitized[:max_length] + "...[truncated]"
+    return sanitized
+
+
 async def _drain_outbound_queue(bot, queue: asyncio.Queue) -> None:
     """
     Background task: drains the orchestrator's outbound queue and sends
@@ -116,12 +133,14 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     user_id = update.effective_user.id
 
     if not is_authorized(user_id):
-        logger.warning(f"Unauthorized message from user {user_id}: {update.message.text}")
+        sanitized_msg = sanitize_for_logging(update.message.text)
+        logger.warning(f"Unauthorized message from user {user_id}: {sanitized_msg}")
         await update.message.reply_text("Unauthorized.")
         return
 
     user_message = update.message.text
-    logger.info(f"Message received from user {user_id}: {user_message}")
+    sanitized_user_msg = sanitize_for_logging(user_message)
+    logger.info(f"Message received from user {user_id}: {sanitized_user_msg}")
 
     try:
         # Send a typing indicator to show the bot is processing
@@ -218,7 +237,8 @@ async def addgoal(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await update.message.reply_text(
             f"Added to backlog:\n  #{obj_id} [{tier}] {title}\n  Estimated Energy: {energy}"
         )
-        logger.info(f"Admin added objective #{obj_id}: [{tier}] {title}")
+        sanitized_title = sanitize_for_logging(title)
+        logger.info(f"Admin added objective #{obj_id}: [{tier}] {sanitized_title}")
     except Exception as e:
         logger.error(f"/addgoal error: {e}", exc_info=True)
         await update.message.reply_text(f"Error adding goal: {e}")
