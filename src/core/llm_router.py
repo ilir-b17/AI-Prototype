@@ -85,6 +85,25 @@ class CognitiveRouter:
         return await self.registry.execute(tool_name, arguments)
 
     @staticmethod
+    def _try_parse_text_tool_call(text: str) -> Optional[Dict[str, Any]]:
+        """Detect if the LLM returned a text-based JSON tool call instead of a structured call.
+
+        Local models (e.g. Gemma) sometimes emit the tool invocation as raw JSON text
+        rather than a structured tool_calls object. This method detects that pattern.
+        Returns a dict with 'tool_call' and 'arguments' keys, or None.
+        """
+        stripped = text.strip()
+        if not (stripped.startswith('{') and stripped.endswith('}')):
+            return None
+        try:
+            parsed = json.loads(stripped)
+            if isinstance(parsed, dict) and 'tool_call' in parsed:
+                return parsed
+        except (json.JSONDecodeError, ValueError):
+            pass
+        return None
+
+    @staticmethod
     def sanitize_response(text: str) -> str:
         """
         Strip internal reasoning, tool schemas, and critic annotations from
@@ -113,13 +132,35 @@ class CognitiveRouter:
         text = re.sub(r'WORKERS:\s*\[.*?\]\s*\n?', '', text, flags=re.IGNORECASE)
 
         # Standalone JSON blobs that look like tool-call payloads
-        # Matches a top-level {...} block containing known internal keys
-        text = re.sub(
-            r'(?m)^\s*\{[^{}]*"(?:tool_call|tool_name|function_call|function|name)"[^{}]*\}\s*$',
-            '',
-            text,
-            flags=re.IGNORECASE,
-        )
+        # First try: entire response is a JSON tool call (handles nested objects)
+        stripped = text.strip()
+        if stripped.startswith('{') and stripped.endswith('}'):
+            try:
+                _parsed = json.loads(stripped)
+                if isinstance(_parsed, dict) and any(
+                    k in _parsed for k in ('tool_call', 'tool_name', 'function_call')
+                ):
+                    return ""  # entire response was a raw tool-call JSON blob
+            except (json.JSONDecodeError, ValueError):
+                pass
+        # Second try: scan line-by-line for single-line JSON tool-call blobs
+        _clean_lines = []
+        for _line in text.split('\n'):
+            _s = _line.strip()
+            if (
+                _s.startswith('{') and _s.endswith('}')
+                and any(k in _s for k in ('"tool_call"', '"tool_name"', '"function_call"'))
+            ):
+                try:
+                    _lp = json.loads(_s)
+                    if isinstance(_lp, dict) and any(
+                        k in _lp for k in ('tool_call', 'tool_name', 'function_call')
+                    ):
+                        continue  # skip this line
+                except (json.JSONDecodeError, ValueError):
+                    pass
+            _clean_lines.append(_line)
+        text = '\n'.join(_clean_lines)
 
         # Internal planning/scratchpad sections the model sometimes generates
         # Strips: ## ⚙️ Section Title, [Output Draft], [Internal Critique], [Finalized Deliverable]
@@ -320,7 +361,43 @@ class CognitiveRouter:
                     continue
 
                 elif 'content' in message:
-                    result = message['content'].strip()
+                    result = message['content'].strip() if message['content'] else ''
+
+                    # Detect text-based tool call (Gemma/local models sometimes emit JSON instead of structured calls)
+                    if result:
+                        text_call = self._try_parse_text_tool_call(result)
+                        if text_call:
+                            text_tool_name = text_call.get('tool_call', '')
+                            text_arguments = text_call.get('arguments', {})
+                            if text_tool_name and tool_iterations < MAX_TOOL_ITERATIONS:
+                                logger.info(f"ReAct loop: detected text-based tool call for '{text_tool_name}'")
+                                if text_tool_name == "request_core_update":
+                                    raise RequiresMFAError(text_tool_name, text_arguments)
+                                if text_tool_name == "ask_admin_for_guidance":
+                                    raise RequiresHITLError(
+                                        f"Guidance Needed: {text_arguments.get('context_summary', '')}\n"
+                                        f"Question: {text_arguments.get('specific_question', '')}"
+                                    )
+                                if text_tool_name == "request_capability":
+                                    raise RequiresCapabilitySynthesisError(
+                                        gap_description=text_arguments.get('gap_description', 'unspecified gap'),
+                                        suggested_tool_name=text_arguments.get('suggested_tool_name', 'new_tool'),
+                                    )
+                                tool_result = await self._execute_tool(text_tool_name, text_arguments)
+                                tool_iterations += 1
+                                current_messages.append({"role": "assistant", "content": result})
+                                current_messages.append({"role": "user", "content": f"Tool result: {tool_result}"})
+                                current_response = await asyncio.wait_for(
+                                    client.chat(
+                                        model=available_model,
+                                        messages=current_messages,
+                                        tools=active_tools
+                                    ),
+                                    timeout=60.0
+                                )
+                                continue
+                            elif not text_tool_name:
+                                logger.warning("ReAct loop: text-based call missing tool_call name, skipping")
 
                     if not result and tool_iterations > 0:
                         # Silent crash fix: LLM returned empty after a tool call — force continuation

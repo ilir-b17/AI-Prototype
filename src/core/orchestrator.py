@@ -109,6 +109,7 @@ class Orchestrator:
             "current_time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
             "os": os_str,
             "cpu_usage": cpu,
+            "cwd": os.getcwd(),
         }
 
     async def _sensory_update_loop(self) -> None:
@@ -122,7 +123,8 @@ class Orchestrator:
         return (
             f"[Machine Context — {s.get('current_time', 'unknown')} | "
             f"OS: {s.get('os', 'unknown')} | "
-            f"CPU: {s.get('cpu_usage', 'unknown')}]"
+            f"CPU: {s.get('cpu_usage', 'unknown')} | "
+            f"CWD: {s.get('cwd', 'unknown')}]"
         )
 
     def _load_charter(self, filepath: str = "charter.md") -> str:
