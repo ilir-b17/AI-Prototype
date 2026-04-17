@@ -9,6 +9,7 @@ Broken skill folders are skipped with a warning; healthy ones load normally.
 import os
 import json
 import re
+import asyncio
 import logging
 import importlib.util
 from typing import Any, Callable, Dict, List, Optional
@@ -36,10 +37,6 @@ class SkillRegistry:
         self.skills_dir = os.path.abspath(skills_dir)
         self._skills: Dict[str, Dict[str, Any]] = {}  # name → {fn, schema}
         self._load_all()
-
-    # ─────────────────────────────────────────────────────────────
-    # Loading
-    # ─────────────────────────────────────────────────────────────
 
     def _load_all(self) -> None:
         if not os.path.isdir(self.skills_dir):
@@ -88,16 +85,16 @@ class SkillRegistry:
     def _parse_schema(md_path: str, skill_name: str) -> Dict[str, Any]:
         with open(md_path, "r", encoding="utf-8") as f:
             content = f.read()
-        match = re.search(r"```json\s*(\{.*?\})\s*```", content, re.DOTALL)
-        if not match:
+        code_block = re.search(r"```json\s*", content)
+        if not code_block:
             raise ValueError(f"No ```json schema block found in {md_path}")
-        schema = json.loads(match.group(1))
+        decoder = json.JSONDecoder()
+        try:
+            schema, _ = decoder.raw_decode(content, code_block.end())
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"Invalid JSON schema in {md_path}: {exc}") from exc
         schema.setdefault("name", skill_name)
         return schema
-
-    # ─────────────────────────────────────────────────────────────
-    # Public API
-    # ─────────────────────────────────────────────────────────────
 
     def get_schemas(self) -> List[Dict[str, Any]]:
         """All loaded tool schemas, ready to pass to Ollama / Groq."""
@@ -113,7 +110,10 @@ class SkillRegistry:
         if skill is None:
             return f"Error: Unknown tool '{tool_name}'."
         try:
-            return await skill["fn"](**arguments)
+            result = skill["fn"](**arguments)
+            if asyncio.iscoroutine(result):
+                return await result
+            return result
         except TypeError as exc:
             return f"Error: Bad arguments for '{tool_name}': {exc}"
         except Exception as exc:

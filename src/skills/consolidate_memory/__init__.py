@@ -1,7 +1,8 @@
-import asyncio
 import json
 import logging
 import os
+
+import aiosqlite
 
 logger = logging.getLogger(__name__)
 
@@ -17,28 +18,27 @@ _SYSTEM_PROMPT = (
 )
 
 
-def _sync_consolidate(
-    ledger_db_path: str = "data/ledger.db",
-    core_memory_path: str = "data/core_memory.json",
-) -> str:
+async def consolidate_memory() -> str:
+    """Long-term cognitive compression: distil recent chat history into core memory."""
+    logger.info("consolidate_memory: starting compression pass")
+
+    ledger_db_path = "data/ledger.db"
+    core_memory_path = "data/core_memory.json"
+
     try:
-        from src.memory.ledger_db import LedgerMemory
-        from src.memory.core_memory import CoreMemory
+        # Read chat history directly via aiosqlite (cross-user, no user_id filter)
+        async with aiosqlite.connect(ledger_db_path) as db:
+            db.row_factory = aiosqlite.Row
+            cursor = await db.execute(
+                "SELECT role, content FROM ("
+                "  SELECT id, role, content FROM chat_history"
+                "  WHERE user_id != 'heartbeat'"
+                "  ORDER BY id DESC LIMIT 50"
+                ") ORDER BY id ASC"
+            )
+            rows = await cursor.fetchall()
 
-        ledger = LedgerMemory(db_path=ledger_db_path)
-        cursor = ledger.connection.cursor()
-        cursor.execute("""
-            SELECT role, content FROM (
-                SELECT id, role, content
-                FROM chat_history
-                WHERE user_id != 'heartbeat'
-                ORDER BY id DESC
-                LIMIT 50
-            ) ORDER BY id ASC
-        """)
-        history = [{"role": r["role"], "content": r["content"]} for r in cursor.fetchall()]
-        ledger.close()
-
+        history = [{"role": r["role"], "content": r["content"]} for r in rows]
         if not history:
             return "No chat history to consolidate."
 
@@ -75,11 +75,13 @@ def _sync_consolidate(
         if not insights:
             return "Consolidation complete: no new insights extracted."
 
+        from src.memory.core_memory import CoreMemory
         core = CoreMemory(memory_file_path=core_memory_path)
-        existing = core.get_all().get("consolidated_insights", "")
+        state = await core.get_all()
+        existing = state.get("consolidated_insights", "")
         new_block = " | ".join(insights)
         merged = f"{existing} | {new_block}".strip(" |") if existing else new_block
-        core.update("consolidated_insights", merged)
+        await core.update("consolidated_insights", merged)
 
         logger.info(f"consolidate_memory: wrote {len(insights)} insights to core memory")
         return f"Memory consolidation complete. Extracted {len(insights)} insights: {new_block[:200]}"
@@ -89,9 +91,3 @@ def _sync_consolidate(
     except Exception as e:
         logger.error(f"consolidate_memory error: {e}", exc_info=True)
         return f"Consolidation failed: {e}"
-
-
-async def consolidate_memory() -> str:
-    """Long-term cognitive compression: distil recent chat history into core memory."""
-    logger.info("consolidate_memory: starting compression pass")
-    return await asyncio.to_thread(_sync_consolidate)

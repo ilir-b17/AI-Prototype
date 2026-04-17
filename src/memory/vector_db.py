@@ -15,6 +15,9 @@ from chromadb.config import Settings
 
 logger = logging.getLogger(__name__)
 
+_HNSW_SPACE = "cosine"
+_COLLECTION_METADATA = {"hnsw:space": _HNSW_SPACE}
+
 
 class VectorMemory:
     """
@@ -56,7 +59,7 @@ class VectorMemory:
             try:
                 self.collection = self.client.get_or_create_collection(
                     name="agent_memory",
-                    metadata={"hnsw:space": "cosine"}
+                    metadata=_COLLECTION_METADATA
                 )
             except Exception as collection_error:
                 logger.warning(f"Collection initialization failed: {collection_error}. Attempting recovery...")
@@ -70,7 +73,7 @@ class VectorMemory:
                 # Create fresh collection
                 self.collection = self.client.create_collection(
                     name="agent_memory",
-                    metadata={"hnsw:space": "cosine"}
+                    metadata=_COLLECTION_METADATA
                 )
                 logger.info("Created fresh collection after recovery")
 
@@ -234,7 +237,7 @@ class VectorMemory:
             self.client.delete_collection(name="agent_memory")
             self.collection = self.client.get_or_create_collection(
                 name="agent_memory",
-                metadata={"hnsw:space": "cosine"}
+                metadata=_COLLECTION_METADATA
             )
             logger.warning("All memories cleared from the database")
         except Exception as e:
@@ -253,9 +256,9 @@ class VectorMemory:
         except Exception as e:
             logger.warning(f"Error closing VectorMemory: {e}")
 
-    # ─────────────────────────────────────────────────────────────
-    # Async wrappers — non-blocking via asyncio.to_thread()
-    # ─────────────────────────────────────────────────────────────
+    # â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    # Async wrappers â€” non-blocking via asyncio.to_thread()
+    # â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
     async def add_memory_async(
         self,
@@ -275,3 +278,4 @@ class VectorMemory:
         """Non-blocking wrapper for :meth:`query_memory`."""
         import asyncio
         return await asyncio.to_thread(self.query_memory, query_text, n_results)
+

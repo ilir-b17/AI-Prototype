@@ -172,7 +172,7 @@ class Orchestrator:
             "energy_remaining": 100,
         }
 
-    async def _deduct_energy(self, state: Dict[str, Any], amount: int, reason: str) -> Dict[str, Any]:
+    def _deduct_energy(self, state: Dict[str, Any], amount: int, reason: str) -> Dict[str, Any]:
         """Deduct energy and raise HITL if exhausted."""
         state["energy_remaining"] = state.get("energy_remaining", 100) - amount
         logger.debug(f"Energy -{amount} ({reason}). Remaining: {state['energy_remaining']}")
@@ -181,6 +181,93 @@ class Orchestrator:
                 f"Energy Budget Exhausted: The system consumed all cognitive energy on this task.\n"
                 f"Question: How should I prioritize the remaining work for: '{state.get('user_input', '')}'"
             )
+        return state
+
+    @staticmethod
+    def _get_output_to_evaluate(state: Dict[str, Any]) -> str:
+        """Return the most recent worker output, or the supervisor's final response."""
+        if state.get("worker_outputs"):
+            last_worker = list(state["worker_outputs"].keys())[-1]
+            return state["worker_outputs"][last_worker]
+        return state.get("final_response", "")
+
+    async def _spawn_debug_task(self, state: Dict[str, Any]) -> None:
+        """Inject a high-priority debug Task into the backlog after 3 critic failures."""
+        try:
+            last_worker = list(state["worker_outputs"].keys())[-1] if state.get("worker_outputs") else "unknown"
+            task_title = f"Debug failing [{last_worker}] logic for: {state.get('user_input', '')[:80]}"
+            await self.ledger_memory.add_objective(
+                tier="Task",
+                title=task_title,
+                estimated_energy=20,
+                origin="Critic",
+                priority=2,
+            )
+            logger.info(f"Critic: injected debug Task into backlog after 3 failures: {task_title!r}")
+        except Exception as spawn_err:
+            logger.warning(f"Critic: failed to spawn debug objective: {spawn_err}")
+
+    async def _route_supervisor_request(self, messages: List[Dict]) -> Optional["RouterResult"]:
+        """Try System 1, fall back to System 2.  Returns None on total failure."""
+        router_result: Optional[RouterResult] = None
+        try:
+            logger.info("Routing Supervisor through System 1 (Local Model)")
+            router_result = await asyncio.wait_for(
+                self.cognitive_router.route_to_system_1(messages),
+                timeout=150.0,
+            )
+        except asyncio.TimeoutError:
+            logger.error("System 1 timed out in supervisor (150 s). Escalating to System 2.", exc_info=True)
+        except Exception as s1_err:
+            logger.error(f"System 1 raised an exception in supervisor: {s1_err!r}. Escalating.", exc_info=True)
+
+        if router_result is not None:
+            return router_result
+
+        if not self.cognitive_router.get_system_2_available():
+            return None
+
+        try:
+            logger.info("Escalating Supervisor to System 2")
+            router_result = await asyncio.wait_for(
+                self.cognitive_router.route_to_system_2(messages),
+                timeout=60.0,
+            )
+            return router_result
+        except asyncio.TimeoutError:
+            logger.error("System 2 timed out in supervisor (60 s).", exc_info=True)
+        except Exception as s2_err:
+            logger.error(f"System 2 raised an exception in supervisor: {s2_err!r}.", exc_info=True)
+        return None
+
+    def _parse_supervisor_response(self, response: str, state: Dict[str, Any]) -> Dict[str, Any]:
+        """Parse the WORKERS tag from *response* and update *state* in-place."""
+        lines = response.strip().split("\n")
+        workers_match = None
+        for line in reversed(lines[-3:]):
+            workers_match = re.search(r"WORKERS:\s*(\[[^\]]*\])", line)
+            if workers_match:
+                break
+
+        if not workers_match:
+            state["current_plan"] = []
+            state["final_response"] = response.strip()
+            return state
+
+        try:
+            plan = json.loads(workers_match.group(1))
+            answer = "\n".join(ln for ln in lines if not re.search(r"WORKERS:\s*\[", ln)).strip()
+            if isinstance(plan, list) and plan and all(isinstance(x, str) for x in plan):
+                state["current_plan"] = plan
+                if answer:
+                    state["worker_outputs"]["supervisor_context"] = answer
+            else:
+                state["current_plan"] = []
+                state["final_response"] = answer or response.strip()
+        except ValueError:
+            state["current_plan"] = []
+            answer = "\n".join(ln for ln in lines if not re.search(r"WORKERS:\s*\[", ln)).strip()
+            state["final_response"] = answer or response.strip()
         return state
 
     async def _notify_admin(self, message: str) -> None:
@@ -341,7 +428,7 @@ class Orchestrator:
 
     async def supervisor_node(self, state: Dict[str, Any]) -> Dict[str, Any]:
         """Plans execution. Tries System 1 (local) first per Directive 1.3; escalates to System 2 only on failure."""
-        state = await self._deduct_energy(state, ENERGY_COST_SUPERVISOR, "supervisor")
+        state = self._deduct_energy(state, ENERGY_COST_SUPERVISOR, "supervisor")
         user_input = state["user_input"]
         core_mem_str = await self.core_memory.get_context_string()
         capabilities_str = self._get_capabilities_string()
@@ -360,71 +447,25 @@ class Orchestrator:
             f"{self.charter_text}\n{core_mem_str}\n\n"
             f"{capabilities_str}\n\n"
             f"Respond to the user, then on the very last line declare which workers are needed.\n"
-            f"Format: WORKERS: [] for chat, WORKERS: [\"research_agent\"] or [\"coder_agent\"] for tasks."
+            f'Format: WORKERS: [] for chat, WORKERS: ["research_agent"] or ["coder_agent"] for tasks.'
         )
 
-        # Build messages: system prompt → chat history → sanitized user turn
         messages = [{"role": "system", "content": system_prompt}]
         for turn in state.get("chat_history", []):
             messages.append({"role": turn["role"], "content": turn["content"]})
-        # Wrap user input in XML tags to isolate it from system directives
         messages.append({"role": "user", "content": f"<user_input>{user_input}</user_input>"})
 
         try:
-            # Local-first per Directive 1.3 — try System 1, escalate to System 2 only on failure
-            router_result: Optional[RouterResult] = None
-            try:
-                logger.info("Routing Supervisor through System 1 (Local Model)")
-                # Timeout must exceed route_to_system_1's internal 60 s primary + 60 s fallback.
-                router_result = await asyncio.wait_for(
-                    self.cognitive_router.route_to_system_1(messages),
-                    timeout=150.0
-                )
-            except asyncio.TimeoutError as s1_timeout:
-                logger.error(
-                    "System 1 timed out in supervisor (outer 150 s deadline). Escalating to System 2.",
-                    exc_info=True,
-                )
-                router_result = None
-            except Exception as s1_err:
-                logger.error(
-                    f"System 1 raised an exception in supervisor: {s1_err!r}. Escalating to System 2.",
-                    exc_info=True,
-                )
-                router_result = None
+            router_result = await self._route_supervisor_request(messages)
 
-            # Propagate non-ok RouterResult immediately (MFA / HITL / capability gap)
             if router_result is not None and router_result.status != "ok":
                 state[_BLOCKED_KEY] = router_result
                 return state
 
             response = router_result.content if router_result else None
 
-            if not response or response.startswith("[System 1 - Error]"):
-                if self.cognitive_router.get_system_2_available():
-                    try:
-                        logger.info("Escalating Supervisor to System 2")
-                        router_result = await asyncio.wait_for(
-                            self.cognitive_router.route_to_system_2(messages),
-                            timeout=60.0
-                        )
-                        # Propagate non-ok results from System 2 as well
-                        if router_result.status != "ok":
-                            state[_BLOCKED_KEY] = router_result
-                            return state
-                        response = router_result.content
-                    except asyncio.TimeoutError:
-                        logger.error("System 2 timed out in supervisor (60 s deadline).", exc_info=True)
-                        response = None
-                    except Exception as s2_err:
-                        logger.error(
-                            f"System 2 raised an exception in supervisor: {s2_err!r}.",
-                            exc_info=True,
-                        )
-                        response = None
-
             if not response or response.startswith("[System 1 - Error]") or response.startswith("[System 2"):
-                logger.warning(f"Supervisor received error: {response}")
+                logger.warning(f"Supervisor received error or no response: {response!r}")
                 state["current_plan"] = []
                 if not self.cognitive_router.get_system_2_available():
                     state["final_response"] = (
@@ -437,38 +478,7 @@ class Orchestrator:
                     state["final_response"] = "Both local and cloud reasoning failed on this request. Please try rephrasing or simplifying the task."
                 return state
 
-            # Parse WORKERS tag — search last 3 lines to handle trailing newlines/notes
-            lines = response.strip().split('\n')
-            workers_match = None
-            for line in reversed(lines[-3:]):
-                workers_match = re.search(r'WORKERS:\s*(\[.*?\])', line)
-                if workers_match:
-                    break
-            if workers_match:
-                try:
-                    plan = json.loads(workers_match.group(1))
-                    # Strip all lines that contain the WORKERS tag to extract the clean answer
-                    answer = '\n'.join(
-                        ln for ln in lines if not re.search(r'WORKERS:\s*\[', ln)
-                    ).strip()
-                    if isinstance(plan, list) and len(plan) > 0 and all(isinstance(x, str) for x in plan):
-                        state["current_plan"] = plan
-                        if answer:
-                            state["worker_outputs"]["supervisor_context"] = answer
-                    else:
-                        # Empty workers list — direct answer
-                        state["current_plan"] = []
-                        state["final_response"] = answer if answer else response.strip()
-                except (json.JSONDecodeError, ValueError):
-                    state["current_plan"] = []
-                    answer = '\n'.join(
-                        ln for ln in lines if not re.search(r'WORKERS:\s*\[', ln)
-                    ).strip()
-                    state["final_response"] = answer or response.strip()
-            else:
-                # No WORKERS tag — treat entire response as direct answer
-                state["current_plan"] = []
-                state["final_response"] = response.strip()
+            state = self._parse_supervisor_response(response, state)
 
         except asyncio.TimeoutError:
             logger.error("Supervisor node timeout (60s)")
@@ -485,7 +495,7 @@ class Orchestrator:
 
     async def research_agent(self, state: Dict[str, Any]) -> Dict[str, Any]:
         """Worker: searches archival memory for relevant context."""
-        state = await self._deduct_energy(state, ENERGY_COST_WORKER, "research_agent")
+        state = self._deduct_energy(state, ENERGY_COST_WORKER, "research_agent")
         core_mem_str = await self.core_memory.get_context_string()
 
         capabilities_str = self._get_capabilities_string()
@@ -510,7 +520,7 @@ class Orchestrator:
 
     async def coder_agent(self, state: Dict[str, Any]) -> Dict[str, Any]:
         """Worker: executes coding tasks, updates memory/ledger."""
-        state = await self._deduct_energy(state, ENERGY_COST_WORKER, "coder_agent")
+        state = self._deduct_energy(state, ENERGY_COST_WORKER, "coder_agent")
         core_mem_str = await self.core_memory.get_context_string()
         research_context = state["worker_outputs"].get("research", "")
 
@@ -540,14 +550,8 @@ class Orchestrator:
 
     async def critic_node(self, state: Dict[str, Any]) -> Dict[str, Any]:
         """Checks worker output against the charter. Skipped for direct supervisor responses."""
-        state = await self._deduct_energy(state, ENERGY_COST_CRITIC, "critic")
-
-        output_to_eval = ""
-        if state.get("worker_outputs"):
-            last_worker = list(state["worker_outputs"].keys())[-1]
-            output_to_eval = state["worker_outputs"][last_worker]
-        elif state.get("final_response"):
-            output_to_eval = state["final_response"]
+        state = self._deduct_energy(state, ENERGY_COST_CRITIC, "critic")
+        output_to_eval = self._get_output_to_evaluate(state)
 
         if not output_to_eval:
             state["critic_feedback"] = "PASS"
@@ -555,23 +559,19 @@ class Orchestrator:
 
         messages = [
             {"role": "system", "content": f"Evaluate the output. Output PASS if it follows the charter, or FAIL with a reason.\nCharter: {self.charter_text}"},
-            {"role": "user", "content": output_to_eval[:1000]}  # Truncate to reduce latency
+            {"role": "user", "content": output_to_eval[:1000]},
         ]
 
         try:
-            use_system2 = self.cognitive_router.get_system_2_available()
-            if use_system2:
+            if self.cognitive_router.get_system_2_available():
                 logger.info("Routing Critic through System 2 (Gemini)")
                 router_result = await asyncio.wait_for(
-                    self.cognitive_router.route_to_system_2(messages),
-                    timeout=30.0
+                    self.cognitive_router.route_to_system_2(messages), timeout=30.0
                 )
             else:
                 router_result = await asyncio.wait_for(
-                    self.cognitive_router.route_to_system_1(messages, allowed_tools=[]),
-                    timeout=60.0
+                    self.cognitive_router.route_to_system_1(messages, allowed_tools=[]), timeout=60.0
                 )
-            # Non-ok router results (e.g. HITL during critic) are propagated via state
             if router_result.status != "ok":
                 state[_BLOCKED_KEY] = router_result
                 return state
@@ -590,26 +590,10 @@ class Orchestrator:
                 state["final_response"] = output_to_eval
 
         if state["iteration_count"] >= 3 and state["critic_feedback"] != "PASS":
-            # Sprint 11: inject a high-priority debug Task into the backlog
-            try:
-                last_worker = list(state["worker_outputs"].keys())[-1] if state.get("worker_outputs") else "unknown"
-                task_title = (
-                    f"Debug failing [{last_worker}] logic for: "
-                    f"{state.get('user_input', '')[:80]}"
-                )
-                await self.ledger_memory.add_objective(
-                    tier="Task",
-                    title=task_title,
-                    estimated_energy=20,
-                    origin="Critic",
-                    priority=2,
-                )
-                logger.info(f"Critic: injected debug Task into backlog after 3 failures: {task_title!r}")
-            except Exception as spawn_err:
-                logger.warning(f"Critic: failed to spawn debug objective: {spawn_err}")
+            await self._spawn_debug_task(state)
             raise RequiresHITLError(
-                f"Critic rejected output 3 times. Guidance needed.\n"
-                f"Question: How should I proceed to satisfy the charter?"
+                "Critic rejected output 3 times. Guidance needed.\n"
+                "Question: How should I proceed to satisfy the charter?"
             )
 
         return state
@@ -633,188 +617,165 @@ class Orchestrator:
             ]
             result = await asyncio.wait_for(
                 self.cognitive_router.route_to_system_1(messages, allowed_tools=[]),
-                timeout=30.0,
+                timeout=90.0,
             )
             if result.status == "ok" and result.content:
                 await self.core_memory.update("conversation_summary", result.content.strip())
                 logger.info(f"Memory consolidation complete for user {user_id}")
+        except asyncio.TimeoutError:
+            logger.warning("Memory consolidation skipped: LLM did not respond within 90s")
         except Exception as e:
-            logger.warning(f"Memory consolidation failed: {e}")
+            logger.warning(f"Memory consolidation failed: {type(e).__name__}: {e}", exc_info=True)
 
-    async def process_message(self, user_message: str, user_id: str) -> str:
-        """Main entry point: State Graph execution with Energy Budget."""
-        if not user_message:
-            return "Error: Invalid message"
+    async def _try_resume_mfa(self, user_id: str, user_message: str) -> Optional[str]:
+        """Handle MFA challenge response. Returns a reply string, or None if not in MFA flow."""
+        if user_id not in self.pending_mfa:
+            return None
+        pending_tool = self.pending_mfa[user_id]
+        del self.pending_mfa[user_id]
+        if not verify_mfa_challenge(user_message):
+            return "Error: MFA authorization failed. Action aborted."
+        exec_result = await self.cognitive_router._execute_tool(
+            pending_tool["name"], pending_tool["arguments"]
+        )
+        if exec_result.status == "ok":
+            return exec_result.content
+        return self._handle_blocked_result(exec_result, pending_tool.get("user_id", user_id), {})
 
-        # MFA resumption
-        if user_id in self.pending_mfa:
-            pending_tool = self.pending_mfa[user_id]
-            if verify_mfa_challenge(user_message):
-                del self.pending_mfa[user_id]
-                exec_result = await self.cognitive_router._execute_tool(
-                    pending_tool["name"],
-                    pending_tool["arguments"]
-                )
-                # _execute_tool returns RouterResult; extract content
-                if exec_result.status == "ok":
-                    return exec_result.content
-                # If another security gate fires during MFA execution, surface it
-                return self._handle_blocked_result(exec_result, pending_tool.get("user_id", user_id), {})
-            else:
-                del self.pending_mfa[user_id]
-                return "Error: MFA authorization failed. Action aborted."
+    async def _try_resume_tool_approval(self, user_id: str, user_message: str) -> Optional[str]:
+        """Handle YES/NO tool synthesis approval. Returns a reply string, or None if not pending."""
+        if user_id not in self.pending_tool_approval:
+            return None
+        payload = self.pending_tool_approval.pop(user_id)
+        synthesis = payload["synthesis"]
+        original_state = payload["original_state"]
+        if not user_message.strip().upper().startswith("YES"):
+            logger.info(f"Admin rejected tool synthesis for user {user_id}")
+            return f"Tool proposal rejected. The capability gap remains: {synthesis['description']}"
+        tool_name = synthesis["tool_name"]
+        try:
+            self.cognitive_router.register_dynamic_tool(tool_name, synthesis["code"], synthesis["schema_json"])
+            await self.ledger_memory.register_tool(
+                name=tool_name, description=synthesis["description"],
+                code=synthesis["code"], schema_json=synthesis["schema_json"],
+            )
+            await self.ledger_memory.approve_tool(tool_name)
+            core = await self.core_memory.get_all()
+            caps = core.get("known_capabilities", "")
+            await self.core_memory.update("known_capabilities", f"{caps}, {tool_name}".lstrip(", "))
+            logger.info(f"Tool '{tool_name}' approved, registered, and logged to core memory")
+            retry = await self.process_message(original_state["user_input"], user_id)
+            return f"✅ Tool '{tool_name}' deployed.\n\n{retry}"
+        except Exception as e:
+            logger.error(f"Tool registration failed: {e}", exc_info=True)
+            return f"Error deploying tool '{tool_name}': {e}"
 
-        # Tool approval resumption (Admin replies YES/NO to a synthesis proposal)
-        if user_id in self.pending_tool_approval:
-            payload = self.pending_tool_approval.pop(user_id)
-            synthesis = payload["synthesis"]
-            original_state = payload["original_state"]
-
-            if user_message.strip().upper().startswith("YES"):
-                tool_name = synthesis["tool_name"]
-                try:
-                    # 1. Register in runtime (includes AST sandbox)
-                    self.cognitive_router.register_dynamic_tool(
-                        tool_name, synthesis["code"], synthesis["schema_json"]
-                    )
-                    # 2. Persist to DB
-                    await self.ledger_memory.register_tool(
-                        name=tool_name,
-                        description=synthesis["description"],
-                        code=synthesis["code"],
-                        schema_json=synthesis["schema_json"],
-                    )
-                    await self.ledger_memory.approve_tool(tool_name)
-                    # 3. Log capability to core memory
-                    core = await self.core_memory.get_all()
-                    caps = core.get("known_capabilities", "")
-                    updated_caps = f"{caps}, {tool_name}".lstrip(", ")
-                    await self.core_memory.update("known_capabilities", updated_caps)
-                    logger.info(f"Tool '{tool_name}' approved, registered, and logged to core memory")
-                    # 4. Retry original query with the new tool available
-                    retry_response = await self.process_message(
-                        original_state["user_input"], user_id
-                    )
-                    return f"✅ Tool '{tool_name}' deployed.\n\n{retry_response}"
-                except Exception as e:
-                    logger.error(f"Tool registration failed: {e}", exc_info=True)
-                    return f"Error deploying tool '{tool_name}': {e}"
-            else:
-                logger.info(f"Admin rejected tool synthesis for user {user_id}")
-                return f"Tool proposal rejected. The capability gap remains: {synthesis['description']}"
-
-        # HITL resumption
+    async def _load_state(self, user_id: str, user_message: str) -> Dict[str, Any]:
+        """Return a state dict: resumes a HITL conversation if pending, else creates fresh."""
         if user_id in self.pending_hitl_state:
             state = self.pending_hitl_state.pop(user_id)
             state["admin_guidance"] = user_message
             state["user_input"] += f"\n[ADMIN GUIDANCE: {user_message}]"
             state["iteration_count"] = 0
             state["current_plan"] = []
-            state["energy_remaining"] = min(state.get("energy_remaining", 0) + 50, 100)  # Refuel on guidance
-        else:
-            state = self._new_state(user_id, user_message)
-            # Load last 10 conversational turns for this user
-            if user_id != "heartbeat":
-                try:
-                    state["chat_history"] = await self.ledger_memory.get_chat_history(user_id, limit=5)
-                except Exception as e:
-                    logger.warning(f"Failed to load chat history for {user_id}: {e}")
+            state["energy_remaining"] = min(state.get("energy_remaining", 0) + 50, 100)
+            return state
+        state = self._new_state(user_id, user_message)
+        if user_id != "heartbeat":
+            try:
+                state["chat_history"] = await self.ledger_memory.get_chat_history(user_id, limit=5)
+            except Exception as e:
+                logger.warning(f"Failed to load chat history for {user_id}: {e}")
+        return state
+
+    async def _run_graph_loop(self, state: Dict[str, Any], user_id: str, user_message: str) -> str:
+        """Execute the supervisor → workers → critic loop. Returns the final sanitized response."""
+        max_iterations = 3
+
+        while state["iteration_count"] < max_iterations:
+            if state.get(_BLOCKED_KEY):
+                return self._handle_blocked_result(state.pop(_BLOCKED_KEY), user_id, state)
+
+            if not state["current_plan"] and state["iteration_count"] == 0:
+                state = await self.supervisor_node(state)
+            else:
+                state["user_input"] += f"\n[CRITIC FEEDBACK: {state['critic_feedback']}. Fix your output.]"
+
+            if state.get(_BLOCKED_KEY):
+                return self._handle_blocked_result(state.pop(_BLOCKED_KEY), user_id, state)
+
+            if not state["current_plan"] and state.get("final_response"):
+                break
+
+            for task in state["current_plan"]:
+                if "research" in task.lower():
+                    state = await self.research_agent(state)
+                elif "coder" in task.lower():
+                    state = await self.coder_agent(state)
+                if state.get(_BLOCKED_KEY):
+                    return self._handle_blocked_result(state.pop(_BLOCKED_KEY), user_id, state)
+
+            if not state["current_plan"] and not state.get("final_response"):
+                state["final_response"] = "No response could be generated. Please try again."
+                break
+
+            state = await self.critic_node(state)
+
+            if state.get(_BLOCKED_KEY):
+                return self._handle_blocked_result(state.pop(_BLOCKED_KEY), user_id, state)
+
+            if state["critic_feedback"] == "PASS":
+                break
+            logger.warning(f"Critic rejected output on iteration {state['iteration_count']}")
+            state["final_response"] = ""
+            state["worker_outputs"] = {}
+
+        if state["iteration_count"] >= max_iterations and state.get("critic_feedback") != "PASS":
+            state["final_response"] = "Unable to fulfill this request — output repeatedly failed internal safety checks."
+
+        if not state.get("final_response"):
+            state["final_response"] = "No valid response could be generated."
+
+        final_resp = self.cognitive_router.sanitize_response(state["final_response"])
+
+        _error_prefixes = (
+            "Supervisor encountered an error", "Both local and cloud reasoning failed",
+            "I was unable to process this request locally", "Planning timed out",
+            "Unable to fulfill this request", "No valid response could be generated",
+            "An internal error occurred",
+        )
+        is_error_response = any(final_resp.startswith(p) for p in _error_prefixes)
+
+        if user_id != "heartbeat" and not is_error_response:
+            try:
+                await self.ledger_memory.save_chat_turn(user_id, "user", user_message)
+                await self.ledger_memory.save_chat_turn(user_id, "assistant", final_resp)
+            except Exception as e:
+                logger.warning(f"Failed to save chat turn for {user_id}: {e}")
+            _consolidate_task = asyncio.create_task(self._consolidate_memory(user_id))
+
+        _save_memory_task = asyncio.create_task(
+            self._save_memory_async(f"User: {user_message}\nAssistant: {final_resp}")
+        )
+        return final_resp
+
+    async def process_message(self, user_message: str, user_id: str) -> str:
+        """Main entry point: State Graph execution with Energy Budget."""
+        if not user_message:
+            return "Error: Invalid message"
+
+        reply = await self._try_resume_mfa(user_id, user_message)
+        if reply is not None:
+            return reply
+
+        reply = await self._try_resume_tool_approval(user_id, user_message)
+        if reply is not None:
+            return reply
+
+        state = await self._load_state(user_id, user_message)
 
         try:
-            max_iterations = 3
-
-            while state["iteration_count"] < max_iterations:
-
-                # Check for a blocked result set by a previous node
-                if state.get(_BLOCKED_KEY):
-                    return self._handle_blocked_result(
-                        state.pop(_BLOCKED_KEY), user_id, state
-                    )
-
-                # 1. Supervisor (first iteration only, or after HITL guidance)
-                if not state["current_plan"] and state["iteration_count"] == 0:
-                    state = await self.supervisor_node(state)
-                else:
-                    state["user_input"] += f"\n[CRITIC FEEDBACK: {state['critic_feedback']}. Fix your output.]"
-
-                # Check for blocked result after supervisor
-                if state.get(_BLOCKED_KEY):
-                    return self._handle_blocked_result(
-                        state.pop(_BLOCKED_KEY), user_id, state
-                    )
-
-                # If supervisor handled it directly (no workers), skip critic to reduce latency
-                if not state["current_plan"] and state.get("final_response"):
-                    break
-
-                # 2. Workers
-                for task in state["current_plan"]:
-                    if "research" in task.lower():
-                        state = await self.research_agent(state)
-                    elif "coder" in task.lower():
-                        state = await self.coder_agent(state)
-                    # Check after each worker
-                    if state.get(_BLOCKED_KEY):
-                        return self._handle_blocked_result(
-                            state.pop(_BLOCKED_KEY), user_id, state
-                        )
-
-                if not state["current_plan"] and not state.get("final_response"):
-                    state["final_response"] = "No response could be generated. Please try again."
-                    break
-
-                # 3. Critic (only when workers were called)
-                state = await self.critic_node(state)
-
-                if state.get(_BLOCKED_KEY):
-                    return self._handle_blocked_result(
-                        state.pop(_BLOCKED_KEY), user_id, state
-                    )
-
-                if state["critic_feedback"] == "PASS":
-                    break
-                else:
-                    logger.warning(f"Critic rejected output on iteration {state['iteration_count']}")
-                    state["final_response"] = ""
-                    state["worker_outputs"] = {}
-
-            if state["iteration_count"] >= max_iterations and state.get("critic_feedback") != "PASS":
-                state["final_response"] = "Unable to fulfill this request — output repeatedly failed internal safety checks."
-
-            if not state.get("final_response"):
-                state["final_response"] = "No valid response could be generated."
-
-            final_resp = self.cognitive_router.sanitize_response(state["final_response"])
-
-            # Persist this conversation turn to chat history (skip heartbeat tasks and error responses)
-            _error_prefixes = (
-                "Supervisor encountered an error",
-                "Both local and cloud reasoning failed",
-                "I was unable to process this request locally",
-                "Planning timed out",
-                "Unable to fulfill this request",
-                "No valid response could be generated",
-                "An internal error occurred",
-            )
-            is_error_response = any(final_resp.startswith(p) for p in _error_prefixes)
-
-            if user_id != "heartbeat" and not is_error_response:
-                try:
-                    await self.ledger_memory.save_chat_turn(user_id, "user", user_message)
-                    await self.ledger_memory.save_chat_turn(user_id, "assistant", final_resp)
-                except Exception as e:
-                    logger.warning(f"Failed to save chat turn for {user_id}: {e}")
-
-                # Fire-and-forget memory consolidation and vector store write
-                asyncio.create_task(self._consolidate_memory(user_id))
-
-            # Vector memory storage (non-blocking fire-and-forget)
-            asyncio.create_task(
-                self._save_memory_async(f"User: {user_message}\nAssistant: {final_resp}")
-            )
-
-            return final_resp
-
+            return await self._run_graph_loop(state, user_id, user_message)
         except RequiresHITLError as hitl_err:
             self.pending_hitl_state[user_id] = state
             return str(hitl_err)
@@ -846,7 +807,7 @@ class Orchestrator:
         if result.status == "capability_gap":
             # Run synthesis synchronously via create_task — result will come back
             # in a follow-up message after the Admin approves/rejects.
-            asyncio.create_task(self._async_tool_synthesis(user_id, result, state))
+            _synthesis_task = asyncio.create_task(self._async_tool_synthesis(user_id, result, state))
             return (
                 f"I identified a capability gap: {result.gap_description}. "
                 f"Requesting tool synthesis from System 2..."
@@ -857,7 +818,7 @@ class Orchestrator:
 
     async def _async_tool_synthesis(
         self,
-        user_id: str,
+        _user_id: str,
         result: RouterResult,
         state: Dict[str, Any],
     ) -> None:

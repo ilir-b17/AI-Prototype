@@ -5,7 +5,7 @@ from datetime import datetime
 logger = logging.getLogger(__name__)
 
 
-async def get_system_info() -> str:
+def get_system_info() -> str:
     """Returns current datetime, timezone, and host platform."""
     try:
         now = datetime.now().astimezone()

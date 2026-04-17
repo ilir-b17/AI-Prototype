@@ -1,15 +1,16 @@
-import asyncio
 import logging
 
 logger = logging.getLogger(__name__)
 
 
-def _sync_spawn_new_objective(tier: str, title: str, estimated_energy: int) -> str:
+async def spawn_new_objective(tier: str, title: str, estimated_energy: int) -> str:
+    logger.info(f"spawn_new_objective: [{tier}] {title}")
     ledger = None
     try:
         from src.memory.ledger_db import LedgerMemory
         ledger = LedgerMemory()
-        obj_id = ledger.add_objective(
+        await ledger.initialize()
+        obj_id = await ledger.add_objective(
             tier=tier, title=title,
             estimated_energy=estimated_energy, origin="System"
         )
@@ -18,9 +19,4 @@ def _sync_spawn_new_objective(tier: str, title: str, estimated_energy: int) -> s
         return f"Error: Could not spawn objective due to [{exc}]."
     finally:
         if ledger:
-            ledger.close()
-
-
-async def spawn_new_objective(tier: str, title: str, estimated_energy: int) -> str:
-    logger.info(f"spawn_new_objective: [{tier}] {title}")
-    return await asyncio.to_thread(_sync_spawn_new_objective, tier, title, estimated_energy)
+            await ledger.close()
