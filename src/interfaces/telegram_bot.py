@@ -116,12 +116,14 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     user_id = update.effective_user.id
 
     if not is_authorized(user_id):
-        logger.warning(f"Unauthorized message from user {user_id}: {update.message.text}")
+        message_length = len(update.message.text) if update.message.text else 0
+        logger.warning(f"Unauthorized message from user {user_id} (length: {message_length})")
         await update.message.reply_text("Unauthorized.")
         return
 
     user_message = update.message.text
-    logger.info(f"Message received from user {user_id}: {user_message}")
+    message_length = len(user_message) if user_message else 0
+    logger.info(f"Message received from user {user_id} (length: {message_length})")
 
     try:
         # Send a typing indicator to show the bot is processing
@@ -218,7 +220,8 @@ async def addgoal(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await update.message.reply_text(
             f"Added to backlog:\n  #{obj_id} [{tier}] {title}\n  Estimated Energy: {energy}"
         )
-        logger.info(f"Admin added objective #{obj_id}: [{tier}] {title}")
+        title_length = len(title) if title else 0
+        logger.info(f"Admin added objective #{obj_id}: [{tier}] (title length: {title_length})")
     except Exception as e:
         logger.error(f"/addgoal error: {e}", exc_info=True)
         await update.message.reply_text(f"Error adding goal: {e}")
