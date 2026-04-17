@@ -4,9 +4,15 @@ import logging
 
 logger = logging.getLogger(__name__)
 
-# Regex strictly prevents the execution of destructive base commands
-# Matches optional whitespace, optional 'sudo ' (and any combination of spaces), followed by the blacklisted commands
-BLACKLIST_REGEX = re.compile(r"^\s*(?:sudo\s+)?(rm|mkfs|dd|shutdown|reboot|chmod|chown|mv)(?:\s|$)", re.IGNORECASE)
+# Regex strictly prevents the execution of destructive base commands.
+# Covers both Unix destructive commands and Windows equivalents.
+BLACKLIST_REGEX = re.compile(
+    r"^\s*(?:sudo\s+)?"
+    r"(rm|mkfs|dd|shutdown|reboot|chmod|chown|mv"
+    r"|del|erase|format|rmdir|rd|cipher|attrib|icacls|takeown|reg\s+delete|net\s+stop|sc\s+delete)"
+    r"(?:\s|$)",
+    re.IGNORECASE
+)
 
 async def run_terminal_command(command: str) -> str:
     """

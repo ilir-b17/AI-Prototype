@@ -1,5 +1,6 @@
 import asyncio
 import subprocess
+import sys
 import tempfile
 import os
 import logging
@@ -28,7 +29,7 @@ async def execute_python_sandbox(code_string: str) -> str:
             # To avoid blocking the event loop entirely, let's wrap it in asyncio.to_thread
             def run_script():
                 return subprocess.run(
-                    ["python3", script_path],
+                    [sys.executable, script_path],
                     capture_output=True,
                     text=True,
                     timeout=10

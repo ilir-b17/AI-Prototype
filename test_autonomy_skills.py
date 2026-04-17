@@ -59,8 +59,8 @@ async def test_run_terminal_command():
     assert "Error: Command is blocked" in sudo_rm_res, f"Expected command to be blocked, got: {sudo_rm_res}"
     print("[PASS] run_terminal_command blacklist (sudo rm)")
 
-    # Test timeout
-    timeout_res = await run_terminal_command("sleep 12")
+    # Test timeout — use a cross-platform Python one-liner so it works on both Windows and Linux
+    timeout_res = await run_terminal_command('python -c "import time; time.sleep(12)"')
     assert "timeout" in timeout_res.lower(), f"Expected timeout error, got: {timeout_res}"
     print("[PASS] run_terminal_command timeout")
 
