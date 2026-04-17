@@ -8,6 +8,7 @@ log for audit trails and debugging.
 
 import sqlite3
 import logging
+import threading
 from datetime import datetime
 from typing import List, Dict, Any, Optional
 from enum import Enum
@@ -59,15 +60,30 @@ class LedgerMemory:
             sqlite3.Error: If database initialization fails.
         """
         self.db_path = db_path
+        self._local = threading.local()
 
         try:
-            self.connection = sqlite3.connect(db_path, check_same_thread=False)
-            self.connection.row_factory = sqlite3.Row
+            # Initialize tables on instantiation using the main thread's connection
             self._initialize_tables()
             logger.info(f"LedgerMemory initialized with database at {db_path}")
         except sqlite3.Error as e:
             logger.error(f"Failed to initialize LedgerMemory: {e}")
             raise
+
+    @property
+    def connection(self) -> sqlite3.Connection:
+        """
+        Get a thread-local SQLite connection.
+        Enables Write-Ahead Logging (WAL) and sets a timeout for concurrent access.
+        """
+        if not hasattr(self._local, "connection"):
+            # Set a timeout and omit check_same_thread=False since connections are per-thread
+            conn = sqlite3.connect(self.db_path, timeout=5.0)
+            conn.row_factory = sqlite3.Row
+            # Enable WAL mode for safe concurrent reads/writes
+            conn.execute("PRAGMA journal_mode=WAL;")
+            self._local.connection = conn
+        return self._local.connection
 
     def _initialize_tables(self) -> None:
         """
@@ -618,9 +634,11 @@ class LedgerMemory:
         return [dict(row) for row in cursor.fetchall()]
 
     def close(self) -> None:
-        """Close the database connection."""
+        """Close the thread-local database connection."""
         try:
-            self.connection.close()
-            logger.info("LedgerMemory connection closed")
+            if hasattr(self._local, "connection"):
+                self._local.connection.close()
+                del self._local.connection
+                logger.info("LedgerMemory thread-local connection closed")
         except sqlite3.Error as e:
             logger.error(f"Error closing database connection: {e}")
