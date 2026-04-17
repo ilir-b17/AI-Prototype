@@ -74,19 +74,25 @@ except Exception as e:
     report("VectorMemory", False, str(e))
 
 try:
-    lm = LedgerMemory(db_path="data/ledger.db")
-    tid = lm.add_task("Test task from integration test", priority=3)
-    report("LedgerMemory write", bool(tid), f"task_id={tid}")
-    tasks = lm.get_pending_tasks(limit=5)
-    report("LedgerMemory read", isinstance(tasks, list), f"{len(tasks)} pending tasks")
+    async def _test_ledger():
+        lm = LedgerMemory(db_path="data/ledger.db")
+        await lm.initialize()
+        tid = await lm.add_task("Test task from integration test", priority=3)
+        report("LedgerMemory write", bool(tid), f"task_id={tid}")
+        tasks = await lm.get_pending_tasks(limit=5)
+        report("LedgerMemory read", isinstance(tasks, list), f"{len(tasks)} pending tasks")
+        await lm.close()
+    asyncio.run(_test_ledger())
 except Exception as e:
     report("LedgerMemory", False, str(e))
 
 try:
-    cm = CoreMemory(memory_file_path="data/core_memory.json")
-    cm.update("current_focus", "integration_test")
-    ctx = cm.get_context_string()
-    report("CoreMemory", "integration_test" in ctx)
+    async def _test_core():
+        cm = CoreMemory(memory_file_path="data/core_memory.json")
+        await cm.update("current_focus", "integration_test")
+        ctx = await cm.get_context_string()
+        report("CoreMemory", "integration_test" in ctx)
+    asyncio.run(_test_core())
 except Exception as e:
     report("CoreMemory", False, str(e))
 
@@ -99,7 +105,7 @@ print("\n[4] LLM Router")
 async def test_router():
     router = CognitiveRouter()
     report("CognitiveRouter init", True,
-           f"System2={'Groq' if router.groq_client else 'Gemini' if router.gemini_model else 'None'}")
+           f"System2={'Groq' if router.groq_client else 'Gemini' if router.gemini_client else 'None'}")
 
     # System 2 test (Groq)
     if router.get_system_2_available():
@@ -110,7 +116,7 @@ async def test_router():
                 ]),
                 timeout=15.0
             )
-            report("System 2 (Groq)", bool(r), repr(r[:60]))
+            report("System 2 (Groq)", r.status == "ok" and bool(r.content), repr(r.content[:60]))
         except Exception as e:
             report("System 2 (Groq)", False, str(e))
     else:
@@ -124,7 +130,7 @@ async def test_router():
             ]),
             timeout=60.0
         )
-        report("System 1 (Gemma)", bool(r) and not r.startswith("[System 1 - Error]"), repr(r[:60]))
+        report("System 1 (Gemma)", r.status == "ok" and not r.content.startswith("[System 1 - Error]"), repr(r.content[:60]))
     except Exception as e:
         report("System 1 (Gemma)", False, str(e))
 
@@ -138,6 +144,7 @@ print("\n[5] Orchestrator (full message flow)")
 
 async def test_orchestrator():
     orch = Orchestrator()
+    await orch.async_init()
 
     # Test 1: simple chat
     try:

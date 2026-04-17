@@ -40,6 +40,7 @@ logger = logging.getLogger(__name__)
 # Load configuration from environment
 TELEGRAM_BOT_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN')
 ADMIN_USER_ID = int(os.getenv('ADMIN_USER_ID', 0))
+AGENT_TIMEOUT_SECONDS = float(os.getenv('AGENT_TIMEOUT_SECONDS', 30.0))
 
 if not TELEGRAM_BOT_TOKEN:
     raise ValueError("TELEGRAM_BOT_TOKEN environment variable not set")
@@ -52,6 +53,23 @@ orchestrator: Orchestrator = None
 
 # Track consecutive conflicts for backoff mechanism
 consecutive_conflicts = 0
+
+
+def sanitize_for_logging(text: str, max_length: int = 256) -> str:
+    """
+    Sanitize text for safe logging by escaping control characters
+    and truncating excessively long strings to prevent log injection
+    and DoS via log bloating.
+    """
+    if not text:
+        return ""
+
+    # Use repr() to escape special characters, but strip the enclosing quotes
+    sanitized = repr(text)[1:-1]
+
+    if len(sanitized) > max_length:
+        return sanitized[:max_length] + "...[truncated]"
+    return sanitized
 
 
 async def _drain_outbound_queue(bot, queue: asyncio.Queue) -> None:
@@ -139,13 +157,16 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             return
 
         # Process message (may call external APIs - handle timeouts)
-        ai_response = await orchestrator.process_message(user_message, str(user_id))
+        ai_response = await asyncio.wait_for(
+            orchestrator.process_message(user_message, str(user_id)),
+            timeout=AGENT_TIMEOUT_SECONDS
+        )
 
         # Send the response back to the user
         await update.message.reply_text(ai_response)
         logger.info(f"Response sent to user {user_id}")
 
-    except TimeoutError as e:
+    except (TimeoutError, asyncio.TimeoutError) as e:
         timeout_msg = "Request timed out. Please try again."
         logger.warning(f"Timeout error: {e}")
         await update.message.reply_text(timeout_msg)
@@ -163,8 +184,9 @@ async def goals(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
     try:
         ledger = LedgerMemory()
-        items = ledger.get_all_active_goals()
-        ledger.close()
+        await ledger.initialize()
+        items = await ledger.get_all_active_goals()
+        await ledger.close()
 
         if not items:
             await update.message.reply_text("Backlog is empty. Use /addgoal to add objectives.")
@@ -215,8 +237,9 @@ async def addgoal(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
     try:
         ledger = LedgerMemory()
-        obj_id = ledger.add_objective(tier=tier, title=title, estimated_energy=energy, origin="Admin")
-        ledger.close()
+        await ledger.initialize()
+        obj_id = await ledger.add_objective(tier=tier, title=title, estimated_energy=energy, origin="Admin")
+        await ledger.close()
         await update.message.reply_text(
             f"Added to backlog:\n  #{obj_id} [{tier}] {title}\n  Estimated Energy: {energy}"
         )
@@ -311,12 +334,14 @@ def main() -> None:
 
         # post_init: start heartbeat and outbound message queue drainer
         async def post_init(app) -> None:
+            # Complete async initialisation (opens aiosqlite connection, seeds goals)
+            await orchestrator.async_init()
             outbound_queue = asyncio.Queue()
             orchestrator.outbound_queue = outbound_queue
             asyncio.create_task(orchestrator._heartbeat_loop())
             asyncio.create_task(orchestrator._sensory_update_loop())
             asyncio.create_task(_drain_outbound_queue(app.bot, outbound_queue))
-            logger.info("Heartbeat loop, sensory update loop, and outbound queue drainer started.")
+            logger.info("Orchestrator async_init, heartbeat loop, sensory update loop, and outbound queue drainer started.")
 
         application.post_init = post_init
 

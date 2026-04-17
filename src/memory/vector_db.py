@@ -252,3 +252,26 @@ class VectorMemory:
                 self.client = None
         except Exception as e:
             logger.warning(f"Error closing VectorMemory: {e}")
+
+    # ─────────────────────────────────────────────────────────────
+    # Async wrappers — non-blocking via asyncio.to_thread()
+    # ─────────────────────────────────────────────────────────────
+
+    async def add_memory_async(
+        self,
+        text: str,
+        metadata: Optional[Dict[str, Any]] = None,
+        memory_id: Optional[str] = None,
+    ) -> str:
+        """Non-blocking wrapper for :meth:`add_memory`."""
+        import asyncio
+        return await asyncio.to_thread(self.add_memory, text, metadata, memory_id)
+
+    async def query_memory_async(
+        self,
+        query_text: str,
+        n_results: int = 3,
+    ) -> List[Dict[str, Any]]:
+        """Non-blocking wrapper for :meth:`query_memory`."""
+        import asyncio
+        return await asyncio.to_thread(self.query_memory, query_text, n_results)
