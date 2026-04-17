@@ -76,9 +76,6 @@ class Orchestrator:
             self.core_memory = CoreMemory(memory_file_path=core_memory_path)
             self.cognitive_router = CognitiveRouter(model_name=gemini_model, local_model=local_model)
 
-            # Dynamically record the host OS so every system prompt stays accurate
-            self.core_memory.update("host_os", platform.system())
-
             self.charter_text = self._load_charter()
             self.pending_mfa: Dict[str, dict] = {}
             self.pending_hitl_state: Dict[str, dict] = {}
@@ -101,6 +98,8 @@ class Orchestrator:
         await self.ledger_memory.initialize()
         await self.ledger_memory.seed_initial_goals()
         await self._load_approved_tools()
+        # Record the host OS now that we're in an async context
+        await self.core_memory.update("host_os", platform.system())
         logger.info("Orchestrator async_init complete")
 
     def _refresh_sensory_state(self) -> None:

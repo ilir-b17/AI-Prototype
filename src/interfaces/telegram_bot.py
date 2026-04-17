@@ -40,7 +40,7 @@ logger = logging.getLogger(__name__)
 # Load configuration from environment
 TELEGRAM_BOT_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN')
 ADMIN_USER_ID = int(os.getenv('ADMIN_USER_ID', 0))
-AGENT_TIMEOUT_SECONDS = float(os.getenv('AGENT_TIMEOUT_SECONDS', 30.0))
+AGENT_TIMEOUT_SECONDS = float(os.getenv('AGENT_TIMEOUT_SECONDS', 120.0))
 
 if not TELEGRAM_BOT_TOKEN:
     raise ValueError("TELEGRAM_BOT_TOKEN environment variable not set")
@@ -70,6 +70,23 @@ def sanitize_for_logging(text: str, max_length: int = 256) -> str:
     if len(sanitized) > max_length:
         return sanitized[:max_length] + "...[truncated]"
     return sanitized
+
+
+async def _keep_typing_alive(bot, chat_id: int, stop_event: asyncio.Event) -> None:
+    """
+    Background task: re-sends the 'typing' action every 4 s until stop_event is
+    set. Telegram's typing indicator auto-expires after ~5 s, so without this
+    the user sees no activity for long-running requests.
+    """
+    while not stop_event.is_set():
+        try:
+            await bot.send_chat_action(chat_id=chat_id, action="typing")
+        except Exception:
+            pass
+        try:
+            await asyncio.wait_for(stop_event.wait(), timeout=4.0)
+        except asyncio.TimeoutError:
+            pass
 
 
 async def _drain_outbound_queue(bot, queue: asyncio.Queue) -> None:
@@ -144,31 +161,33 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     logger.info(f"Message received from user {user_id}: {sanitized_user_msg}")
 
     try:
-        # Send a typing indicator to show the bot is processing
-        await context.bot.send_chat_action(
-            chat_id=update.effective_chat.id,
-            action="typing"
-        )
-
-        # Process the message through the Orchestrator
         if orchestrator is None:
             logger.error("Orchestrator not initialized")
             await update.message.reply_text("System error: Service temporarily unavailable.")
             return
 
-        # Process message (may call external APIs - handle timeouts)
-        ai_response = await asyncio.wait_for(
-            orchestrator.process_message(user_message, str(user_id)),
-            timeout=AGENT_TIMEOUT_SECONDS
+        # Keep sending 'typing' every 4 s so the indicator stays visible throughout
+        stop_typing = asyncio.Event()
+        typing_task = asyncio.create_task(
+            _keep_typing_alive(context.bot, update.effective_chat.id, stop_typing)
         )
 
-        # Send the response back to the user
+        try:
+            # Process message (may call external APIs - handle timeouts)
+            ai_response = await asyncio.wait_for(
+                orchestrator.process_message(user_message, str(user_id)),
+                timeout=AGENT_TIMEOUT_SECONDS
+            )
+        finally:
+            stop_typing.set()
+            await typing_task
+
         await update.message.reply_text(ai_response)
         logger.info(f"Response sent to user {user_id}")
 
     except (TimeoutError, asyncio.TimeoutError) as e:
         timeout_msg = "Request timed out. Please try again."
-        logger.warning(f"Timeout error: {e}")
+        logger.warning(f"Timeout error after {AGENT_TIMEOUT_SECONDS}s: {e}")
         await update.message.reply_text(timeout_msg)
 
     except Exception as e:
