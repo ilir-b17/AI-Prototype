@@ -195,16 +195,29 @@ class CognitiveRouter:
         # System 2 provider selection: Groq takes priority over Gemini
         self.groq_client = None
         self.gemini_client = None
+        self.groq_model = os.getenv('GROQ_MODEL', 'llama-3.3-70b-versatile')
 
         if GROQ_AVAILABLE and GROQ_API_KEY:
             self.groq_client = AsyncGroq(api_key=GROQ_API_KEY)
-            self.groq_model = os.getenv('GROQ_MODEL', 'llama-3.3-70b-versatile')
-            logger.info(f"System 2: Groq ({self.groq_model}) — fast free inference")
+            logger.info(f"System 2: Groq ({self.groq_model}) — API key configured")
+        elif not GROQ_AVAILABLE and GROQ_API_KEY:
+            logger.warning(
+                "GROQ_API_KEY is set but the 'groq' package is not installed. "
+                "Run: pip install groq"
+            )
         elif GEMINI_API_KEY and USE_GEMINI:
             self.gemini_client = genai.Client(api_key=GEMINI_API_KEY)
-            logger.info(f"System 2: Gemini ({model_name}) via google-genai SDK")
+            logger.info(f"System 2: Gemini ({model_name}) — API key configured")
+        elif GEMINI_API_KEY and not USE_GEMINI:
+            logger.warning(
+                "GEMINI_API_KEY is set but USE_GEMINI is not 'True'. "
+                "Set USE_GEMINI=True in .env to activate Gemini as System 2."
+            )
         else:
-            logger.warning("No System 2 available. Set GROQ_API_KEY (free) or GEMINI_API_KEY + USE_GEMINI=True.")
+            logger.warning(
+                "No System 2 provider configured — capability synthesis will be unavailable. "
+                "Set GROQ_API_KEY (free at console.groq.com) or GEMINI_API_KEY + USE_GEMINI=True."
+            )
 
         logger.info(f"CognitiveRouter initialized. System 1: {local_model}")
 
@@ -216,6 +229,81 @@ class CognitiveRouter:
             except Exception as e:
                 logger.debug(f"Error closing Ollama client: {e}")
             self._ollama_client = None
+
+    @staticmethod
+    def _extract_inline_tool_call(text: str) -> Optional[tuple]:
+        """
+        Fallback parser for models that embed tool call JSON inside the text
+        ``content`` field instead of using the native ``tool_calls`` array.
+
+        Looks for a top-level JSON object containing a ``tool_name`` (or
+        ``name``) key whose value matches a known meta-tool pattern, plus an
+        optional ``arguments`` / ``parameters`` block.
+
+        Returns ``(tool_name, arguments_dict)`` on success, or ``None`` if no
+        recognisable inline tool call is found.
+        """
+        if not text:
+            return None
+
+        # Extract all top-level JSON objects, including those with nested braces,
+        # by scanning for balanced brace pairs.
+        blobs: List[str] = []
+        depth = 0
+        start = -1
+        for i, ch in enumerate(text):
+            if ch == '{':
+                if depth == 0:
+                    start = i
+                depth += 1
+            elif ch == '}':
+                depth -= 1
+                if depth == 0 and start != -1:
+                    blobs.append(text[start:i + 1])
+                    start = -1
+
+        for raw in blobs:
+            try:
+                obj = json.loads(raw)
+            except (json.JSONDecodeError, ValueError):
+                continue
+
+            if not isinstance(obj, dict):
+                continue
+
+            # Accept keys like "tool_name", "name", "function_call", "tool_call"
+            name_val = (
+                obj.get("tool_name")
+                or obj.get("name")
+                or obj.get("function_call")
+                or obj.get("tool_call")
+            )
+            if not isinstance(name_val, str) or not name_val.strip():
+                continue
+
+            # Extract arguments from common key variations
+            raw_args = (
+                obj.get("arguments")
+                or obj.get("parameters")
+                or obj.get("args")
+                or {}
+            )
+            if isinstance(raw_args, str):
+                try:
+                    raw_args = json.loads(raw_args)
+                except (json.JSONDecodeError, ValueError):
+                    raw_args = {}
+            if not isinstance(raw_args, dict):
+                # Arguments might be spread flat in the same object
+                # (e.g. {"tool_name": "x", "gap_description": "...", ...})
+                known_meta = {"tool_name", "name", "function_call", "tool_call",
+                              "arguments", "parameters", "args"}
+                raw_args = {k: v for k, v in obj.items() if k not in known_meta}
+
+            logger.debug(f"_extract_inline_tool_call: found '{name_val}' in content text")
+            return (name_val.strip(), raw_args)
+
+        return None
 
     async def route_to_system_1(
         self,
@@ -301,48 +389,115 @@ class CognitiveRouter:
                 message = response['message']
 
                 if 'tool_calls' in message and message['tool_calls']:
-                    tool_call = message['tool_calls'][0]['function']
-                    tool_name = tool_call['name']
-                    arguments = tool_call.get('arguments', {})
+                    # Robust extraction: Ollama returns ToolCall Pydantic objects that
+                    # support both attribute access (.function) and dict-like access
+                    # (['function']).  Some model/library combinations may omit the
+                    # 'function' wrapper or serialize 'arguments' as a JSON string
+                    # rather than a plain dict.  Handle all variants gracefully.
+                    tool_name = ""
+                    arguments: dict = {}
+                    tc_parse_ok = False
+                    try:
+                        raw_tc = message['tool_calls'][0]
+                        # Support both {'function': {...}} and bare {'name': ..., 'arguments': ...}
+                        if hasattr(raw_tc, 'function'):
+                            fn_data = raw_tc.function
+                        elif isinstance(raw_tc, dict) and 'function' in raw_tc:
+                            fn_data = raw_tc['function']
+                        else:
+                            fn_data = raw_tc  # bare format
 
-                    # Delegate to _execute_tool — returns RouterResult
-                    exec_result = await self._execute_tool(tool_name, arguments)
-                    if exec_result.status != "ok":
-                        return exec_result  # Propagate MFA / HITL / capability-gap
+                        tool_name = (
+                            fn_data.get('name', '') if isinstance(fn_data, dict)
+                            else getattr(fn_data, 'name', '')
+                        )
+                        raw_args = (
+                            fn_data.get('arguments', {}) if isinstance(fn_data, dict)
+                            else getattr(fn_data, 'arguments', {})
+                        )
+                        # Some models return arguments as a JSON string instead of a dict
+                        if isinstance(raw_args, str):
+                            try:
+                                arguments = json.loads(raw_args)
+                            except (json.JSONDecodeError, ValueError):
+                                logger.warning(
+                                    f"System 1 tool call arguments could not be JSON-parsed: {raw_args!r}"
+                                )
+                                arguments = {}
+                        elif isinstance(raw_args, dict):
+                            arguments = raw_args
+                        else:
+                            arguments = dict(raw_args) if raw_args else {}
 
-                    # Build follow-up messages and get a final answer
-                    followup_messages = messages.copy()
-                    followup_messages.append({
-                        "role": "assistant",
-                        "content": json.dumps({"tool_call": tool_name, "arguments": arguments})
-                    })
-                    followup_messages.append({
-                        "role": "user",
-                        "content": f"Tool result: {exec_result.content}"
-                    })
+                        if not tool_name:
+                            raise ValueError(f"Tool call is missing the 'name' field: {raw_tc!r}")
 
-                    final_response = await asyncio.wait_for(
-                        client.chat(
-                            model=available_model,
-                            messages=followup_messages,
-                            tools=active_tools
-                        ),
-                        timeout=60.0
-                    )
+                        tc_parse_ok = True
 
-                    if final_response and 'message' in final_response and 'content' in final_response['message']:
-                        result = final_response['message']['content'].strip()
-                        if result:
-                            logger.info(f"System 1 response received after tool call ({len(result)} chars)")
-                            return RouterResult(status="ok", content=result)
-                    return RouterResult(status="ok", content="Tool executed but model produced no response.")
+                    except Exception as tc_parse_err:
+                        logger.error(
+                            f"Failed to parse tool_calls from System 1 response: {tc_parse_err!r}",
+                            exc_info=True,
+                        )
 
-                # Standard text response
-                elif 'content' in message:
-                    result = message['content'].strip()
+                    if tc_parse_ok:
+                        # Delegate to _execute_tool — returns RouterResult
+                        exec_result = await self._execute_tool(tool_name, arguments)
+                        if exec_result.status != "ok":
+                            return exec_result  # Propagate MFA / HITL / capability-gap
+
+                        # Build follow-up messages and get a final answer
+                        followup_messages = messages.copy()
+                        followup_messages.append({
+                            "role": "assistant",
+                            "content": json.dumps({"tool_call": tool_name, "arguments": arguments})
+                        })
+                        followup_messages.append({
+                            "role": "user",
+                            "content": f"Tool result: {exec_result.content}"
+                        })
+
+                        final_response = await asyncio.wait_for(
+                            client.chat(
+                                model=available_model,
+                                messages=followup_messages,
+                                tools=active_tools
+                            ),
+                            timeout=60.0
+                        )
+
+                        if final_response and 'message' in final_response and 'content' in final_response['message']:
+                            result = final_response['message']['content'].strip()
+                            if result:
+                                logger.info(f"System 1 response received after tool call ({len(result)} chars)")
+                                return RouterResult(status="ok", content=result)
+                        return RouterResult(status="ok", content="Tool executed but model produced no response.")
+                    # tc_parse_ok is False: fall through to content handling below
+
+                # Standard text response.
+                # Note: intentionally `if` (not `elif`) so that a tool_calls parse
+                # failure above can fall through here and still return the content.
+                # When a tool_calls parse succeeds the block above always returns
+                # early, so double-processing cannot occur.
+                if 'content' in message:
+                    result = message['content'].strip() if message['content'] else ""
                     if not result:
                         logger.warning("System 1 returned empty response")
                         return RouterResult(status="ok", content="[System 1 - Error]: Empty response from model")
+
+                    # Fallback: detect in-text tool calls that some models embed as JSON
+                    # in the content field instead of using the native tool_calls array.
+                    inline_tc = self._extract_inline_tool_call(result)
+                    if inline_tc:
+                        inline_name, inline_args = inline_tc
+                        logger.info(
+                            f"System 1 in-text tool call detected: {inline_name} — delegating to _execute_tool"
+                        )
+                        exec_result = await self._execute_tool(inline_name, inline_args)
+                        if exec_result.status != "ok":
+                            return exec_result  # Propagate MFA / HITL / capability-gap
+                        return RouterResult(status="ok", content=exec_result.content)
+
                     logger.info(f"System 1 response received ({len(result)} chars)")
                     logger.debug(f"System 1 response: {result[:200]}...")
                     return RouterResult(status="ok", content=result)

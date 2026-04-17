@@ -368,12 +368,22 @@ class Orchestrator:
             router_result: Optional[RouterResult] = None
             try:
                 logger.info("Routing Supervisor through System 1 (Local Model)")
+                # Timeout must exceed route_to_system_1's internal 60 s primary + 60 s fallback.
                 router_result = await asyncio.wait_for(
                     self.cognitive_router.route_to_system_1(messages),
-                    timeout=60.0
+                    timeout=150.0
                 )
+            except asyncio.TimeoutError as s1_timeout:
+                logger.error(
+                    "System 1 timed out in supervisor (outer 150 s deadline). Escalating to System 2.",
+                    exc_info=True,
+                )
+                router_result = None
             except Exception as s1_err:
-                logger.warning(f"System 1 failed in supervisor ({s1_err}). Escalating to System 2.")
+                logger.error(
+                    f"System 1 raised an exception in supervisor: {s1_err!r}. Escalating to System 2.",
+                    exc_info=True,
+                )
                 router_result = None
 
             # Propagate non-ok RouterResult immediately (MFA / HITL / capability gap)
@@ -389,15 +399,21 @@ class Orchestrator:
                         logger.info("Escalating Supervisor to System 2")
                         router_result = await asyncio.wait_for(
                             self.cognitive_router.route_to_system_2(messages),
-                            timeout=30.0
+                            timeout=60.0
                         )
                         # Propagate non-ok results from System 2 as well
                         if router_result.status != "ok":
                             state[_BLOCKED_KEY] = router_result
                             return state
                         response = router_result.content
+                    except asyncio.TimeoutError:
+                        logger.error("System 2 timed out in supervisor (60 s deadline).", exc_info=True)
+                        response = None
                     except Exception as s2_err:
-                        logger.warning(f"System 2 also failed in supervisor ({s2_err}).")
+                        logger.error(
+                            f"System 2 raised an exception in supervisor: {s2_err!r}.",
+                            exc_info=True,
+                        )
                         response = None
 
             if not response or response.startswith("[System 1 - Error]") or response.startswith("[System 2"):
