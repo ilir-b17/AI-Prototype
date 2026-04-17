@@ -257,12 +257,25 @@ class CognitiveRouter:
                 else:
                     raise
 
-            # Check for tool calls
-            if response and 'message' in response:
-                message = response['message']
+            # ReAct loop — max 5 tool executions per turn to prevent infinite chaining
+            MAX_TOOL_ITERATIONS = 5
+            tool_iterations = 0
+            current_messages = list(messages)
+            current_response = response
+
+            while True:
+                if not (current_response and 'message' in current_response):
+                    error_msg = "Unexpected response format from Ollama"
+                    logger.warning(error_msg)
+                    return f"[System 1 - Error]: {error_msg}"
+
+                message = current_response['message']
 
                 if 'tool_calls' in message and message['tool_calls']:
-                    # Handle tool calls
+                    if tool_iterations >= MAX_TOOL_ITERATIONS:
+                        logger.warning("ReAct loop: max tool iterations (%d) reached", MAX_TOOL_ITERATIONS)
+                        return "Tool execution limit reached without a final response."
+
                     tool_call = message['tool_calls'][0]['function']
                     tool_name = tool_call['name']
                     arguments = tool_call.get('arguments', {})
@@ -284,50 +297,63 @@ class CognitiveRouter:
                             suggested_tool_name=arguments.get("suggested_tool_name", "new_tool"),
                         )
 
-                    # Pause, call execute tool
                     tool_result = await self._execute_tool(tool_name, arguments)
+                    tool_iterations += 1
 
-                    # Build new messages for follow-up call (avoid malformed assistant messages)
-                    followup_messages = messages.copy()
-                    followup_messages.append({
+                    current_messages.append({
                         "role": "assistant",
                         "content": json.dumps({"tool_call": tool_name, "arguments": arguments})
                     })
-                    followup_messages.append({
+                    current_messages.append({
                         "role": "user",
                         "content": f"Tool result: {tool_result}"
                     })
 
-                    # Call model again with the correct model name
-                    final_response = await asyncio.wait_for(
+                    current_response = await asyncio.wait_for(
                         client.chat(
                             model=available_model,
-                            messages=followup_messages,
+                            messages=current_messages,
                             tools=active_tools
                         ),
                         timeout=60.0
                     )
+                    continue
 
-                    if final_response and 'message' in final_response and 'content' in final_response['message']:
-                        result = final_response['message']['content'].strip()
-                        if result:
-                            logger.info(f"System 1 response received after tool call ({len(result)} chars)")
-                            return result
-                    return "Tool executed but model produced no response."
-
-                # Standard text response
                 elif 'content' in message:
                     result = message['content'].strip()
+
+                    if not result and tool_iterations > 0:
+                        # Silent crash fix: LLM returned empty after a tool call — force continuation
+                        logger.info("ReAct loop: empty response after tool call, injecting continuation prompt")
+                        if tool_iterations >= MAX_TOOL_ITERATIONS:
+                            return "Tool execution limit reached without a final response."
+                        current_messages.append({
+                            "role": "user",
+                            "content": "Tool execution successful. Please continue with the next logical step or provide your final response to the user."
+                        })
+                        tool_iterations += 1
+                        current_response = await asyncio.wait_for(
+                            client.chat(
+                                model=available_model,
+                                messages=current_messages,
+                                tools=active_tools
+                            ),
+                            timeout=60.0
+                        )
+                        continue
+
                     if not result:
                         logger.warning("System 1 returned empty response")
                         return "[System 1 - Error]: Empty response from model"
-                    logger.info(f"System 1 response received ({len(result)} chars)")
+
+                    logger.info(f"System 1 response received after {tool_iterations} tool call(s) ({len(result)} chars)")
                     logger.debug(f"System 1 response: {result[:200]}...")
                     return result
 
-            error_msg = "Unexpected response format from Ollama"
-            logger.warning(error_msg)
-            return f"[System 1 - Error]: {error_msg}"
+                else:
+                    error_msg = "Unexpected response format from Ollama"
+                    logger.warning(error_msg)
+                    return f"[System 1 - Error]: {error_msg}"
 
         except Exception as e:
             error_msg = f"System 1 (Local Model) error: {str(e)}. Make sure Ollama is running with a model like 'gemma4:e4b' or 'gemma2' available."
@@ -553,47 +579,57 @@ Rules:
                 for tool in self.registry.get_schemas()
             ]
 
+            # ReAct loop — max 5 tool executions per turn to prevent infinite chaining
+            MAX_TOOL_ITERATIONS = 5
+            tool_iterations = 0
+            current_messages = list(messages)
+
             response = await self.groq_client.chat.completions.create(
                 model=self.groq_model,
-                messages=messages,
+                messages=current_messages,
                 tools=groq_tools,
                 tool_choice="auto",
                 max_tokens=2048,
             )
 
-            choice = response.choices[0]
+            while True:
+                choice = response.choices[0]
 
-            # Handle tool calls
-            if choice.finish_reason == "tool_calls" and choice.message.tool_calls:
-                tool_call = choice.message.tool_calls[0]
-                tool_name = tool_call.function.name
-                try:
-                    arguments = json.loads(tool_call.function.arguments)
-                except (json.JSONDecodeError, TypeError):
-                    arguments = {}
+                # Handle tool calls
+                if choice.finish_reason == "tool_calls" and choice.message.tool_calls:
+                    if tool_iterations >= MAX_TOOL_ITERATIONS:
+                        logger.warning("ReAct loop: max tool iterations (%d) reached", MAX_TOOL_ITERATIONS)
+                        return "Tool execution limit reached without a final response."
 
-                logger.info(f"Groq requested tool call: {tool_name}")
+                    tool_call = choice.message.tool_calls[0]
+                    tool_name = tool_call.function.name
+                    try:
+                        arguments = json.loads(tool_call.function.arguments)
+                    except (json.JSONDecodeError, TypeError):
+                        arguments = {}
 
-                # Security intercepts (same as System 1)
-                if tool_name == "request_core_update":
-                    raise RequiresMFAError(tool_name, arguments)
-                if tool_name == "ask_admin_for_guidance":
-                    raise RequiresHITLError(
-                        f"Guidance Needed: {arguments.get('context_summary', '')}\n"
-                        f"Question: {arguments.get('specific_question', '')}"
-                    )
-                if tool_name == "request_capability":
-                    raise RequiresCapabilitySynthesisError(
-                        gap_description=arguments.get("gap_description", "unspecified gap"),
-                        suggested_tool_name=arguments.get("suggested_tool_name", "new_tool"),
-                    )
+                    logger.info(f"Groq requested tool call: {tool_name}")
 
-                tool_result = await self._execute_tool(tool_name, arguments)
-                logger.info(f"Groq tool '{tool_name}' executed: {tool_result[:100]}")
+                    # Security intercepts (same as System 1)
+                    if tool_name == "request_core_update":
+                        raise RequiresMFAError(tool_name, arguments)
+                    if tool_name == "ask_admin_for_guidance":
+                        raise RequiresHITLError(
+                            f"Guidance Needed: {arguments.get('context_summary', '')}\n"
+                            f"Question: {arguments.get('specific_question', '')}"
+                        )
+                    if tool_name == "request_capability":
+                        raise RequiresCapabilitySynthesisError(
+                            gap_description=arguments.get("gap_description", "unspecified gap"),
+                            suggested_tool_name=arguments.get("suggested_tool_name", "new_tool"),
+                        )
 
-                # Follow-up in proper OpenAI tool-result format
-                followup_messages = list(messages) + [
-                    {
+                    tool_result = await self._execute_tool(tool_name, arguments)
+                    tool_iterations += 1
+                    logger.info(f"Groq tool '{tool_name}' executed: {tool_result[:100]}")
+
+                    # Append tool call + result in proper OpenAI format
+                    current_messages.append({
                         "role": "assistant",
                         "content": None,
                         "tool_calls": [{
@@ -601,27 +637,48 @@ Rules:
                             "type": "function",
                             "function": {"name": tool_name, "arguments": tool_call.function.arguments}
                         }]
-                    },
-                    {
+                    })
+                    current_messages.append({
                         "role": "tool",
                         "tool_call_id": tool_call.id,
                         "content": tool_result
-                    }
-                ]
+                    })
 
-                final_response = await self.groq_client.chat.completions.create(
-                    model=self.groq_model,
-                    messages=followup_messages,
-                    max_tokens=2048,
-                )
-                result = final_response.choices[0].message.content.strip()
-                logger.info(f"System 2 (Groq) response after tool call ({len(result)} chars)")
-                return result
+                    response = await self.groq_client.chat.completions.create(
+                        model=self.groq_model,
+                        messages=current_messages,
+                        tools=groq_tools,
+                        tool_choice="auto",
+                        max_tokens=2048,
+                    )
+                    continue
 
-            # Standard text response
-            result = choice.message.content.strip()
-            logger.info(f"System 2 (Groq) response received ({len(result)} chars)")
-            return result
+                # Standard text response
+                result = choice.message.content
+                if result:
+                    result = result.strip()
+
+                if not result and tool_iterations > 0:
+                    # Silent crash fix: LLM returned empty after a tool call — force continuation
+                    logger.info("ReAct loop: empty response after tool call, injecting continuation prompt")
+                    if tool_iterations >= MAX_TOOL_ITERATIONS:
+                        return "Tool execution limit reached without a final response."
+                    current_messages.append({
+                        "role": "user",
+                        "content": "Tool execution successful. Please continue with the next logical step or provide your final response to the user."
+                    })
+                    tool_iterations += 1
+                    response = await self.groq_client.chat.completions.create(
+                        model=self.groq_model,
+                        messages=current_messages,
+                        tools=groq_tools,
+                        tool_choice="auto",
+                        max_tokens=2048,
+                    )
+                    continue
+
+                logger.info(f"System 2 (Groq) response received after {tool_iterations} tool call(s) ({len(result or '')} chars)")
+                return result or ""
 
         except (RequiresMFAError, RequiresHITLError, RequiresCapabilitySynthesisError):
             raise

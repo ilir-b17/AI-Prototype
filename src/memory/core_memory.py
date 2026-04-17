@@ -65,7 +65,15 @@ class CoreMemory:
     def get_context_string(self) -> str:
         """Returns the core memory as a string formatted for Prompt injection."""
         state = self.get_all()
-        return f"<Core_Working_Memory>\n  <Current_Focus>{state.get('current_focus', '')}</Current_Focus>\n  <User_Preferences>{state.get('user_preferences', '')}</User_Preferences>\n</Core_Working_Memory>"
+        host_os = state.get('host_os', '')
+        os_line = f"\n  <Host_OS>{host_os}</Host_OS>" if host_os else ""
+        return (
+            f"<Core_Working_Memory>"
+            f"\n  <Current_Focus>{state.get('current_focus', '')}</Current_Focus>"
+            f"\n  <User_Preferences>{state.get('user_preferences', '')}</User_Preferences>"
+            f"{os_line}"
+            f"\n</Core_Working_Memory>"
+        )
 
     def update(self, key: str, value: Any) -> bool:
         """Updates a specific key in core memory."""

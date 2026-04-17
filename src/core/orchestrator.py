@@ -67,6 +67,9 @@ class Orchestrator:
             self.core_memory = CoreMemory(memory_file_path=core_memory_path)
             self.cognitive_router = CognitiveRouter(model_name=gemini_model, local_model=local_model)
 
+            # Dynamically record the host OS so every system prompt stays accurate
+            self.core_memory.update("host_os", platform.system())
+
             self.charter_text = self._load_charter()
             self.pending_mfa = {}
             self.pending_hitl_state = {}
@@ -324,6 +327,9 @@ class Orchestrator:
             f"Reply in plain conversational text, no markdown headers. "
             f"Private reasoning: wrap in <think>...</think> — it will be stripped.\n\n"
             f"{self._get_sensory_context()}\n\n"
+            f"OS CONTEXT: You are running on {self.sensory_state.get('os', platform.system())}. "
+            f"Use OS-appropriate shell commands (e.g., 'dir' instead of 'ls' on Windows). "
+            f"Preferentially use your `manage_file_system` Python tool for OS-agnostic file exploration.\n\n"
             f"{self.charter_text}\n{core_mem_str}\n\n"
             f"{capabilities_str}\n\n"
             f"Respond to the user, then on the very last line declare which workers are needed.\n"
