@@ -18,7 +18,6 @@ from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 from telegram.error import Conflict
 from src.core.orchestrator import Orchestrator
-from src.memory.ledger_db import LedgerMemory
 
 # Ensure stdout/stderr use UTF-8 on Windows so Unicode log characters don't crash
 if hasattr(sys.stdout, "reconfigure"):
@@ -212,16 +211,20 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
 
 async def goals(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """/goals â€" list all active objectives grouped by tier."""
+    """/goals — list all active objectives grouped by tier."""
     if not is_authorized(update.effective_user.id):
         await update.message.reply_text(_UNAUTHORIZED_MSG)
         return
 
     try:
-        ledger = LedgerMemory()
-        await ledger.initialize()
+        # Re-use the orchestrator's existing LedgerMemory connection (ISSUE-003).
+        # Opening a second aiosqlite connection to the same file can cause
+        # "database is locked" errors under concurrent access.
+        ledger = context.bot_data.get("ledger")
+        if ledger is None:
+            await update.message.reply_text("System error: Ledger not available.")
+            return
         items = await ledger.get_all_active_goals()
-        await ledger.close()
 
         if not items:
             await update.message.reply_text("Backlog is empty. Use /addgoal to add objectives.")
@@ -271,10 +274,12 @@ async def addgoal(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     title = " ".join(args[2:])
 
     try:
-        ledger = LedgerMemory()
-        await ledger.initialize()
+        # Re-use the orchestrator's existing LedgerMemory connection (ISSUE-003).
+        ledger = context.bot_data.get("ledger")
+        if ledger is None:
+            await update.message.reply_text("System error: Ledger not available.")
+            return
         obj_id = await ledger.add_objective(tier=tier, title=title, estimated_energy=energy, origin="Admin")
-        await ledger.close()
         await update.message.reply_text(
             f"Added to backlog:\n  #{obj_id} [{tier}] {title}\n  Estimated Energy: {energy}"
         )
@@ -325,35 +330,37 @@ async def restart(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """
     Handle errors from the Telegram API and application.
-    Implements intelligent backoff for Conflict (409) errors.
-    
-    Args:
-        update: The update from Telegram.
-        context: The context with error information.
+    Implements exponential backoff for Conflict (409) errors (ISSUE-014).
+
+    The handler IS async, so the sleep is awaited directly — this is
+    intentional: it applies real back-pressure before the next polling
+    cycle rather than only logging a "waiting" message that is never acted on.
     """
     global consecutive_conflicts
-    
+
     error = context.error
-    
+
     # Log all errors
     logger.error(f"Telegram API error: {error}", exc_info=True)
-    
+
     # Special handling for Conflict errors - these are recoverable
     if isinstance(error, Conflict):
         consecutive_conflicts += 1
-        
-        # Implement exponential backoff: wait longer as conflicts accumulate
-        wait_time = min(2 ** consecutive_conflicts, 60)  # Max 60 seconds
-        logger.warning(f"Polling conflict #{consecutive_conflicts} detected. Waiting {wait_time}s before retry...")
-        
-        # Note: We cannot await sleep in an async-unsafe context here.
-        # The Application will retry automatically; we just log the backoff intention.
-        # The exponential backoff is implemented at the polling level via poll_interval
+
+        # Exponential backoff: cap at 60 seconds
+        wait_time = min(2 ** consecutive_conflicts, 60)
+        logger.warning(
+            f"Polling conflict #{consecutive_conflicts} detected. "
+            f"Sleeping {wait_time}s before next poll cycle..."
+        )
+        # Actually enforce the backoff — this is safe to await inside an
+        # async error handler (ISSUE-014).
+        await asyncio.sleep(wait_time)
         return
-    
+
     # Reset conflict counter on other errors (indicates we recovered)
     consecutive_conflicts = 0
-    
+
     # For other errors, try to notify the user if we have an update
     if update and update.effective_message:
         try:
@@ -385,6 +392,11 @@ async def _async_run(application: Application, orchestrator_inst: "Orchestrator"
         await orchestrator_inst.async_init()
         outbound_queue: asyncio.Queue = asyncio.Queue()
         orchestrator_inst.outbound_queue = outbound_queue
+
+        # Expose the orchestrator's existing LedgerMemory connection so that
+        # command handlers (/goals, /addgoal) can re-use it instead of opening
+        # a second parallel connection to the same DB (ISSUE-003).
+        application.bot_data["ledger"] = orchestrator_inst.ledger_memory
 
         _heartbeat_task = asyncio.create_task(orchestrator_inst._heartbeat_loop())
         _sensory_task   = asyncio.create_task(orchestrator_inst._sensory_update_loop())

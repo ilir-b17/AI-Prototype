@@ -82,6 +82,19 @@ _BLOCKED_TOP_LEVEL_MODULES = {
     "os", "sys", "subprocess", "shutil", "pathlib", "socket",
     "importlib", "builtins", "ctypes", "multiprocessing", "threading",
     "signal", "pty", "popen", "pexpect", "atexit", "gc",
+    # Additional dangerous modules blocked to close sandbox escape paths:
+    "asyncio",      # asyncio.create_subprocess_shell/exec can launch child processes
+    "concurrent",   # concurrent.futures.ProcessPoolExecutor / ThreadPoolExecutor
+    "runpy",        # runpy.run_path() executes arbitrary code files
+    "code",         # interactive Python interpreter
+    "codeop",       # compile/execute helper used by interactive interpreter
+    "compileall",   # mass-compilation of Python source trees
+    "tempfile",     # can write arbitrary files to the filesystem
+    "mmap",         # raw memory-mapped file access
+    "pickle",       # arbitrary code execution via __reduce__ / __getstate__
+    "marshal",      # low-level serialization; can reconstruct code objects
+    "shelve",       # uses pickle internally
+    "ast",          # can parse/compile/reconstruct blocked expressions at runtime
 }
 
 logger = logging.getLogger(__name__)
@@ -685,7 +698,7 @@ class CognitiveRouter:
 
         except Exception as e:
             logger.error(f"System 2 (Gemini) error: {str(e)}", exc_info=True)
-            raise
+            return RouterResult(status="ok", content=f"[System 2 - Error]: {str(e)[:200]}")
 
     async def synthesize_tool(
         self,
@@ -797,7 +810,6 @@ Rules:
         return result
 
     @staticmethod
-    @staticmethod
     def _check_blocked_import(module_name: str, tool_name: str) -> None:
         """Raise ValueError if *module_name*'s top-level package is blocked."""
         base = module_name.split(".")[0]
@@ -807,6 +819,7 @@ Rules:
                 f"Blocked modules: {sorted(_BLOCKED_TOP_LEVEL_MODULES)}"
             )
 
+    @staticmethod
     def _validate_tool_code_ast(code: str, tool_name: str) -> None:
         """
         Parse the synthesised code as an AST and reject any import that
@@ -1095,4 +1108,4 @@ Rules:
                 return RouterResult(status="ok", content=result)
 
             logger.error(f"Groq error: {e}", exc_info=True)
-            raise
+            return RouterResult(status="ok", content=f"[System 2 - Error]: {str(e)[:200]}")
