@@ -109,6 +109,25 @@ class SkillRegistry:
         alias_map = {
             "extract_text_from_file": "extract_pdf_text",
             "extract_text": "extract_pdf_text",
+            "extract_pdf_text_from_file": "extract_pdf_text",
+            "read_pdf": "extract_pdf_text",
+            "pdf_extract": "extract_pdf_text",
+            "search_web": "web_search",
+            "google_search": "web_search",
+            "run_python": "execute_python_sandbox",
+            "python_execute": "execute_python_sandbox",
+            "run_command": "run_terminal_command",
+            "execute_command": "run_terminal_command",
+            "file_system": "manage_file_system",
+            "read_file": "manage_file_system",
+            "write_file": "manage_file_system",
+            "stock_price": "get_stock_price",
+            "fetch_stock": "get_stock_price",
+            "analyze_csv": "analyze_table_file",
+            "analyze_excel": "analyze_table_file",
+            "extract_article": "extract_web_article",
+            "fetch_article": "extract_web_article",
+            "scrape_web": "extract_web_article",
         }
         tool_name = alias_map.get(tool_name, tool_name)
 
@@ -136,6 +155,10 @@ class SkillRegistry:
 
     def __len__(self) -> int:
         return len(self._skills)
+
+    def get_skill_names(self) -> List[str]:
+        """Return a sorted list of all registered skill names."""
+        return sorted(self._skills.keys())
 
     def __contains__(self, name: str) -> bool:
         return name in self._skills

@@ -8,6 +8,7 @@ System 2: Cloud LLM for complex reasoning. Provider priority:
 """
 
 import ast
+import difflib
 import os
 import logging
 import json
@@ -103,6 +104,9 @@ class CognitiveRouter:
         Security intercepts (MFA / HITL / capability synthesis) are handled
         here, returning a structured :class:`RouterResult` rather than raising.
         """
+        # Normalize hallucinated / malformed tool names
+        tool_name = self._normalize_tool_name(tool_name)
+
         logger.info(f"Executing tool: {tool_name} with args: {list(arguments.keys())}")
 
         # ── Security intercepts ──────────────────────────────────────────────
@@ -263,7 +267,43 @@ class CognitiveRouter:
 
     @staticmethod
     def _is_pdf_extraction_tool(tool_name: str) -> bool:
-        return tool_name in {"extract_pdf_text", "extract_text_from_file", "extract_text"}
+        _pdf_variants = {
+            "extract_pdf_text", "extract_text_from_file", "extract_text",
+            "extract_pdf_text_from_file", "read_pdf", "pdf_extract",
+        }
+        return tool_name in _pdf_variants
+
+    def _normalize_tool_name(self, raw_name: str) -> str:
+        """Best-effort normalization of hallucinated tool names.
+
+        Steps:
+        1. Strip namespace prefixes (e.g. ``skill:func`` → ``func``).
+        2. Check the skill registry alias map (exact match).
+        3. Fuzzy-match against registered skill names using difflib.
+        """
+        if not raw_name:
+            return raw_name
+
+        # Strip colon-separated namespace prefix
+        if ":" in raw_name:
+            raw_name = raw_name.rsplit(":", 1)[-1].strip()
+
+        # Already a registered name?
+        skill_names = self.registry.get_skill_names()
+        if raw_name in skill_names:
+            return raw_name
+
+        # Underscore-normalized lookup (e.g., "extractPdfText" won't match,
+        # but "extract_pdf_text_from_file" might after alias map in registry)
+        # Let the registry alias map handle it — but try fuzzy match first
+        matches = difflib.get_close_matches(raw_name, skill_names, n=1, cutoff=0.6)
+        if matches:
+            resolved = matches[0]
+            logger.info(f"Fuzzy-matched tool name '{raw_name}' → '{resolved}'")
+            return resolved
+
+        # Return as-is; registry.execute() will return an error for unknowns
+        return raw_name
 
     @staticmethod
     def _extract_failed_generation(err_text: str) -> str:
@@ -426,6 +466,9 @@ class CognitiveRouter:
                 raw_args = dict(raw_args) if raw_args else {}
             if not tool_name:
                 raise ValueError(f"Tool call missing 'name': {raw_tc!r}")
+            # Strip namespace prefix (e.g. "extract_pdf_text:extract_pdf_text" → "extract_pdf_text")
+            if ":" in tool_name:
+                tool_name = tool_name.rsplit(":", 1)[-1].strip()
             return tool_name, raw_args, True
         except Exception as exc:
             logger.error(f"Failed to parse tool_calls: {exc!r}", exc_info=True)
