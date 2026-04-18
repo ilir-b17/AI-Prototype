@@ -141,6 +141,12 @@ class SkillRegistry:
             result = skill["fn"](**arguments)
             if asyncio.iscoroutine(result):
                 return await result
+            if asyncio.isasyncgen(result):
+                # Drain async generator and concatenate string chunks
+                parts = []
+                async for chunk in result:
+                    parts.append(str(chunk))
+                return "\n".join(parts)
             return result
         except TypeError as exc:
             return f"Error: Bad arguments for '{tool_name}': {exc}"

@@ -156,6 +156,13 @@ class LedgerMemory:
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 )
             """)
+            await self._db.execute("""
+                CREATE TABLE IF NOT EXISTS pending_hitl_states (
+                    user_id TEXT NOT NULL PRIMARY KEY,
+                    state_json TEXT NOT NULL,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            """)
             await self._db.commit()
         logger.debug("Database tables initialized")
 
@@ -521,5 +528,50 @@ class LedgerMemory:
         async with self._lock:
             await self._db.execute(
                 "DELETE FROM pending_tool_approvals WHERE user_id=?", (user_id,)
+            )
+            await self._db.commit()
+
+    # ─────────────────────────────────────────────────────────────
+    # HITL State Persistence  (survive bot restarts)
+    # ─────────────────────────────────────────────────────────────
+
+    async def save_hitl_state(self, user_id: str, state: dict) -> None:
+        """Persist a HITL state dict so it survives a bot restart."""
+        import json as _json
+        try:
+            state_json = _json.dumps(state)
+        except (TypeError, ValueError) as e:
+            logger.warning(f"HITL state for '{user_id}' is not JSON-serializable, skipping persistence: {e}")
+            return
+        async with self._lock:
+            await self._db.execute(
+                "INSERT INTO pending_hitl_states (user_id, state_json) "
+                "VALUES (?, ?) ON CONFLICT(user_id) DO UPDATE SET "
+                "state_json=excluded.state_json, created_at=CURRENT_TIMESTAMP",
+                (user_id, state_json),
+            )
+            await self._db.commit()
+
+    async def load_hitl_states(self) -> dict:
+        """Return {user_id: state_dict} for all persisted HITL states."""
+        import json as _json
+        async with self._lock:
+            cursor = await self._db.execute(
+                "SELECT user_id, state_json FROM pending_hitl_states"
+            )
+            rows = await cursor.fetchall()
+        result = {}
+        for row in rows:
+            try:
+                result[row["user_id"]] = _json.loads(row["state_json"])
+            except Exception as e:
+                logger.warning(f"Could not deserialize HITL state for user '{row['user_id']}': {e}")
+        return result
+
+    async def clear_hitl_state(self, user_id: str) -> None:
+        """Remove a persisted HITL state after it is resumed or abandoned."""
+        async with self._lock:
+            await self._db.execute(
+                "DELETE FROM pending_hitl_states WHERE user_id=?", (user_id,)
             )
             await self._db.commit()

@@ -247,10 +247,27 @@ class VectorMemory:
     def close(self) -> None:
         """
         Close the ChromaDB client and release resources.
+
+        Drops the collection reference first to prevent racing async wrappers
+        from touching it after the client is gone.  Then attempts to stop the
+        ChromaDB internal system (persist thread / connection pool) before
+        nulling the client reference.
         """
         try:
-            if hasattr(self, 'client') and self.client:
-                # ChromaDB doesn't have an explicit close, but we can set to None
+            # Drop the collection reference before touching the client so that
+            # any concurrent asyncio.to_thread() calls see None and raise an
+            # AttributeError rather than accessing a half-torn-down client.
+            if hasattr(self, 'collection') and self.collection is not None:
+                self.collection = None
+
+            if hasattr(self, 'client') and self.client is not None:
+                # Attempt to stop ChromaDB's internal background system
+                # (persist thread, HNSW index, etc.) gracefully.
+                try:
+                    if hasattr(self.client, '_system') and hasattr(self.client._system, 'stop'):
+                        self.client._system.stop()
+                except Exception:
+                    pass  # Best-effort — client may not expose _system
                 logger.info("Closing VectorMemory connections")
                 self.client = None
         except Exception as e:

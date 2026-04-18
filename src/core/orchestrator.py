@@ -84,6 +84,11 @@ class Orchestrator:
             self.pending_tool_approval: Dict[str, dict] = {}
             self.outbound_queue: Optional[asyncio.Queue] = None
             self.sensory_state: Dict[str, str] = {}
+            # Background task registry — holds strong references to prevent GC (ISSUE-002)
+            self._background_tasks: set = set()
+            # Per-user async locks to serialise concurrent messages (ISSUE-012)
+            self._user_locks: Dict[str, asyncio.Lock] = {}
+            self._user_locks_lock: asyncio.Lock = asyncio.Lock()
             self._refresh_sensory_state()
 
             logger.info("Orchestrator __init__ complete — call async_init() to finish setup")
@@ -101,6 +106,7 @@ class Orchestrator:
         await self.ledger_memory.seed_initial_goals()
         await self._load_approved_tools()
         await self._load_pending_approvals()
+        await self._load_pending_hitl()
         # Record the host OS now that we're in an async context
         await self.core_memory.update("host_os", platform.system())
         logger.info("Orchestrator async_init complete")
@@ -202,6 +208,7 @@ class Orchestrator:
             "iteration_count": 0,
             "admin_guidance": "",
             "energy_remaining": 100,
+            "hitl_count": 0,
         }
 
     def _deduct_energy(self, state: Dict[str, Any], amount: int, reason: str) -> Dict[str, Any]:
@@ -317,57 +324,78 @@ class Orchestrator:
         Proactive Heartbeat: wakes every 30 min, queries the Objective Backlog
         for the highest-priority pending Task, processes it if energy allows,
         then notifies the admin with a summary.
+
+        An asyncio.Lock prevents heartbeat cycles from overlapping: if the
+        previous run is still in progress when the next interval fires, the
+        new cycle is skipped (ISSUE-004).  A hard timeout of 90% of the
+        heartbeat interval caps individual task execution time.
         """
         logger.info("Heartbeat loop started.")
+        _heartbeat_lock = asyncio.Lock()
         while True:
             await asyncio.sleep(HEARTBEAT_INTERVAL)
-            try:
-                logger.info("Heartbeat: Querying objective backlog...")
-                task = await self.ledger_memory.get_highest_priority_task()
+            if _heartbeat_lock.locked():
+                logger.warning("Heartbeat: Previous run still in progress. Skipping this cycle.")
+                continue
+            async with _heartbeat_lock:
+                try:
+                    logger.info("Heartbeat: Querying objective backlog...")
+                    task = await self.ledger_memory.get_highest_priority_task()
 
-                if not task:
-                    logger.info("Heartbeat: Backlog is empty. Nothing to do.")
-                    continue
+                    if not task:
+                        logger.info("Heartbeat: Backlog is empty. Nothing to do.")
+                        continue
 
-                energy_available = 100  # Heartbeat starts with full budget
-                if task["estimated_energy"] > energy_available:
-                    logger.info(
-                        f"Heartbeat: Task #{task['id']} needs {task['estimated_energy']} energy "
-                        f"but only {energy_available} available. Skipping."
+                    energy_available = 100  # Heartbeat starts with full budget
+                    if task["estimated_energy"] > energy_available:
+                        logger.info(
+                            f"Heartbeat: Task #{task['id']} needs {task['estimated_energy']} energy "
+                            f"but only {energy_available} available. Skipping."
+                        )
+                        continue
+
+                    logger.info(f"Heartbeat: Accepting task #{task['id']}: {task['title'][:60]}")
+                    await self.ledger_memory.update_objective_status(task["id"], "active")
+
+                    try:
+                        result = await asyncio.wait_for(
+                            self.process_message(
+                                user_message=(
+                                    f"[HEARTBEAT TASK #{task['id']}]: {task['title']}\n"
+                                    f"You MUST execute this task right now by calling the appropriate tools. "
+                                    f"Do NOT describe what you plan to do — use your tools and report the actual results. "
+                                    f"If the task requires storing data, call update_core_memory or update_ledger explicitly. "
+                                    f"If you cannot complete it, explain exactly why."
+                                ),
+                                user_id="heartbeat"
+                            ),
+                            timeout=HEARTBEAT_INTERVAL * 0.9,  # 27-minute hard cap
+                        )
+                    except asyncio.TimeoutError:
+                        logger.error(
+                            f"Heartbeat: Task #{task['id']} timed out after "
+                            f"{int(HEARTBEAT_INTERVAL * 0.9)}s. Marking pending."
+                        )
+                        await self.ledger_memory.update_objective_status(task["id"], "pending")
+                        continue
+
+                    # Only mark completed if the result isn't an error or refusal
+                    status = "completed"
+                    if any(w in result.lower() for w in ("error", "cannot", "unable", "failed", "i cannot", "i am unable")):
+                        status = "pending"
+                        logger.warning(f"Heartbeat: Task #{task['id']} may not have completed — marking pending. Result: {result[:100]}")
+                    await self.ledger_memory.update_objective_status(task["id"], status)
+
+                    summary = (
+                        f"Heartbeat completed task #{task['id']}:\n"
+                        f"  Task: {task['title']}\n"
+                        f"  Result: {result[:200]}"
                     )
-                    continue
+                    await self._notify_admin(summary)
+                    logger.info(f"Heartbeat: Task #{task['id']} completed.")
 
-                logger.info(f"Heartbeat: Accepting task #{task['id']}: {task['title'][:60]}")
-                await self.ledger_memory.update_objective_status(task["id"], "active")
-
-                result = await self.process_message(
-                    user_message=(
-                        f"[HEARTBEAT TASK #{task['id']}]: {task['title']}\n"
-                        f"You MUST execute this task right now by calling the appropriate tools. "
-                        f"Do NOT describe what you plan to do — use your tools and report the actual results. "
-                        f"If the task requires storing data, call update_core_memory or update_ledger explicitly. "
-                        f"If you cannot complete it, explain exactly why."
-                    ),
-                    user_id="heartbeat"
-                )
-
-                # Only mark completed if the result isn't an error or refusal
-                status = "completed"
-                if any(w in result.lower() for w in ("error", "cannot", "unable", "failed", "i cannot", "i am unable")):
-                    status = "pending"
-                    logger.warning(f"Heartbeat: Task #{task['id']} may not have completed — marking pending. Result: {result[:100]}")
-                await self.ledger_memory.update_objective_status(task["id"], status)
-
-                summary = (
-                    f"Heartbeat completed task #{task['id']}:\n"
-                    f"  Task: {task['title']}\n"
-                    f"  Result: {result[:200]}"
-                )
-                await self._notify_admin(summary)
-                logger.info(f"Heartbeat: Task #{task['id']} completed.")
-
-            except Exception as e:
-                logger.error(f"Heartbeat error: {e}", exc_info=True)
+                except Exception as e:
+                    logger.error(f"Heartbeat error: {e}", exc_info=True)
 
     async def _memory_consolidation_loop(self) -> None:
         """Background task: periodically consolidate chat history into long-term memory."""
@@ -429,6 +457,41 @@ class Orchestrator:
                 logger.info(f"Restored {len(pending)} pending tool approval(s) from DB")
         except Exception as e:
             logger.warning(f"_load_pending_approvals failed: {e}")
+
+    async def _load_pending_hitl(self) -> None:
+        """Reload any HITL states that were persisted before the last shutdown (ISSUE-013)."""
+        try:
+            states = await self.ledger_memory.load_hitl_states()
+            for user_id, state in states.items():
+                self.pending_hitl_state[user_id] = state
+            if states:
+                logger.info(f"Restored {len(states)} pending HITL state(s) from DB")
+                # Notify admin so they know the context survived the restart
+                await self._notify_admin(
+                    f"⚠️ AIDEN restarted with {len(states)} pending HITL workflow(s) restored. "
+                    f"Affected user(s): {', '.join(states.keys())}. Reply to continue."
+                )
+        except Exception as e:
+            logger.warning(f"_load_pending_hitl failed: {e}")
+
+    def _fire_and_forget(self, coro) -> asyncio.Task:
+        """Schedule a coroutine as a background task with a strong GC-safe reference (ISSUE-002).
+
+        The task is added to ``_background_tasks`` and automatically removed
+        when it completes, so the set never grows unboundedly while still
+        preventing the garbage collector from destroying mid-flight tasks.
+        """
+        task = asyncio.create_task(coro)
+        self._background_tasks.add(task)
+        task.add_done_callback(self._background_tasks.discard)
+        return task
+
+    async def _get_user_lock(self, user_id: str) -> asyncio.Lock:
+        """Return the per-user asyncio.Lock, creating it lazily (ISSUE-012)."""
+        async with self._user_locks_lock:
+            if user_id not in self._user_locks:
+                self._user_locks[user_id] = asyncio.Lock()
+            return self._user_locks[user_id]
 
     async def tool_synthesis_node(
         self,
@@ -781,7 +844,7 @@ class Orchestrator:
         )
         if exec_result.status == "ok":
             return exec_result.content
-        return self._handle_blocked_result(exec_result, pending_tool.get("user_id", user_id), {})
+        return await self._handle_blocked_result(exec_result, pending_tool.get("user_id", user_id), {})
 
     async def _try_resume_tool_approval(self, user_id: str, user_message: str) -> Optional[str]:
         """Handle YES/NO tool synthesis approval. Returns a reply string, or None if not pending."""
@@ -816,11 +879,32 @@ class Orchestrator:
         """Return a state dict: resumes a HITL conversation if pending, else creates fresh."""
         if user_id in self.pending_hitl_state:
             state = self.pending_hitl_state.pop(user_id)
+            # Clear the persisted DB record now that we've resumed (ISSUE-013)
+            try:
+                await self.ledger_memory.clear_hitl_state(user_id)
+            except Exception as e:
+                logger.warning(f"Failed to clear HITL state from DB for {user_id}: {e}")
             state["admin_guidance"] = user_message
             state["user_input"] += f"\n[ADMIN GUIDANCE: {user_message}]"
             state["iteration_count"] = 0
             state["current_plan"] = []
-            state["energy_remaining"] = min(state.get("energy_remaining", 0) + 50, 100)
+            # Track how many HITL cycles have been spent on this task (ISSUE-005)
+            state["hitl_count"] = state.get("hitl_count", 0) + 1
+            # Cap recharge to 75 so energy budget is never fully restored — this
+            # ensures a perpetually failing task eventually becomes unrecoverable
+            # rather than cycling indefinitely at full energy (ISSUE-005).
+            state["energy_remaining"] = min(state.get("energy_remaining", 0) + 50, 75)
+            # If the admin has guided this task 3+ times without success, abandon it
+            if state["hitl_count"] >= 3:
+                logger.warning(
+                    f"HITL cycle limit (3) reached for user {user_id}. "
+                    f"Abandoning task: {state.get('user_input', '')[:80]}"
+                )
+                state["final_response"] = (
+                    "This task has been attempted 3 times with admin guidance and "
+                    "could not be completed. The request has been abandoned to prevent "
+                    "an infinite loop. Please rephrase or break it into smaller steps."
+                )
             return state
         state = self._new_state(user_id, user_message)
         if user_id != "heartbeat":
@@ -834,9 +918,14 @@ class Orchestrator:
         """Execute the supervisor → workers → critic loop. Returns the final sanitized response."""
         max_iterations = 3
 
+        # Fast-exit if the state already carries a final response before we enter
+        # the loop — e.g. when the HITL cycle limit has been reached (ISSUE-005).
+        if state.get("final_response") and not state.get("current_plan"):
+            return self.cognitive_router.sanitize_response(state["final_response"])
+
         while state["iteration_count"] < max_iterations:
             if state.get(_BLOCKED_KEY):
-                return self._handle_blocked_result(state.pop(_BLOCKED_KEY), user_id, state)
+                return await self._handle_blocked_result(state.pop(_BLOCKED_KEY), user_id, state)
 
             if not state["current_plan"] and state["iteration_count"] == 0:
                 state = await self.supervisor_node(state)
@@ -844,7 +933,7 @@ class Orchestrator:
                 state["user_input"] += f"\n[CRITIC FEEDBACK: {state['critic_feedback']}. Fix your output.]"
 
             if state.get(_BLOCKED_KEY):
-                return self._handle_blocked_result(state.pop(_BLOCKED_KEY), user_id, state)
+                return await self._handle_blocked_result(state.pop(_BLOCKED_KEY), user_id, state)
 
             if not state["current_plan"] and state.get("final_response"):
                 break
@@ -855,7 +944,7 @@ class Orchestrator:
                 elif "coder" in task.lower():
                     state = await self.coder_agent(state)
                 if state.get(_BLOCKED_KEY):
-                    return self._handle_blocked_result(state.pop(_BLOCKED_KEY), user_id, state)
+                    return await self._handle_blocked_result(state.pop(_BLOCKED_KEY), user_id, state)
 
             if not state["current_plan"] and not state.get("final_response"):
                 state["final_response"] = "No response could be generated. Please try again."
@@ -864,13 +953,16 @@ class Orchestrator:
             state = await self.critic_node(state)
 
             if state.get(_BLOCKED_KEY):
-                return self._handle_blocked_result(state.pop(_BLOCKED_KEY), user_id, state)
+                return await self._handle_blocked_result(state.pop(_BLOCKED_KEY), user_id, state)
 
             if state["critic_feedback"] == "PASS":
                 break
             logger.warning(f"Critic rejected output on iteration {state['iteration_count']}")
             state["final_response"] = ""
             state["worker_outputs"] = {}
+            # Clear the stale plan so the supervisor re-plans with the Critic
+            # feedback injected into user_input (ISSUE-006).
+            state["current_plan"] = []
 
         if state["iteration_count"] >= max_iterations and state.get("critic_feedback") != "PASS":
             state["final_response"] = "Unable to fulfill this request — output repeatedly failed internal safety checks."
@@ -894,9 +986,11 @@ class Orchestrator:
                 await self.ledger_memory.save_chat_turn(user_id, "assistant", final_resp)
             except Exception as e:
                 logger.warning(f"Failed to save chat turn for {user_id}: {e}")
-            _consolidate_task = asyncio.create_task(self._consolidate_memory(user_id))
+            # Use _fire_and_forget to keep a strong reference preventing GC (ISSUE-002)
+            self._fire_and_forget(self._consolidate_memory(user_id))
 
-        _save_memory_task = asyncio.create_task(
+        # Use _fire_and_forget to keep a strong reference preventing GC (ISSUE-002)
+        self._fire_and_forget(
             self._save_memory_async(f"User: {user_message}\nAssistant: {final_resp}")
         )
         return final_resp
@@ -906,26 +1000,33 @@ class Orchestrator:
         if not user_message:
             return "Error: Invalid message"
 
-        reply = await self._try_resume_mfa(user_id, user_message)
-        if reply is not None:
-            return reply
+        # Serialise concurrent messages for the same user_id to prevent
+        # race conditions on pending_mfa / pending_hitl_state / pending_tool_approval
+        # dicts (ISSUE-012).  Different users are still processed concurrently.
+        lock = await self._get_user_lock(user_id)
+        async with lock:
+            reply = await self._try_resume_mfa(user_id, user_message)
+            if reply is not None:
+                return reply
 
-        reply = await self._try_resume_tool_approval(user_id, user_message)
-        if reply is not None:
-            return reply
+            reply = await self._try_resume_tool_approval(user_id, user_message)
+            if reply is not None:
+                return reply
 
-        state = await self._load_state(user_id, user_message)
+            state = await self._load_state(user_id, user_message)
 
-        try:
-            return await self._run_graph_loop(state, user_id, user_message)
-        except RequiresHITLError as hitl_err:
-            self.pending_hitl_state[user_id] = state
-            return str(hitl_err)
-        except Exception as e:
-            logger.error(f"Graph execution failed: {e}", exc_info=True)
-            return "An internal error occurred."
+            try:
+                return await self._run_graph_loop(state, user_id, user_message)
+            except RequiresHITLError as hitl_err:
+                self.pending_hitl_state[user_id] = state
+                # Persist so the state survives a bot restart (ISSUE-013)
+                self._fire_and_forget(self.ledger_memory.save_hitl_state(user_id, state))
+                return str(hitl_err)
+            except Exception as e:
+                logger.error(f"Graph execution failed: {e}", exc_info=True)
+                return "An internal error occurred."
 
-    def _handle_blocked_result(
+    async def _handle_blocked_result(
         self,
         result: RouterResult,
         user_id: str,
@@ -944,12 +1045,14 @@ class Orchestrator:
 
         if result.status == "hitl_required":
             self.pending_hitl_state[user_id] = state
+            # Persist so the HITL state survives a bot restart (ISSUE-013)
+            self._fire_and_forget(self.ledger_memory.save_hitl_state(user_id, state))
             return result.hitl_message
 
         if result.status == "capability_gap":
-            # Run synthesis synchronously via create_task — result will come back
-            # in a follow-up message after the Admin approves/rejects.
-            _synthesis_task = asyncio.create_task(self._async_tool_synthesis(user_id, result, state))
+            # Run synthesis in the background via _fire_and_forget which holds
+            # a strong GC-safe reference (ISSUE-002).
+            self._fire_and_forget(self._async_tool_synthesis(user_id, result, state))
             return (
                 f"I identified a capability gap: {result.gap_description}. "
                 f"Requesting tool synthesis from System 2..."
