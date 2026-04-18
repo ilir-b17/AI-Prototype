@@ -82,11 +82,17 @@ class CoreMemory:
         state = await self.get_all()
         host_os = state.get('host_os', '')
         os_line = f"\n  <Host_OS>{host_os}</Host_OS>" if host_os else ""
+        summary = state.get('conversation_summary', '')
+        summary_line = f"\n  <Conversation_Summary>{summary}</Conversation_Summary>" if summary else ""
+        insights = state.get('consolidated_insights', '')
+        insights_line = f"\n  <Consolidated_Insights>{insights}</Consolidated_Insights>" if insights else ""
         return (
             f"<Core_Working_Memory>\n"
             f"  <Current_Focus>{state.get('current_focus', '')}</Current_Focus>\n"
             f"  <User_Preferences>{state.get('user_preferences', '')}</User_Preferences>"
-            f"{os_line}\n"
+            f"{os_line}"
+            f"{summary_line}"
+            f"{insights_line}\n"
             f"</Core_Working_Memory>"
         )
 

@@ -5,6 +5,16 @@ import logging
 
 logger = logging.getLogger(__name__)
 
+def _read_pdf(file_path: str) -> str:
+    from pypdf import PdfReader
+    reader = PdfReader(file_path)
+    pages = []
+    for page in reader.pages:
+        text = page.extract_text()
+        if text:
+            pages.append(text)
+    return "\n\n".join(pages) if pages else "(No extractable text found in PDF)"
+
 async def manage_file_system(action: str, file_path: str, content: str = None) -> str:
     """
     Manages file system operations.
@@ -21,7 +31,12 @@ async def manage_file_system(action: str, file_path: str, content: str = None) -
             if not os.path.exists(file_path) or not os.path.isfile(file_path):
                 return f"Error: File not found or is a directory - {file_path}"
 
-            async with aiofiles.open(file_path, mode='r') as f:
+            if file_path.lower().endswith('.pdf'):
+                loop = asyncio.get_event_loop()
+                data = await loop.run_in_executor(None, _read_pdf, file_path)
+                return data
+
+            async with aiofiles.open(file_path, mode='r', encoding='utf-8', errors='replace') as f:
                 data = await f.read()
             return data
 

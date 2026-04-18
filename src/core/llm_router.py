@@ -13,6 +13,7 @@ import logging
 import json
 import asyncio
 import re
+import time
 from dataclasses import dataclass, field
 from typing import Optional, Dict, Any, List
 from google import genai
@@ -182,15 +183,27 @@ class CognitiveRouter:
         logger.debug(f"sanitize_response output preview: {logged!r}")
         return text.strip()
 
-    def __init__(self, model_name: str = "gemini-2.0-flash", local_model: str = "gemma4:e4b") -> None:
+    def __init__(self, model_name: str = "gemini-2.0-flash", local_model: str = "gemma4:26b") -> None:
         self.model_name = model_name
-        self.local_model = local_model
+        self.local_model = os.getenv("OLLAMA_MODEL", local_model)
+        env_timeout = os.getenv("OLLAMA_TIMEOUT", "").strip()
+        if env_timeout:
+            self._ollama_timeout = float(env_timeout)
+        else:
+            self._ollama_timeout = 120.0 if "26b" in self.local_model else 60.0
+        self._system2_cooldown_until = 0.0
 
         # SkillRegistry — single source of truth for all tool schemas and callables
         self.registry = SkillRegistry()
 
         # System 1: cached Ollama client — created once, reused across all calls
         self._ollama_client: Optional[ollama.AsyncClient] = None
+
+        # Ollama runtime options — num_gpu=0 forces CPU-only, -1 means all layers on GPU
+        _num_gpu = int(os.getenv("OLLAMA_NUM_GPU", "-1"))
+        self._ollama_options = {"num_gpu": _num_gpu} if _num_gpu != -1 else {}
+        if _num_gpu == 0:
+            logger.info("System 1: CPU-only mode (OLLAMA_NUM_GPU=0)")
 
         # System 2 provider selection: Groq takes priority over Gemini
         self.groq_client = None
@@ -247,6 +260,39 @@ class CognitiveRouter:
                     blobs.append(text[start:i + 1])
                     start = -1
         return blobs
+
+    @staticmethod
+    def _is_pdf_extraction_tool(tool_name: str) -> bool:
+        return tool_name in {"extract_pdf_text", "extract_text_from_file", "extract_text"}
+
+    @staticmethod
+    def _extract_failed_generation(err_text: str) -> str:
+        if not err_text:
+            return ""
+        m = re.search(r"failed_generation':\s*'(.+?)'\s*}\s*$", err_text, re.DOTALL)
+        if not m:
+            return ""
+        raw = m.group(1)
+        return raw.replace("\\n", "\n")
+
+    @staticmethod
+    def _extract_failed_generation_tool_call(text: str) -> Optional[tuple]:
+        if not text:
+            return None
+        m = re.search(
+            r"<function=([a-zA-Z0-9_]+)\s*\[?\]?\s*(\{.*?\})\s*</function>",
+            text,
+            re.DOTALL
+        )
+        if not m:
+            return None
+        name = m.group(1).strip()
+        args_raw = m.group(2).strip()
+        try:
+            args = json.loads(args_raw)
+        except (json.JSONDecodeError, TypeError):
+            args = {}
+        return name, args
 
     @staticmethod
     def _extract_args_from_blob(obj: dict) -> dict:
@@ -331,6 +377,13 @@ class CognitiveRouter:
             })
         return result
 
+    def _format_cooldown_message(self) -> str:
+        remaining = max(0, int(self._system2_cooldown_until - time.time()))
+        if remaining <= 0:
+            return ""
+        minutes, seconds = divmod(remaining, 60)
+        return f"Rate limited. Retry in {minutes}m{seconds}s."
+
     async def _call_ollama_with_model_fallback(self, client, messages, tools):
         """Call Ollama chat with the configured local model.
 
@@ -339,8 +392,9 @@ class CognitiveRouter:
         """
         model = self.local_model
         response = await asyncio.wait_for(
-            client.chat(model=model, messages=messages, tools=tools),
-            timeout=60.0,
+            client.chat(model=model, messages=messages, tools=tools,
+                        options=self._ollama_options),
+            timeout=self._ollama_timeout,
         )
         return response, model
 
@@ -404,9 +458,44 @@ class CognitiveRouter:
                  "tool_calls": [{"function": {"name": tool_name, "arguments": arguments}}]},
                 {"role": "tool", "content": exec_result.content},
             ]
+
+            if self._is_pdf_extraction_tool(tool_name):
+                if exec_result.content.strip().lower().startswith("error:"):
+                    return RouterResult(status="ok", content=exec_result.content.strip())
+                summary_messages = [
+                    {
+                        "role": "system",
+                        "content": "You are a summarization engine. Summarize the provided PDF text faithfully."
+                    },
+                    {
+                        "role": "user",
+                        "content": (
+                            "PDF text:\n"
+                            f"{exec_result.content}\n\n"
+                            "Summarize in a concise report. Start with a 3–5 sentence abstract, "
+                            "then 5–8 bullet points. If the text ends with [TRUNCATED], mention "
+                            "the summary is based on a truncated excerpt."
+                        ),
+                    },
+                ]
+                try:
+                    force_resp = await asyncio.wait_for(
+                        client.chat(model=model, messages=summary_messages,
+                                    options=self._ollama_options),
+                        timeout=60.0,
+                    )
+                    if force_resp and "message" in force_resp:
+                        content = (force_resp["message"].get("content") or "").strip()
+                        if content:
+                            logger.info("System 1 PDF summary generated")
+                            return RouterResult(status="ok", content=content)
+                except Exception as e:
+                    logger.warning(f"PDF summary synthesis failed: {e}")
+                return RouterResult(status="ok", content="Error: Failed to summarize extracted PDF text.")
             response = await asyncio.wait_for(
-                client.chat(model=model, messages=current_messages, tools=active_tools),
-                timeout=60.0,
+                client.chat(model=model, messages=current_messages, tools=active_tools,
+                            options=self._ollama_options),
+                timeout=self._ollama_timeout,
             )
             if not (response and "message" in response):
                 logger.warning("Empty response during tool chain — stopping loop")
@@ -423,8 +512,9 @@ class CognitiveRouter:
             })
             try:
                 force_resp = await asyncio.wait_for(
-                    client.chat(model=model, messages=current_messages),
-                    timeout=60.0,
+                    client.chat(model=model, messages=current_messages,
+                                options=self._ollama_options),
+                    timeout=self._ollama_timeout,
                 )
                 if force_resp and "message" in force_resp:
                     content = (force_resp["message"].get("content") or "").strip()
@@ -486,10 +576,17 @@ class CognitiveRouter:
 
             return await self._handle_text_response(message)
 
+        except asyncio.TimeoutError:
+            error_msg = (
+                f"System 1 (Local Model) error: timed out after {int(self._ollama_timeout)}s. "
+                f"Make sure Ollama is running with '{self.local_model}' available."
+            )
+            logger.warning(error_msg)
+            return RouterResult(status="ok", content=f"[System 1 - Error]: {error_msg}")
         except Exception as e:
             error_msg = (
                 f"System 1 (Local Model) error: {str(e)}. "
-                "Make sure Ollama is running with 'gemma4:e4b' available."
+                f"Make sure Ollama is running with '{self.local_model}' available."
             )
             logger.error(error_msg, exc_info=True)
             return RouterResult(status="ok", content=f"[System 1 - Error]: {error_msg}")
@@ -740,43 +837,61 @@ Rules:
 
     def get_system_2_available(self) -> bool:
         """True if any System 2 provider (Groq or Gemini) is configured."""
+        if self._system2_cooldown_until and time.time() < self._system2_cooldown_until:
+            return False
         return self.groq_client is not None or self.gemini_client is not None
 
-    async def route_to_system_2(self, messages: List[Dict[str, str]]) -> RouterResult:
+    async def route_to_system_2(
+        self,
+        messages: List[Dict[str, str]],
+        allowed_tools: Optional[List[str]] = None
+    ) -> RouterResult:
         """
         Route to System 2. Uses Groq if available, falls back to Gemini.
         Groq is preferred: free tier, very fast, high quality (llama-3.3-70b).
         Returns a :class:`RouterResult` — never raises for security intercepts.
         """
+        if self._system2_cooldown_until and time.time() < self._system2_cooldown_until:
+            msg = self._format_cooldown_message() or "Rate limited. Please try again later."
+            return RouterResult(status="ok", content=f"[System 2 - Error]: {msg}")
+
         if self.groq_client is not None:
-            return await self._route_to_groq(messages)
+            return await self._route_to_groq(messages, allowed_tools=allowed_tools)
         elif self.gemini_client is not None:
             return await self._route_to_gemini(messages)
         else:
             raise RuntimeError("No System 2 provider configured. Set GROQ_API_KEY or GEMINI_API_KEY+USE_GEMINI=True.")
 
-    async def _route_to_groq(self, messages: List[Dict[str, str]]) -> RouterResult:
+    async def _route_to_groq(
+        self,
+        messages: List[Dict[str, str]],
+        allowed_tools: Optional[List[str]] = None
+    ) -> RouterResult:
         """Route to Groq API (llama-3.3-70b or configured model) with full tool calling."""
         logger.info(f"Routing to System 2 (Groq/{self.groq_model})")
         try:
             # Format tools in OpenAI-compatible format for Groq
-            groq_tools = [
-                {
+            groq_tools = []
+            for tool in self.registry.get_schemas():
+                if allowed_tools is not None and tool["name"] not in allowed_tools:
+                    continue
+                groq_tools.append({
                     "type": "function",
                     "function": {
                         "name": tool["name"],
                         "description": tool["description"],
                         "parameters": tool["parameters"],
                     }
-                }
-                for tool in self.registry.get_schemas()
-            ]
+                })
+
+            tool_kwargs = {}
+            if groq_tools:
+                tool_kwargs = {"tools": groq_tools, "tool_choice": "auto"}
 
             response = await self.groq_client.chat.completions.create(
                 model=self.groq_model,
                 messages=messages,
-                tools=groq_tools,
-                tool_choice="auto",
+                **tool_kwargs,
                 max_tokens=2048,
             )
 
@@ -800,6 +915,34 @@ Rules:
 
                 logger.info(f"Groq tool '{tool_name}' executed: {exec_result.content[:100]}")
 
+                if tool_name == "extract_pdf_text":
+                    if exec_result.content.strip().lower().startswith("error:"):
+                        return RouterResult(status="ok", content=exec_result.content.strip())
+                    summary_messages = [
+                        {
+                            "role": "system",
+                            "content": "You are a summarization engine. Summarize the provided PDF text faithfully."
+                        },
+                        {
+                            "role": "user",
+                            "content": (
+                                "PDF text:\n"
+                                f"{exec_result.content}\n\n"
+                                "Summarize in a concise report. Start with a 3–5 sentence abstract, "
+                                "then 5–8 bullet points. If the text ends with [TRUNCATED], mention "
+                                "the summary is based on a truncated excerpt."
+                            ),
+                        },
+                    ]
+                    final_response = await self.groq_client.chat.completions.create(
+                        model=self.groq_model,
+                        messages=summary_messages,
+                        max_tokens=2048,
+                    )
+                    result = final_response.choices[0].message.content.strip()
+                    logger.info(f"System 2 (Groq) PDF summary generated ({len(result)} chars)")
+                    return RouterResult(status="ok", content=result)
+
                 # Follow-up in proper OpenAI tool-result format
                 followup_messages = list(messages) + [
                     {
@@ -817,6 +960,15 @@ Rules:
                         "content": exec_result.content
                     }
                 ]
+                if tool_name == "extract_pdf_text":
+                    followup_messages.append({
+                        "role": "user",
+                        "content": (
+                            "Summarize the extracted PDF text above in a concise report. "
+                            "Start with a 3–5 sentence abstract, then 5–8 bullet points. "
+                            "If the text ends with [TRUNCATED], mention that the summary is based on a truncated excerpt."
+                        ),
+                    })
 
                 final_response = await self.groq_client.chat.completions.create(
                     model=self.groq_model,
@@ -833,5 +985,71 @@ Rules:
             return RouterResult(status="ok", content=result)
 
         except Exception as e:
+            err_text = str(e)
+            if "rate limit" in err_text.lower() or "rate_limit" in err_text.lower() or "code: 429" in err_text.lower():
+                cooldown_seconds = 1800
+                m = re.search(r"try again in (\d+)m(\d+(?:\.\d+)?)s", err_text)
+                if m:
+                    cooldown_seconds = int(m.group(1)) * 60 + int(float(m.group(2)))
+                self._system2_cooldown_until = time.time() + cooldown_seconds
+                msg = self._format_cooldown_message() or "Rate limited. Please try again later."
+                logger.warning(f"Groq rate limit hit: {msg}")
+                return RouterResult(status="ok", content=f"[System 2 - Error]: {msg}")
+
+            if "tool_use_failed" in err_text or "failed_generation" in err_text:
+                failed_gen = self._extract_failed_generation(err_text)
+                parsed = self._extract_failed_generation_tool_call(failed_gen)
+                if parsed:
+                    tool_name, arguments = parsed
+                    logger.warning(f"Groq tool_use_failed; replaying tool call: {tool_name}")
+                    exec_result = await self._execute_tool(tool_name, arguments)
+                    if exec_result.status != "ok":
+                        return exec_result
+
+                    last_user = ""
+                    for msg in reversed(messages):
+                        if msg.get("role") == "user":
+                            last_user = msg.get("content", "")
+                            break
+
+                    retry_messages = []
+                    for msg in messages:
+                        if msg.get("role") == "system":
+                            retry_messages.append(msg)
+                    retry_messages.append({
+                        "role": "user",
+                        "content": (
+                            f"User request: {last_user}\n\n"
+                            f"Tool output:\n{exec_result.content}\n\n"
+                            "Answer using the tool output above. Do not call tools."
+                        )
+                    })
+                    final_response = await self.groq_client.chat.completions.create(
+                        model=self.groq_model,
+                        messages=retry_messages,
+                        max_tokens=2048,
+                    )
+                    result = final_response.choices[0].message.content.strip()
+                    logger.info("System 2 (Groq) response generated after tool_use_failed recovery")
+                    return RouterResult(status="ok", content=result)
+
+                # Fallback: respond without tools
+                fallback_messages = []
+                for msg in messages:
+                    if msg.get("role") == "system":
+                        fallback_messages.append(msg)
+                fallback_messages.append({
+                    "role": "user",
+                    "content": "Tool calling failed. Respond without tools and explain any limitations."
+                })
+                final_response = await self.groq_client.chat.completions.create(
+                    model=self.groq_model,
+                    messages=fallback_messages,
+                    max_tokens=2048,
+                )
+                result = final_response.choices[0].message.content.strip()
+                logger.info("System 2 (Groq) fallback response generated without tools")
+                return RouterResult(status="ok", content=result)
+
             logger.error(f"Groq error: {e}", exc_info=True)
             raise

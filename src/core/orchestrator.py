@@ -40,6 +40,8 @@ ENERGY_COST_WORKER = 15
 ENERGY_COST_CRITIC = 10
 ENERGY_COST_TOOL = 5
 HEARTBEAT_INTERVAL = 1800  # 30 minutes
+MEMORY_SAVE_THRESHOLD = int(os.getenv("MEMORY_SAVE_THRESHOLD", "120"))
+MEMORY_CONSOLIDATION_INTERVAL = int(os.getenv("MEMORY_CONSOLIDATION_INTERVAL", "21600"))  # 6 hours
 
 # Key used in the state dict to signal a blocked (non-ok) router result
 _BLOCKED_KEY = "_blocked_result"
@@ -66,7 +68,7 @@ class Orchestrator:
         ledger_db_path: str = "data/ledger.db",
         core_memory_path: str = "data/core_memory.json",
         gemini_model: str = "gemini-2.0-flash",
-        local_model: str = "gemma4:e4b"
+        local_model: str = "gemma4:26b"
     ) -> None:
         logger.info("Initializing Orchestrator (State Graph)")
 
@@ -98,6 +100,7 @@ class Orchestrator:
         await self.ledger_memory.initialize()
         await self.ledger_memory.seed_initial_goals()
         await self._load_approved_tools()
+        await self._load_pending_approvals()
         # Record the host OS now that we're in an async context
         await self.core_memory.update("host_os", platform.system())
         logger.info("Orchestrator async_init complete")
@@ -159,6 +162,35 @@ class Orchestrator:
         names = ", ".join(s["name"] for s in self.cognitive_router.registry.get_schemas())
         return f"Available tools (use them — do not claim you lack them): {names}"
 
+    @staticmethod
+    def _is_system_1_error(result: Optional[RouterResult]) -> bool:
+        """Detect System 1 error payloads that should trigger System 2 fallback."""
+        return bool(
+            result
+            and result.status == "ok"
+            and isinstance(result.content, str)
+            and result.content.startswith("[System 1 - Error]")
+        )
+
+    async def _get_archival_context(self, query: str) -> str:
+        """Retrieve top archival memory snippets relevant to the user query."""
+        if not query:
+            return ""
+        try:
+            results = await self.vector_memory.query_memory_async(query, n_results=3)
+            if not results:
+                return ""
+            lines = ["<Archival_Memory>"]
+            for item in results:
+                snippet = item.get("document", "")
+                if snippet:
+                    lines.append(f"  <Memory>{snippet}</Memory>")
+            lines.append("</Archival_Memory>")
+            return "\n".join(lines)
+        except Exception as e:
+            logger.warning(f"Archival memory lookup failed: {e}")
+            return ""
+
     def _new_state(self, user_id: str, user_message: str) -> Dict[str, Any]:
         return {
             "user_id": user_id,
@@ -216,6 +248,9 @@ class Orchestrator:
                 self.cognitive_router.route_to_system_1(messages),
                 timeout=150.0,
             )
+            if self._is_system_1_error(router_result):
+                logger.warning("System 1 returned an error payload in supervisor; escalating to System 2.")
+                router_result = None
         except asyncio.TimeoutError:
             logger.error("System 1 timed out in supervisor (150 s). Escalating to System 2.", exc_info=True)
         except Exception as s1_err:
@@ -308,12 +343,20 @@ class Orchestrator:
                 result = await self.process_message(
                     user_message=(
                         f"[HEARTBEAT TASK #{task['id']}]: {task['title']}\n"
-                        f"Execute this task autonomously and report what you did."
+                        f"You MUST execute this task right now by calling the appropriate tools. "
+                        f"Do NOT describe what you plan to do — use your tools and report the actual results. "
+                        f"If the task requires storing data, call update_core_memory or update_ledger explicitly. "
+                        f"If you cannot complete it, explain exactly why."
                     ),
                     user_id="heartbeat"
                 )
 
-                await self.ledger_memory.update_objective_status(task["id"], "completed")
+                # Only mark completed if the result isn't an error or refusal
+                status = "completed"
+                if any(w in result.lower() for w in ("error", "cannot", "unable", "failed", "i cannot", "i am unable")):
+                    status = "pending"
+                    logger.warning(f"Heartbeat: Task #{task['id']} may not have completed — marking pending. Result: {result[:100]}")
+                await self.ledger_memory.update_objective_status(task["id"], status)
 
                 summary = (
                     f"Heartbeat completed task #{task['id']}:\n"
@@ -326,16 +369,30 @@ class Orchestrator:
             except Exception as e:
                 logger.error(f"Heartbeat error: {e}", exc_info=True)
 
+    async def _memory_consolidation_loop(self) -> None:
+        """Background task: periodically consolidate chat history into long-term memory."""
+        logger.info("Memory consolidation loop started.")
+        while True:
+            await asyncio.sleep(MEMORY_CONSOLIDATION_INTERVAL)
+            try:
+                user_ids = await self.ledger_memory.get_recent_user_ids(limit=20)
+                if not user_ids:
+                    continue
+                for user_id in user_ids:
+                    await self._consolidate_memory(user_id)
+            except Exception as e:
+                logger.warning(f"Memory consolidation loop error: {e}", exc_info=True)
+
     async def _save_memory_async(self, text: str) -> None:
         """Fire-and-forget memory storage gated by response length.
 
         Skips trivial exchanges (short greetings, one-liners).
-        Threshold: combined user+assistant text must exceed 200 chars.
+        Threshold: combined user+assistant text must exceed MEMORY_SAVE_THRESHOLD.
         Uses asyncio.to_thread() so the blocking ChromaDB call does not
         stall the event loop.
         """
         try:
-            if len(text) < 200:
+            if len(text) < MEMORY_SAVE_THRESHOLD:
                 return
             await self.vector_memory.add_memory_async(
                 text=text,
@@ -358,6 +415,20 @@ class Orchestrator:
                     logger.error(f"Failed to restore tool '{tool['name']}': {e}")
         except Exception as e:
             logger.warning(f"_load_approved_tools failed: {e}")
+
+    async def _load_pending_approvals(self) -> None:
+        """Reload any tool synthesis proposals that were pending when the bot last stopped."""
+        try:
+            pending = await self.ledger_memory.load_pending_approvals()
+            for user_id, payload in pending.items():
+                self.pending_tool_approval[user_id] = {
+                    "synthesis": payload["synthesis"],
+                    "original_state": {"user_input": payload["original_input"], "user_id": user_id},
+                }
+            if pending:
+                logger.info(f"Restored {len(pending)} pending tool approval(s) from DB")
+        except Exception as e:
+            logger.warning(f"_load_pending_approvals failed: {e}")
 
     async def tool_synthesis_node(
         self,
@@ -395,11 +466,14 @@ class Orchestrator:
             logger.error(f"Tool synthesis failed: {e}", exc_info=True)
             return f"System 2 failed to synthesise a tool for '{gap_description}': {e}"
 
-        # Store payload for approval resumption
+        # Store payload for approval resumption (in-memory + persisted to DB)
         self.pending_tool_approval[user_id] = {
             "synthesis": synthesis,
             "original_state": state,
         }
+        await self.ledger_memory.save_pending_approval(
+            user_id, synthesis, state["user_input"]
+        )
 
         # Build Admin-facing HITL prompt with the proposed code
         hitl_msg = (
@@ -431,7 +505,9 @@ class Orchestrator:
         state = self._deduct_energy(state, ENERGY_COST_SUPERVISOR, "supervisor")
         user_input = state["user_input"]
         core_mem_str = await self.core_memory.get_context_string()
+        archival_context = await self._get_archival_context(user_input)
         capabilities_str = self._get_capabilities_string()
+        archival_block = f"{archival_context}\n\n" if archival_context else ""
 
         system_prompt = (
             f"You are AIDEN — a local autonomous AI agent on the Admin's machine (Ollama). "
@@ -440,11 +516,21 @@ class Orchestrator:
             f"You have tools — never deny capabilities listed below. "
             f"Reply in plain conversational text, no markdown headers. "
             f"Private reasoning: wrap in <think>...</think> — it will be stripped.\n\n"
+            f"CRITICAL RULES:\n"
+            f"- NEVER fabricate or simulate tool results. If a tool returns an error, report the exact error to the user honestly. Do NOT invent summaries, page counts, or any content that the tool did not actually return.\n"
+            f"- If you cannot complete a task due to a tool error, say so clearly and ask the user for help.\n\n"
+            f"FILE ACCESS: The Admin's downloads folder for you to read files from is: "
+            f"C:\\Users\\iboci\\Live-Trading-bot\\AI_Prototype\\downloads\\\n\n"
+            f"PDF RULE: If the user asks to read or summarize a PDF, you MUST call "
+            f"`extract_pdf_text` first (use the downloads folder if only a filename is given).\n\n"
+            f"WEB RULE: After `web_search`, call `extract_web_article` to read the chosen URL before summarizing.\n\n"
+            f"DATA RULE: For CSV/Excel analysis, use `analyze_table_file` instead of reading raw text.\n\n"
             f"{self._get_sensory_context()}\n\n"
             f"OS CONTEXT: You are running on {self.sensory_state.get('os', platform.system())}. "
             f"Use OS-appropriate shell commands (e.g., 'dir' instead of 'ls' on Windows). "
             f"Preferentially use your `manage_file_system` Python tool for OS-agnostic file exploration.\n\n"
             f"{self.charter_text}\n{core_mem_str}\n\n"
+            f"{archival_block}"
             f"{capabilities_str}\n\n"
             f"Respond to the user, then on the very last line declare which workers are needed.\n"
             f'Format: WORKERS: [] for chat, WORKERS: ["research_agent"] or ["coder_agent"] for tasks.'
@@ -508,13 +594,37 @@ class Orchestrator:
                 self.cognitive_router.route_to_system_1(messages, allowed_tools=["search_archival_memory"]),
                 timeout=60.0
             )
-            if router_result.status != "ok":
-                state[_BLOCKED_KEY] = router_result
-            else:
-                state["worker_outputs"]["research"] = router_result.content
+            if self._is_system_1_error(router_result):
+                router_result = None
         except Exception as e:
-            logger.error(f"Research Agent failed: {e}")
-            state["worker_outputs"]["research"] = f"Error: {e}"
+            logger.error(f"Research Agent failed on System 1: {e}")
+            router_result = None
+
+        attempted_system_2 = False
+        if router_result is None and self.cognitive_router.get_system_2_available():
+            attempted_system_2 = True
+            try:
+                router_result = await asyncio.wait_for(
+                    self.cognitive_router.route_to_system_2(
+                        messages, allowed_tools=["search_archival_memory"]
+                    ),
+                    timeout=60.0
+                )
+            except Exception as e:
+                logger.error(f"Research Agent failed on System 2: {e}")
+                router_result = None
+
+        if router_result is None:
+            if attempted_system_2:
+                state["worker_outputs"]["research"] = "Error: Research agent failed after System 1 error and System 2 fallback."
+            else:
+                state["worker_outputs"]["research"] = "Error: Research agent failed and System 2 is not configured."
+            return state
+
+        if router_result.status != "ok":
+            state[_BLOCKED_KEY] = router_result
+        else:
+            state["worker_outputs"]["research"] = router_result.content
 
         return state
 
@@ -535,16 +645,41 @@ class Orchestrator:
         ]
         try:
             router_result = await asyncio.wait_for(
-                self.cognitive_router.route_to_system_1(messages, allowed_tools=["update_ledger", "update_core_memory", "request_core_update", "spawn_new_objective", "update_objective_status"]),
+                self.cognitive_router.route_to_system_1(messages, allowed_tools=["update_ledger", "update_core_memory", "request_core_update", "spawn_new_objective", "update_objective_status", "extract_pdf_text"]),
                 timeout=60.0
             )
-            if router_result.status != "ok":
-                state[_BLOCKED_KEY] = router_result
-            else:
-                state["worker_outputs"]["coder"] = router_result.content
+            if self._is_system_1_error(router_result):
+                router_result = None
         except Exception as e:
-            logger.error(f"Coder Agent failed: {e}")
-            state["worker_outputs"]["coder"] = f"Error: {e}"
+            logger.error(f"Coder Agent failed on System 1: {e}")
+            router_result = None
+
+        attempted_system_2 = False
+        if router_result is None and self.cognitive_router.get_system_2_available():
+            attempted_system_2 = True
+            try:
+                router_result = await asyncio.wait_for(
+                    self.cognitive_router.route_to_system_2(
+                        messages,
+                        allowed_tools=["update_ledger", "update_core_memory", "request_core_update", "spawn_new_objective", "update_objective_status", "extract_pdf_text"]
+                    ),
+                    timeout=60.0
+                )
+            except Exception as e:
+                logger.error(f"Coder Agent failed on System 2: {e}")
+                router_result = None
+
+        if router_result is None:
+            if attempted_system_2:
+                state["worker_outputs"]["coder"] = "Error: Coder agent failed after System 1 error and System 2 fallback."
+            else:
+                state["worker_outputs"]["coder"] = "Error: Coder agent failed and System 2 is not configured."
+            return state
+
+        if router_result.status != "ok":
+            state[_BLOCKED_KEY] = router_result
+        else:
+            state["worker_outputs"]["coder"] = router_result.content
 
         return state
 
@@ -620,7 +755,13 @@ class Orchestrator:
                 timeout=90.0,
             )
             if result.status == "ok" and result.content:
-                await self.core_memory.update("conversation_summary", result.content.strip())
+                summary = result.content.strip()
+                await self.core_memory.update("conversation_summary", summary)
+                await self.ledger_memory.trim_chat_history(user_id, keep_last=5)
+                await self.vector_memory.add_memory_async(
+                    text=f"Conversation summary ({user_id}): {summary}",
+                    metadata={"type": "conversation_summary", "user_id": user_id, "timestamp": datetime.now().isoformat()}
+                )
                 logger.info(f"Memory consolidation complete for user {user_id}")
         except asyncio.TimeoutError:
             logger.warning("Memory consolidation skipped: LLM did not respond within 90s")
@@ -647,6 +788,7 @@ class Orchestrator:
         if user_id not in self.pending_tool_approval:
             return None
         payload = self.pending_tool_approval.pop(user_id)
+        await self.ledger_memory.clear_pending_approval(user_id)
         synthesis = payload["synthesis"]
         original_state = payload["original_state"]
         if not user_message.strip().upper().startswith("YES"):

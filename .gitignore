@@ -3,3 +3,7 @@
 __pycache__/
 *.db
 *.sqlite3
+
+# Downloads folder — ignore dropped files, keep the folder itself
+/downloads/*
+!/downloads/.gitkeep

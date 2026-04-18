@@ -10,6 +10,12 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+# Ensure UTF-8 output on Windows so emoji/Unicode responses don't crash tests
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8")
+if hasattr(sys.stderr, "reconfigure"):
+    sys.stderr.reconfigure(encoding="utf-8")
+
 PASS = "PASS"
 FAIL = "FAIL"
 WARN = "WARN"
@@ -165,7 +171,7 @@ async def test_orchestrator():
     try:
         state = orch._new_state("test", "hello")
         assert state["energy_remaining"] == 100
-        state = await orch._deduct_energy(state, 10, "test")
+        state = orch._deduct_energy(state, 10, "test")
         assert state["energy_remaining"] == 90
         report("Energy budget", True, "100 -> 90 after -10")
     except Exception as e:

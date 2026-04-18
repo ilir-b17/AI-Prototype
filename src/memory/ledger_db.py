@@ -148,6 +148,14 @@ class LedgerMemory:
                     approved_at TIMESTAMP
                 )
             """)
+            await self._db.execute("""
+                CREATE TABLE IF NOT EXISTS pending_tool_approvals (
+                    user_id TEXT NOT NULL PRIMARY KEY,
+                    synthesis_json TEXT NOT NULL,
+                    original_input TEXT NOT NULL,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            """)
             await self._db.commit()
         logger.debug("Database tables initialized")
 
@@ -407,6 +415,33 @@ class LedgerMemory:
             rows = await cursor.fetchall()
         return [{"role": r["role"], "content": r["content"]} for r in rows]
 
+    async def trim_chat_history(self, user_id: str, keep_last: int = 5) -> int:
+        """Trim chat history to the most recent *keep_last* turns. Returns rows deleted."""
+        if keep_last < 1:
+            raise ValueError("keep_last must be at least 1")
+        async with self._lock:
+            cursor = await self._db.execute(
+                "DELETE FROM chat_history WHERE user_id = ? AND id NOT IN ("
+                "  SELECT id FROM chat_history WHERE user_id = ? ORDER BY id DESC LIMIT ?"
+                ")",
+                (user_id, user_id, keep_last),
+            )
+            await self._db.commit()
+            deleted = cursor.rowcount
+        return deleted
+
+    async def get_recent_user_ids(self, limit: int = 20) -> List[str]:
+        """Return up to *limit* user_ids ordered by most recent chat activity."""
+        async with self._lock:
+            cursor = await self._db.execute(
+                "SELECT user_id, MAX(id) AS max_id FROM chat_history "
+                "WHERE user_id != 'heartbeat' "
+                "GROUP BY user_id ORDER BY max_id DESC LIMIT ?",
+                (limit,),
+            )
+            rows = await cursor.fetchall()
+        return [r["user_id"] for r in rows]
+
     # ─────────────────────────────────────────────────────────────
     # Tool Registry  (System-2-synthesised dynamic tools)
     # ─────────────────────────────────────────────────────────────
@@ -445,3 +480,46 @@ class LedgerMemory:
             rows = await cursor.fetchall()
         return [dict(r) for r in rows]
 
+    # ─────────────────────────────────────────────────────────────
+    # Pending Tool Approvals  (survive bot restarts)
+    # ─────────────────────────────────────────────────────────────
+
+    async def save_pending_approval(self, user_id: str, synthesis: dict, original_input: str) -> None:
+        """Persist a tool synthesis payload so approval survives a restart."""
+        import json
+        async with self._lock:
+            await self._db.execute(
+                "INSERT INTO pending_tool_approvals (user_id, synthesis_json, original_input) "
+                "VALUES (?, ?, ?) ON CONFLICT(user_id) DO UPDATE SET "
+                "synthesis_json=excluded.synthesis_json, original_input=excluded.original_input, "
+                "created_at=CURRENT_TIMESTAMP",
+                (user_id, json.dumps(synthesis), original_input),
+            )
+            await self._db.commit()
+
+    async def load_pending_approvals(self) -> dict:
+        """Return {user_id: {synthesis, original_input}} for all pending approvals."""
+        import json
+        async with self._lock:
+            cursor = await self._db.execute(
+                "SELECT user_id, synthesis_json, original_input FROM pending_tool_approvals"
+            )
+            rows = await cursor.fetchall()
+        result = {}
+        for row in rows:
+            try:
+                result[row["user_id"]] = {
+                    "synthesis": json.loads(row["synthesis_json"]),
+                    "original_input": row["original_input"],
+                }
+            except Exception:
+                pass
+        return result
+
+    async def clear_pending_approval(self, user_id: str) -> None:
+        """Remove a pending approval after it is accepted or rejected."""
+        async with self._lock:
+            await self._db.execute(
+                "DELETE FROM pending_tool_approvals WHERE user_id=?", (user_id,)
+            )
+            await self._db.commit()

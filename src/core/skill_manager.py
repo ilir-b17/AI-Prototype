@@ -106,9 +106,18 @@ class SkillRegistry:
 
     async def execute(self, tool_name: str, arguments: Dict[str, Any]) -> str:
         """Dispatch a tool call. Returns a plain string result."""
+        alias_map = {
+            "extract_text_from_file": "extract_pdf_text",
+            "extract_text": "extract_pdf_text",
+        }
+        tool_name = alias_map.get(tool_name, tool_name)
+
         skill = self._skills.get(tool_name)
         if skill is None:
             return f"Error: Unknown tool '{tool_name}'."
+        if tool_name == "manage_file_system":
+            if "path" in arguments and "file_path" not in arguments:
+                arguments["file_path"] = arguments.pop("path")
         try:
             result = skill["fn"](**arguments)
             if asyncio.iscoroutine(result):

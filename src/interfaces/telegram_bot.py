@@ -41,6 +41,8 @@ logging.basicConfig(
 
 # Suppress ChromaDB telemetry errors (they don't affect functionality)
 logging.getLogger('chromadb.telemetry.product.posthog').setLevel(logging.CRITICAL)
+# Silence noisy HTTP request logs from the Telegram client stack (httpx)
+logging.getLogger('httpx').setLevel(logging.WARNING)
 
 logger = logging.getLogger(__name__)
 
@@ -210,7 +212,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
 
 async def goals(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """/goals â€” list all active objectives grouped by tier."""
+    """/goals â€" list all active objectives grouped by tier."""
     if not is_authorized(update.effective_user.id):
         await update.message.reply_text(_UNAUTHORIZED_MSG)
         return
@@ -241,7 +243,7 @@ async def goals(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def addgoal(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """/addgoal <Tier> <Energy> <Title> â€” inject a goal into the backlog."""
+    """/addgoal <Tier> <Energy> <Title> â€" inject a goal into the backlog."""
     if not is_authorized(update.effective_user.id):
         await update.message.reply_text(_UNAUTHORIZED_MSG)
         return
@@ -284,22 +286,25 @@ async def addgoal(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def shutdown(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """/shutdown â€” gracefully stop the bot (admin only)."""
+    """/shutdown — gracefully stop the bot (admin only)."""
     if not is_authorized(update.effective_user.id):
         await update.message.reply_text(_UNAUTHORIZED_MSG)
         return
 
     logger.info("Shutdown command received from admin.")
-    await update.message.reply_text(
-        "AIDEN shutting down. Goodbye! \u2705"
-    )
-    # Give Telegram time to deliver the reply before we stop polling.
+    await update.message.reply_text("AIDEN shutting down. Goodbye! \u2705")
     await asyncio.sleep(1)
-    os.kill(os.getpid(), signal.SIGTERM)
+    # Cancel the main asyncio task so _async_run's finally block runs cleanly
+    for task in asyncio.all_tasks():
+        if task.get_name() == "main_bot_task":
+            task.cancel()
+            return
+    # Fallback if task name not found
+    os.kill(os.getpid(), signal.SIGINT)
 
 
 async def restart(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """/restart â€” gracefully restart the bot process (admin only)."""
+    """/restart — gracefully restart the bot process (admin only)."""
     global _restart_requested
 
     if not is_authorized(update.effective_user.id):
@@ -307,12 +312,14 @@ async def restart(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
 
     logger.info("Restart command received from admin.")
-    await update.message.reply_text(
-        "AIDEN restarting \u2b6f\ufe0f  Back in a moment..."
-    )
+    await update.message.reply_text("AIDEN restarting \u2b6f\ufe0f  Back in a moment...")
     await asyncio.sleep(1)
     _restart_requested = True
-    os.kill(os.getpid(), signal.SIGTERM)
+    for task in asyncio.all_tasks():
+        if task.get_name() == "main_bot_task":
+            task.cancel()
+            return
+    os.kill(os.getpid(), signal.SIGINT)
 
 
 async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -355,6 +362,90 @@ async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
             )
         except Exception as reply_error:
             logger.error(f"Failed to send error message: {reply_error}", exc_info=True)
+
+
+async def _async_run(application: Application, orchestrator_inst: "Orchestrator") -> None:
+    """
+    Runs the bot inside a single asyncio.run() call we control.
+    Exits cleanly on Ctrl+C (KeyboardInterrupt → CancelledError) or SIGTERM.
+    All async cleanup is done here with a hard 5-second timeout so the process
+    never hangs on shutdown.
+    """
+    _bg_tasks: list = []
+
+    async with application:
+        # Clear stale webhook
+        try:
+            await application.bot.delete_webhook(drop_pending_updates=True)
+            logger.info("Cleared stale Telegram webhook/session before polling.")
+        except Exception as e:
+            logger.warning(f"delete_webhook failed (non-fatal): {e}")
+
+        # Async-init the orchestrator
+        await orchestrator_inst.async_init()
+        outbound_queue: asyncio.Queue = asyncio.Queue()
+        orchestrator_inst.outbound_queue = outbound_queue
+
+        _heartbeat_task = asyncio.create_task(orchestrator_inst._heartbeat_loop())
+        _sensory_task   = asyncio.create_task(orchestrator_inst._sensory_update_loop())
+        _drain_task     = asyncio.create_task(_drain_outbound_queue(application.bot, outbound_queue))
+        _memory_task    = asyncio.create_task(orchestrator_inst._memory_consolidation_loop())
+        _bg_tasks.extend([_heartbeat_task, _sensory_task, _drain_task, _memory_task])
+        logger.info(
+            "Orchestrator async_init, heartbeat loop, sensory update loop, memory consolidation loop, "
+            "and outbound queue drainer started. "
+            f"Tasks: {_heartbeat_task.get_name()}, {_sensory_task.get_name()}, {_memory_task.get_name()}, {_drain_task.get_name()}"
+        )
+
+        # Start polling and the PTB application
+        await application.updater.start_polling(
+            allowed_updates=["message", "callback_query"],
+            drop_pending_updates=True,
+            read_timeout=15,
+            write_timeout=15,
+            connect_timeout=10,
+            poll_interval=1.0,
+        )
+        await application.start()
+        logger.info("Telegram bot initialized and starting polling...")
+
+        try:
+            # Block here until cancelled by Ctrl+C or SIGTERM
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            pass
+        finally:
+            logger.info("Shutting down — stopping polling and cleaning up...")
+
+            # Stop PTB gracefully (best-effort, 5s cap)
+            try:
+                await asyncio.wait_for(application.updater.stop(), timeout=5.0)
+                await asyncio.wait_for(application.stop(), timeout=5.0)
+            except Exception:
+                pass
+
+            # Cancel background tasks with a hard 5s timeout
+            for task in _bg_tasks:
+                task.cancel()
+            try:
+                await asyncio.wait_for(
+                    asyncio.gather(*_bg_tasks, return_exceptions=True),
+                    timeout=5.0,
+                )
+            except asyncio.TimeoutError:
+                logger.warning("Background tasks did not cancel in time — forcing exit.")
+
+            # Close async resources
+            for coro in (
+                orchestrator_inst.cognitive_router.close(),
+                orchestrator_inst.ledger_memory.close(),
+            ):
+                try:
+                    await asyncio.wait_for(coro, timeout=3.0)
+                except Exception:
+                    pass
+
+            logger.info("Shutdown complete.")
 
 
 def main() -> None:
@@ -406,53 +497,20 @@ def main() -> None:
         application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
         application.add_error_handler(error_handler)
 
-        # post_init: start heartbeat and outbound message queue drainer
-        async def post_init(app) -> None:
-            # Complete async initialisation (opens aiosqlite connection, seeds goals)
-            await orchestrator.async_init()
-            outbound_queue = asyncio.Queue()
-            orchestrator.outbound_queue = outbound_queue
-            _heartbeat_task = asyncio.create_task(orchestrator._heartbeat_loop())
-            _sensory_task = asyncio.create_task(orchestrator._sensory_update_loop())
-            _drain_task = asyncio.create_task(_drain_outbound_queue(app.bot, outbound_queue))
-            logger.info(
-                "Orchestrator async_init, heartbeat loop, sensory update loop, and outbound queue drainer started. "
-                f"Tasks: {_heartbeat_task.get_name()}, {_sensory_task.get_name()}, {_drain_task.get_name()}"
-            )
+        async def _named_run():
+            task = asyncio.current_task()
+            if task:
+                task.set_name("main_bot_task")
+            await _async_run(application, orchestrator)
 
-        async def post_init_wrapper(app) -> None:
-            # Clear any stale webhook / conflicting polling session on the
-            # Telegram server before we start receiving updates.  This is the
-            # reliable way to eliminate 409 Conflict errors caused by a
-            # previous bot process that did not shut down cleanly.
-            try:
-                await app.bot.delete_webhook(drop_pending_updates=True)
-                logger.info("Cleared stale Telegram webhook/session before polling.")
-            except Exception as e:
-                logger.warning(f"delete_webhook failed (non-fatal): {e}")
-            await post_init(app)
+        try:
+            asyncio.run(_named_run())
+        except KeyboardInterrupt:
+            logger.info("Bot interrupted by user")
 
-        application.post_init = post_init_wrapper
-
-        logger.info("Telegram bot initialized and starting polling...")
-
-        application.run_polling(
-            allowed_updates=["message", "callback_query"],
-            drop_pending_updates=True,
-            read_timeout=15,
-            write_timeout=15,
-            connect_timeout=10,
-            poll_interval=1.0
-        )
-
-    except KeyboardInterrupt:
-        logger.info("Bot interrupted by user")
     except Exception as e:
         logger.error(f"Bot error: {e}", exc_info=True)
     finally:
-        if orchestrator:
-            logger.info("Shutting down Orchestrator...")
-            orchestrator.close()
         try:
             if lock_sock:
                 lock_sock.close()
@@ -461,7 +519,7 @@ def main() -> None:
             pass
 
     # If a restart was requested, replace the current process with a fresh one.
-    # os.execv replaces the process image in-place â€” the OS PID stays the same
+    # os.execv replaces the process image in-place â€" the OS PID stays the same
     # and the lock socket is already closed above, so the new instance can
     # acquire it cleanly.
     if _restart_requested:
