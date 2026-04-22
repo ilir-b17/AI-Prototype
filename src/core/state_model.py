@@ -11,7 +11,7 @@ class AgentState:
     user_id: str
     user_input: str
     chat_history: List[Dict[str, str]] = field(default_factory=list)
-    current_plan: List[str] = field(default_factory=list)
+    current_plan: List[Any] = field(default_factory=list)
     worker_outputs: Dict[str, str] = field(default_factory=dict)
     final_response: str = ""
     iteration_count: int = 0

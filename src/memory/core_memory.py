@@ -77,13 +77,21 @@ class CoreMemory:
             logger.error(f"Failed to load core memory: {e}")
             return {"current_focus": "", "user_preferences": ""}
 
-    async def get_context_string(self) -> str:
-        """Return the core memory formatted for prompt injection (non-blocking)."""
+    async def get_context_string(self, include_summary: bool = False) -> str:
+        """Return the core memory formatted for prompt injection (non-blocking).
+
+        ``conversation_summary`` is excluded by default because it is a lossy,
+        model-generated recap that can easily inject stale or low-quality
+        behavioral commentary back into the live prompt.
+        """
         state = await self.get_all()
         host_os = state.get('host_os', '')
         os_line = f"\n  <Host_OS>{host_os}</Host_OS>" if host_os else ""
         summary = state.get('conversation_summary', '')
-        summary_line = f"\n  <Conversation_Summary>{summary}</Conversation_Summary>" if summary else ""
+        summary_line = (
+            f"\n  <Conversation_Summary>{summary}</Conversation_Summary>"
+            if include_summary and summary else ""
+        )
         insights = state.get('consolidated_insights', '')
         insights_line = f"\n  <Consolidated_Insights>{insights}</Consolidated_Insights>" if insights else ""
         return (

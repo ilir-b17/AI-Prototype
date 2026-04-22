@@ -10,6 +10,7 @@ import os
 import json
 import re
 import asyncio
+import inspect
 import logging
 import importlib.util
 from typing import Any, Callable, Dict, List, Optional
@@ -141,7 +142,7 @@ class SkillRegistry:
             result = skill["fn"](**arguments)
             if asyncio.iscoroutine(result):
                 return await result
-            if asyncio.isasyncgen(result):
+            if inspect.isasyncgen(result):
                 # Drain async generator and concatenate string chunks
                 parts = []
                 async for chunk in result:

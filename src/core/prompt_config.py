@@ -21,6 +21,7 @@ def build_supervisor_prompt(
     core_mem_str: str,
     archival_block: str,
     capabilities_str: str,
+    agent_descriptions: str,
     sensory_context: str,
     os_name: str,
     downloads_dir: str,
@@ -68,9 +69,16 @@ def build_supervisor_prompt(
         {capabilities_str}
         </available_capabilities>
 
+        <available_agents>
+        {agent_descriptions}
+        </available_agents>
+
         <output_formatting>
         CRITICAL: Every response MUST end with a strict worker declaration on the very last line, outside of any <think> blocks.
         - If you can handle the request directly in chat: WORKERS: []
-        - If you need to delegate to a specialized agent: WORKERS: ["research_agent"] OR WORKERS: ["coder_agent"]
+        - If you need to delegate to specialized agents, output JSON task packets using only agent names listed in <available_agents>.
+        - Format delegated work as: WORKERS: [{{"agent": "agent_name", "task": "short concrete task", "reason": "why this agent is needed", "depends_on": ["upstream_agent"]}}]
+        - Each task must be specific to that agent. Do not output bare agent names unless you are falling back to the older format.
+        - If multiple independent agents are needed but the user expects one polished final answer, add a final synthesis_agent task whose depends_on list names the upstream agents it must combine.
         </output_formatting>
     """)

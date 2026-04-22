@@ -8,11 +8,13 @@ manipulation, AST sandbox, energy caps) without requiring a running Ollama,
 Telegram, or SQLite instance.
 """
 import asyncio
-import json
 import pytest
+import tempfile
 
-from unittest.mock import AsyncMock, MagicMock, patch
-from src.core.llm_router import CognitiveRouter
+from unittest.mock import AsyncMock, MagicMock
+from src.core.llm_router import CognitiveRouter, RouterResult
+from src.core.orchestrator import Orchestrator
+from src.memory.core_memory import CoreMemory
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -31,6 +33,70 @@ def _make_fresh_state(user_id: str = "test_user", user_input: str = "hello") -> 
         "energy_remaining": 100,
         "hitl_count": 0,
     }
+
+
+class _InMemoryLedger:
+    def __init__(self):
+        self.chat_turns = {}
+
+    async def get_chat_history(self, user_id, limit=5):
+        await asyncio.sleep(0)
+        turns = list(self.chat_turns.get(user_id, []))
+        return turns[-limit:]
+
+    async def save_chat_turn(self, user_id, role, content):
+        await asyncio.sleep(0)
+        self.chat_turns.setdefault(user_id, []).append({"role": role, "content": content})
+
+
+def _close_fire_and_forget(coro):
+    coro.close()
+
+
+def _build_process_message_test_orchestrator(
+    tmp_dir: str,
+    *,
+    skill_names,
+    schemas,
+    execute_tool_side_effect,
+    route_to_system_1_side_effect,
+    current_time: str,
+):
+    orchestrator = Orchestrator.__new__(Orchestrator)
+    orchestrator.pending_mfa = {}
+    orchestrator.pending_hitl_state = {}
+    orchestrator.pending_tool_approval = {}
+    orchestrator.core_memory = CoreMemory(f"{tmp_dir}/core_memory.json")
+    orchestrator.ledger_memory = _InMemoryLedger()
+    orchestrator.vector_memory = MagicMock()
+    orchestrator.vector_memory.add_memory_async = AsyncMock(return_value="mem-1")
+    orchestrator.charter_text = "Core Directive: Do no harm."
+    orchestrator.prompt_config = MagicMock(downloads_dir="downloads")
+    orchestrator.sensory_state = {
+        "current_time": current_time,
+        "os": "Windows 11",
+        "cpu_usage": "4%",
+        "cwd": "C:/Users/iboci/Live-Trading-bot/AI_Prototype",
+    }
+    orchestrator._background_tasks = set()
+    orchestrator._user_locks = {}
+    orchestrator._user_locks_lock = asyncio.Lock()
+    orchestrator._compiled_graph = None
+    orchestrator._try_resume_mfa = AsyncMock(return_value=None)
+    orchestrator._try_resume_tool_approval = AsyncMock(return_value=None)
+    orchestrator._run_graph_loop = AsyncMock(return_value="graph fallback should not run")
+    orchestrator._consolidate_memory = AsyncMock()
+    orchestrator._save_memory_async = AsyncMock()
+    orchestrator._fire_and_forget = _close_fire_and_forget
+
+    orchestrator.cognitive_router = MagicMock()
+    orchestrator.cognitive_router.sanitize_response = MagicMock(side_effect=lambda text: text)
+    orchestrator.cognitive_router.get_system_1_gate_metrics = MagicMock(return_value={})
+    orchestrator.cognitive_router.registry.get_skill_names.return_value = list(skill_names)
+    orchestrator.cognitive_router.registry.get_schemas.return_value = list(schemas)
+    orchestrator.cognitive_router._execute_tool = AsyncMock(side_effect=execute_tool_side_effect)
+    orchestrator.cognitive_router.route_to_system_1 = AsyncMock(side_effect=route_to_system_1_side_effect)
+    return orchestrator
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -251,3 +317,787 @@ class TestExpandedBlockedModules:
         )
         # Must not raise
         CognitiveRouter._validate_tool_code_ast(safe_code, "safe_tool")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Tool-loop guardrails — duplicate calls, invalid tool names, critic skip
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestToolLoopGuardrails:
+    @pytest.mark.asyncio
+    async def test_duplicate_tool_call_forces_text_synthesis(self):
+        router = CognitiveRouter.__new__(CognitiveRouter)
+        router._ollama_options = {}
+        router._ollama_timeout = 5.0
+        router._execute_tool = AsyncMock(
+            return_value=RouterResult(status="ok", content="Current time: 12:34:56")
+        )
+
+        first_message = {
+            "tool_calls": [{"function": {"name": "get_system_info", "arguments": {}}}]
+        }
+        duplicate_message = {
+            "message": {
+                "tool_calls": [{"function": {"name": "get_system_info", "arguments": {}}}]
+            }
+        }
+        synthesis_message = {"message": {"content": "The current time is 12:34:56."}}
+
+        client = MagicMock()
+        client.chat = AsyncMock(side_effect=[duplicate_message, synthesis_message])
+
+        result = await router._run_tool_loop(
+            client,
+            "gemma4:26b",
+            first_message,
+            [{"role": "user", "content": "What time is it?"}],
+            active_tools=[{"type": "function"}],
+        )
+
+        assert result.status == "ok"
+        assert result.content == "The current time is 12:34:56."
+        assert router._execute_tool.await_count == 1
+        assert client.chat.await_count == 2
+
+    @pytest.mark.asyncio
+    async def test_invalid_followup_tool_forces_answer_from_prior_results(self):
+        router = CognitiveRouter.__new__(CognitiveRouter)
+        router._ollama_options = {}
+        router._ollama_timeout = 5.0
+        router._execute_tool = AsyncMock(side_effect=[
+            RouterResult(status="ok", content="Search result: Vienna forecast is 18C and cloudy."),
+            RouterResult(status="ok", content="Error: Unknown tool 'run_python_code'."),
+        ])
+
+        first_message = {
+            "tool_calls": [{"function": {"name": "web_search", "arguments": {"query": "Vienna weather"}}}]
+        }
+        invalid_followup = {
+            "message": {
+                "tool_calls": [{"function": {"name": "run_python_code", "arguments": {"code": "print(1)"}}}]
+            }
+        }
+        synthesis_message = {"message": {"content": "Today in Vienna it is about 18C and cloudy."}}
+
+        client = MagicMock()
+        client.chat = AsyncMock(side_effect=[invalid_followup, synthesis_message])
+
+        result = await router._run_tool_loop(
+            client,
+            "gemma4:26b",
+            first_message,
+            [{"role": "user", "content": "What is the weather in Vienna today?"}],
+            active_tools=[{"type": "function"}],
+        )
+
+        assert result.status == "ok"
+        assert result.content == "Today in Vienna it is about 18C and cloudy."
+        assert router._execute_tool.await_count == 2
+        assert client.chat.await_count == 2
+
+
+class TestSystem1ConcurrencyGuard:
+    @pytest.mark.asyncio
+    async def test_system_1_calls_are_serialized_by_semaphore(self):
+        router = CognitiveRouter.__new__(CognitiveRouter)
+        router.local_model = "gemma4:e4b"
+        router._ollama_timeout = 5.0
+        router._ollama_options = {}
+        router._system_1_max_concurrency = 1
+        router._system_1_semaphore = asyncio.Semaphore(1)
+        router._system_1_active_requests = 0
+        router._system_1_waiting_requests = 0
+        router._system_1_wait_events = 0
+        router._system_1_total_wait_seconds = 0.0
+        router._system_1_peak_waiting_requests = 0
+        router._get_or_create_ollama_client = MagicMock(return_value=object())
+        router._format_ollama_tools = MagicMock(return_value=None)
+        router._run_tool_loop = AsyncMock()
+        router._handle_text_response = AsyncMock(side_effect=[
+            RouterResult(status="ok", content="first"),
+            RouterResult(status="ok", content="second"),
+        ])
+
+        first_entered = asyncio.Event()
+        release_first = asyncio.Event()
+        started_calls = 0
+
+        async def fake_call(*_args, **_kwargs):
+            nonlocal started_calls
+            started_calls += 1
+            if started_calls == 1:
+                first_entered.set()
+                await release_first.wait()
+            return {"message": {"content": f"response {started_calls}"}}, router.local_model
+
+        router._call_ollama_with_model_fallback = fake_call
+
+        task1 = asyncio.create_task(router.route_to_system_1([
+            {"role": "user", "content": "first request"}
+        ]))
+        await first_entered.wait()
+
+        task2 = asyncio.create_task(router.route_to_system_1([
+            {"role": "user", "content": "second request"}
+        ]))
+        await asyncio.sleep(0)
+
+        assert started_calls == 1
+
+        release_first.set()
+        result1, result2 = await asyncio.gather(task1, task2)
+
+        assert started_calls == 2
+        assert result1.content == "first"
+        assert result2.content == "second"
+
+    @pytest.mark.asyncio
+    async def test_system_1_queue_wait_is_logged_and_counted(self, caplog):
+        router = CognitiveRouter.__new__(CognitiveRouter)
+        router.local_model = "gemma4:e4b"
+        router._ollama_timeout = 5.0
+        router._ollama_options = {}
+        router._system_1_max_concurrency = 1
+        router._system_1_semaphore = asyncio.Semaphore(1)
+        router._system_1_active_requests = 0
+        router._system_1_waiting_requests = 0
+        router._system_1_wait_events = 0
+        router._system_1_total_wait_seconds = 0.0
+        router._system_1_peak_waiting_requests = 0
+        router._get_or_create_ollama_client = MagicMock(return_value=object())
+        router._format_ollama_tools = MagicMock(return_value=None)
+        router._run_tool_loop = AsyncMock()
+        router._handle_text_response = AsyncMock(side_effect=[
+            RouterResult(status="ok", content="first"),
+            RouterResult(status="ok", content="second"),
+        ])
+
+        first_entered = asyncio.Event()
+        release_first = asyncio.Event()
+        started_calls = 0
+
+        async def fake_call(*_args, **_kwargs):
+            nonlocal started_calls
+            started_calls += 1
+            if started_calls == 1:
+                first_entered.set()
+                await release_first.wait()
+            return {"message": {"content": f"response {started_calls}"}}, router.local_model
+
+        router._call_ollama_with_model_fallback = fake_call
+
+        with caplog.at_level("INFO", logger="src.core.llm_router"):
+            task1 = asyncio.create_task(router.route_to_system_1([
+                {"role": "user", "content": "first request"}
+            ]))
+            await first_entered.wait()
+
+            task2 = asyncio.create_task(router.route_to_system_1([
+                {"role": "user", "content": "second request"}
+            ]))
+            await asyncio.sleep(0)
+
+            release_first.set()
+            await asyncio.gather(task1, task2)
+
+        metrics = router.get_system_1_gate_metrics()
+
+        assert any("queuing local request" in message for message in caplog.messages)
+        assert any("slot acquired after" in message for message in caplog.messages)
+        assert metrics["wait_events"] == 1
+        assert metrics["peak_waiting_requests"] == 1
+        assert metrics["total_wait_seconds"] > 0
+        assert metrics["waiting_requests"] == 0
+
+
+class TestCriticSkipForDirectSupervisorReplies:
+    @pytest.mark.asyncio
+    async def test_critic_skips_when_no_worker_outputs_exist(self):
+        orchestrator = Orchestrator.__new__(Orchestrator)
+        state = _make_fresh_state(user_input="What time is it?")
+        state["final_response"] = "The current time is 12:34:56."
+
+        result = await Orchestrator.critic_node(orchestrator, state)
+
+        assert result["critic_feedback"] == "PASS"
+        assert result["final_response"] == "The current time is 12:34:56."
+        assert result["energy_remaining"] == 100
+
+    @pytest.mark.asyncio
+    async def test_critic_skips_short_single_agent_output(self):
+        orchestrator = Orchestrator.__new__(Orchestrator)
+        orchestrator.cognitive_router = MagicMock()
+        state = _make_fresh_state(user_input="Give me a quick summary")
+        state["current_plan"] = [
+            {"agent": "research_agent", "task": "Give a short summary", "reason": "Need a fast answer"}
+        ]
+        state["worker_outputs"] = {"research_agent": "Short answer."}
+
+        result = await Orchestrator.critic_node(orchestrator, state)
+
+        assert result["critic_feedback"] == "PASS"
+        assert result["final_response"] == "Short answer."
+        assert result["energy_remaining"] == 100
+
+    @pytest.mark.asyncio
+    async def test_critic_reviews_combined_independent_agent_output(self):
+        orchestrator = Orchestrator.__new__(Orchestrator)
+        orchestrator.cognitive_router = MagicMock()
+        orchestrator.charter_text = "Core Directive: Do no harm."
+        orchestrator.cognitive_router.get_system_2_available.return_value = False
+        orchestrator._route_to_system_1 = AsyncMock(return_value=RouterResult(status="ok", content="PASS"))
+
+        state = _make_fresh_state(user_input="Research and plan this change")
+        state["current_plan"] = [
+            {"agent": "research_agent", "task": "Gather the relevant facts", "reason": "Need evidence"},
+            {"agent": "planner_agent", "task": "Outline the implementation", "reason": "Need a plan"},
+        ]
+        state["worker_outputs"] = {
+            "research_agent": "This is a detailed research summary that is long enough to justify a critic review. " * 3,
+            "planner_agent": "This is a detailed implementation plan that is also long enough to justify a critic review. " * 3,
+        }
+
+        result = await Orchestrator.critic_node(orchestrator, state)
+
+        assert result["critic_feedback"] == "PASS"
+        orchestrator._route_to_system_1.assert_awaited_once()
+
+
+class TestCoreMemoryPromptContext:
+    @pytest.mark.asyncio
+    async def test_conversation_summary_excluded_from_prompt_by_default(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            memory = CoreMemory(f"{tmp_dir}/core_memory.json")
+            await memory.update("conversation_summary", "This stale summary should not be injected.")
+            await memory.update("current_focus", "testing")
+
+            context = await memory.get_context_string()
+
+            assert "Conversation_Summary" not in context
+            assert "Current_Focus" in context
+
+
+class TestRequestAssessment:
+    def test_time_query_routes_to_single_tool(self):
+        orchestrator = Orchestrator.__new__(Orchestrator)
+        orchestrator.cognitive_router = MagicMock()
+        orchestrator.cognitive_router.registry.get_schemas.return_value = [
+            {
+                "name": "get_system_info",
+                "description": "Returns the current date, time, timezone, and host platform details.",
+                "parameters": {"type": "object", "properties": {}, "required": []},
+            },
+            {
+                "name": "web_search",
+                "description": "Search the web for current information and news.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"query": {"type": "string"}, "max_results": {"type": "integer"}},
+                    "required": ["query"],
+                },
+            },
+        ]
+
+        assessment = Orchestrator._assess_request_route(
+            orchestrator,
+            "Can you tell me the time right now?",
+        )
+
+        assert assessment["mode"] == "single_tool"
+        assert assessment["tool_name"] == "get_system_info"
+
+    def test_weather_query_routes_to_web_search(self):
+        orchestrator = Orchestrator.__new__(Orchestrator)
+        orchestrator.cognitive_router = MagicMock()
+        orchestrator.cognitive_router.registry.get_schemas.return_value = [
+            {
+                "name": "get_system_info",
+                "description": "Returns the current date, time, timezone, and host platform details.",
+                "parameters": {"type": "object", "properties": {}, "required": []},
+            },
+            {
+                "name": "web_search",
+                "description": "Search the web for current information and weather.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"query": {"type": "string"}, "max_results": {"type": "integer"}},
+                    "required": ["query"],
+                },
+            },
+        ]
+
+        assessment = Orchestrator._assess_request_route(
+            orchestrator,
+            "What about the weather in Vienna, Austria?",
+        )
+
+        assert assessment["mode"] == "single_tool"
+        assert assessment["tool_name"] == "web_search"
+
+    def test_high_complexity_query_falls_back_to_graph(self):
+        orchestrator = Orchestrator.__new__(Orchestrator)
+        orchestrator.cognitive_router = MagicMock()
+        orchestrator.cognitive_router.registry.get_schemas.return_value = []
+
+        assessment = Orchestrator._assess_request_route(
+            orchestrator,
+            "Please analyze this PDF, summarize it, and then tell me what actions I should take next.",
+        )
+
+        assert assessment["mode"] == "graph"
+
+
+class TestFastPathResponses:
+    @pytest.mark.asyncio
+    async def test_time_query_uses_assessed_single_tool_path(self):
+        orchestrator = Orchestrator.__new__(Orchestrator)
+        orchestrator.cognitive_router = MagicMock()
+        orchestrator.cognitive_router.registry.get_schemas.return_value = [
+            {
+                "name": "get_system_info",
+                "description": "Returns the current date, time, timezone, and host platform details.",
+                "parameters": {"type": "object", "properties": {}, "required": []},
+            }
+        ]
+        orchestrator.cognitive_router._execute_tool = AsyncMock(
+            return_value=RouterResult(
+                status="ok",
+                content="DateTime: 2026-04-22 20:17:51 CEST +0200 | Platform: Windows 11 | Machine: AMD64",
+            )
+        )
+        orchestrator.cognitive_router.route_to_system_1 = AsyncMock(
+            return_value=RouterResult(
+                status="ok",
+                content="The current time is 2026-04-22 20:17:51 CEST +0200.",
+            )
+        )
+
+        result = await Orchestrator._try_fast_path_response(
+            orchestrator,
+            "Can you tell me the time right now?",
+        )
+
+        assert result == "The current time is 2026-04-22 20:17:51 CEST +0200."
+        orchestrator.cognitive_router._execute_tool.assert_awaited_once_with("get_system_info", {})
+        orchestrator.cognitive_router.route_to_system_1.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_weather_query_uses_assessed_single_tool_path(self):
+        orchestrator = Orchestrator.__new__(Orchestrator)
+        orchestrator.cognitive_router = MagicMock()
+        orchestrator.cognitive_router.registry.get_schemas.return_value = [
+            {
+                "name": "web_search",
+                "description": "Search the web for current information, weather, and news.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"query": {"type": "string"}, "max_results": {"type": "integer"}},
+                    "required": ["query"],
+                },
+            }
+        ]
+        orchestrator.cognitive_router._execute_tool = AsyncMock(
+            return_value=RouterResult(
+                status="ok",
+                content="1. Weather Vienna\n   URL: https://example.com\n   Vienna is currently 18C and cloudy.",
+            )
+        )
+        orchestrator.cognitive_router.route_to_system_1 = AsyncMock(
+            return_value=RouterResult(status="ok", content="Today in Vienna it is about 18C and cloudy.")
+        )
+
+        result = await Orchestrator._try_fast_path_response(
+            orchestrator,
+            "Nice, what about the weather in Vienna, Austria?",
+        )
+
+        assert result == "Today in Vienna it is about 18C and cloudy."
+        orchestrator.cognitive_router._execute_tool.assert_awaited_once()
+        _, kwargs = orchestrator.cognitive_router.route_to_system_1.await_args
+        assert kwargs["allowed_tools"] == []
+
+    @pytest.mark.asyncio
+    async def test_low_complexity_direct_query_uses_tool_free_route(self):
+        orchestrator = Orchestrator.__new__(Orchestrator)
+        orchestrator.cognitive_router = MagicMock()
+        orchestrator.cognitive_router.registry.get_schemas.return_value = []
+        orchestrator.cognitive_router.route_to_system_1 = AsyncMock(
+            return_value=RouterResult(status="ok", content="Hello. I'm here and ready.")
+        )
+
+        result = await Orchestrator._try_fast_path_response(
+            orchestrator,
+            "Hi Aiden",
+        )
+
+        assert result == "Hello. I'm here and ready."
+        orchestrator.cognitive_router.route_to_system_1.assert_awaited_once()
+
+
+class TestTranscriptRegressionFixes:
+    @pytest.mark.asyncio
+    async def test_capability_question_is_answered_without_running_web_search(self):
+        orchestrator = Orchestrator.__new__(Orchestrator)
+        orchestrator.cognitive_router = MagicMock()
+        orchestrator.cognitive_router.registry.get_skill_names.return_value = [
+            "web_search",
+            "search_archival_memory",
+            "extract_pdf_text",
+        ]
+        orchestrator.cognitive_router.registry.get_schemas.return_value = []
+        orchestrator.cognitive_router.route_to_system_1 = AsyncMock()
+        orchestrator.cognitive_router._execute_tool = AsyncMock()
+
+        result = await Orchestrator._try_fast_path_response(
+            orchestrator,
+            {
+                "user_id": "test_user",
+                "user_input": "Can you access the internet to check for that?",
+                "chat_history": [
+                    {"role": "user", "content": "Can you check the weather in Vienna, Austria today?"},
+                    {"role": "assistant", "content": "I do not have access to real-time weather updates."},
+                ],
+            },
+        )
+
+        assert "web_search" in result
+        orchestrator.cognitive_router._execute_tool.assert_not_awaited()
+        orchestrator.cognitive_router.route_to_system_1.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_last_shared_message_is_recalled_from_chat_history(self):
+        orchestrator = Orchestrator.__new__(Orchestrator)
+        orchestrator.cognitive_router = MagicMock()
+        orchestrator.cognitive_router.registry.get_schemas.return_value = []
+        orchestrator.cognitive_router.route_to_system_1 = AsyncMock()
+
+        result = await Orchestrator._try_fast_path_response(
+            orchestrator,
+            {
+                "user_id": "test_user",
+                "user_input": "what did you just shared",
+                "chat_history": [
+                    {"role": "assistant", "content": "1. Weather Vienna\nURL: https://example.com\nVienna is currently 18C and cloudy."},
+                ],
+            },
+        )
+
+        assert result.startswith("The last thing I shared was:")
+        assert "Weather Vienna" in result
+        orchestrator.cognitive_router.route_to_system_1.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_summary_request_uses_existing_chat_history(self):
+        orchestrator = Orchestrator.__new__(Orchestrator)
+        orchestrator.cognitive_router = MagicMock()
+        orchestrator.cognitive_router.registry.get_schemas.return_value = []
+        orchestrator.cognitive_router.route_to_system_1 = AsyncMock()
+
+        result = await Orchestrator._try_fast_path_response(
+            orchestrator,
+            {
+                "user_id": "test_user",
+                "user_input": "Can you summerize the conversation we had so far?",
+                "chat_history": [
+                    {"role": "user", "content": "Can you check the weather in Vienna, Austria today?"},
+                    {"role": "assistant", "content": "Today in Vienna it is about 18C and cloudy."},
+                    {"role": "user", "content": "Can you access the internet to check for that?"},
+                    {"role": "assistant", "content": "Yes. I can use my web_search tool for live web data."},
+                    {"role": "user", "content": "do you know my name"},
+                ],
+            },
+        )
+
+        assert "weather in vienna" in result.lower()
+        assert "do you know my name" in result.lower()
+        assert "first prompt" not in result.lower()
+        orchestrator.cognitive_router.route_to_system_1.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_user_profile_is_stored_and_recalled(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            orchestrator = Orchestrator.__new__(Orchestrator)
+            orchestrator.core_memory = CoreMemory(f"{tmp_dir}/core_memory.json")
+            orchestrator.cognitive_router = MagicMock()
+            orchestrator.cognitive_router.registry.get_skill_names.return_value = []
+            orchestrator.cognitive_router.registry.get_schemas.return_value = []
+            orchestrator.cognitive_router.route_to_system_1 = AsyncMock()
+
+            stored = await Orchestrator._remember_user_profile(
+                orchestrator,
+                "test_user",
+                "My name is Ilir, 37 years old",
+            )
+            name_result = await Orchestrator._try_fast_path_response(
+                orchestrator,
+                {
+                    "user_id": "test_user",
+                    "user_input": "do you know my name",
+                    "chat_history": [],
+                },
+            )
+            age_result = await Orchestrator._try_fast_path_response(
+                orchestrator,
+                {
+                    "user_id": "test_user",
+                    "user_input": "how old am i",
+                    "chat_history": [],
+                },
+            )
+
+        assert stored is True
+        assert "Ilir" in name_result
+        assert "37" in age_result
+
+    @pytest.mark.asyncio
+    async def test_process_message_loads_state_before_fast_path(self):
+        orchestrator = Orchestrator.__new__(Orchestrator)
+        orchestrator.pending_mfa = {}
+        orchestrator.pending_hitl_state = {}
+        orchestrator.pending_tool_approval = {}
+        orchestrator.cognitive_router = MagicMock()
+        orchestrator.cognitive_router.sanitize_response = MagicMock(side_effect=lambda text: text)
+        orchestrator._get_user_lock = AsyncMock(return_value=asyncio.Lock())
+        orchestrator._try_resume_mfa = AsyncMock(return_value=None)
+        orchestrator._try_resume_tool_approval = AsyncMock(return_value=None)
+        loaded_state = _make_fresh_state(user_id="test_user", user_input="Can you summerize the conversation we had so far?")
+        loaded_state["chat_history"] = [
+            {"role": "user", "content": "Can you check the weather in Vienna, Austria today?"},
+            {"role": "assistant", "content": "Today in Vienna it is about 18C and cloudy."},
+        ]
+        orchestrator._load_state = AsyncMock(return_value=loaded_state)
+        orchestrator._remember_user_profile = AsyncMock(return_value=False)
+        orchestrator._try_fast_path_response = AsyncMock(return_value="So far we've discussed: Can you check the weather in Vienna, Austria today?.")
+        orchestrator.ledger_memory = MagicMock()
+        orchestrator.ledger_memory.save_chat_turn = AsyncMock()
+        orchestrator._consolidate_memory = AsyncMock()
+        orchestrator._save_memory_async = AsyncMock()
+
+        def fake_fire_and_forget(coro):
+            coro.close()
+
+        orchestrator._fire_and_forget = fake_fire_and_forget
+
+        result = await Orchestrator.process_message(
+            orchestrator,
+            "Can you summerize the conversation we had so far?",
+            "test_user",
+        )
+
+        assert result.startswith("So far we've discussed:")
+        orchestrator._load_state.assert_awaited_once_with(
+            "test_user",
+            "Can you summerize the conversation we had so far?",
+        )
+        orchestrator._try_fast_path_response.assert_awaited_once_with(loaded_state)
+
+    @pytest.mark.asyncio
+    async def test_process_message_multi_turn_memory_and_capability_flow(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            async def fake_route_to_system_1(messages, allowed_tools=None):
+                await asyncio.sleep(0)
+                user_prompt = messages[-1]["content"]
+                if "Tool used: web_search" in user_prompt:
+                    return RouterResult(status="ok", content="Today in Vienna it is about 18C and cloudy.")
+                if "My name is Ilir, 37 years old" in user_prompt:
+                    return RouterResult(
+                        status="ok",
+                        content="It is nice to meet you, Ilir. I will remember your name and age for later.",
+                    )
+                return RouterResult(status="ok", content="Acknowledged.")
+
+            orchestrator = _build_process_message_test_orchestrator(
+                tmp_dir,
+                skill_names=["web_search", "search_archival_memory", "extract_pdf_text"],
+                schemas=[
+                    {
+                        "name": "web_search",
+                        "description": "Search the web for current information, weather, and news.",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {
+                                "query": {"type": "string"},
+                                "max_results": {"type": "integer"},
+                            },
+                            "required": ["query"],
+                        },
+                    }
+                ],
+                execute_tool_side_effect=AsyncMock(
+                    return_value=RouterResult(
+                        status="ok",
+                        content="1. Weather Vienna\n   URL: https://example.com\n   Vienna is currently 18C and cloudy.",
+                    )
+                ),
+                route_to_system_1_side_effect=fake_route_to_system_1,
+                current_time="2026-04-22 20:17:51",
+            )
+
+            weather_reply = await Orchestrator.process_message(
+                orchestrator,
+                "Can you check the weather in Vienna, Austria today?",
+                "test_user",
+            )
+            last_shared_reply = await Orchestrator.process_message(
+                orchestrator,
+                "what did you just shared",
+                "test_user",
+            )
+            internet_reply = await Orchestrator.process_message(
+                orchestrator,
+                "Can you access the internet to check for that?",
+                "test_user",
+            )
+            profile_ack = await Orchestrator.process_message(
+                orchestrator,
+                "My name is Ilir, 37 years old",
+                "test_user",
+            )
+            name_reply = await Orchestrator.process_message(
+                orchestrator,
+                "do you know my name",
+                "test_user",
+            )
+            summary_reply = await Orchestrator.process_message(
+                orchestrator,
+                "Can you summerize the conversation we had so far?",
+                "test_user",
+            )
+            assert weather_reply == "Today in Vienna it is about 18C and cloudy."
+            assert last_shared_reply.startswith("The last thing I shared was:")
+            assert "Today in Vienna" in last_shared_reply
+            assert "web_search" in internet_reply
+            assert "Ilir" in profile_ack
+            assert name_reply == "Yes. Your name is Ilir, and you told me that you are 37 years old."
+            assert "weather in vienna" in summary_reply.lower()
+            assert "my name is ilir, 37 years old" in summary_reply.lower()
+            assert orchestrator.cognitive_router._execute_tool.await_count == 1
+            assert orchestrator._run_graph_loop.await_count == 0
+            stored_profile = await orchestrator._get_user_profile("test_user")
+            assert stored_profile["name"] == "Ilir"
+            assert stored_profile["age"] == 37
+
+
+    @pytest.mark.asyncio
+    async def test_tool_repository_question_lists_registered_tools(self):
+        orchestrator = Orchestrator.__new__(Orchestrator)
+        orchestrator.cognitive_router = MagicMock()
+        orchestrator.cognitive_router.registry.get_skill_names.return_value = [
+            "web_search",
+            "search_archival_memory",
+            "update_core_memory",
+        ]
+        orchestrator.cognitive_router.registry.get_schemas.return_value = []
+        orchestrator.cognitive_router.route_to_system_1 = AsyncMock()
+
+        result = await Orchestrator._try_fast_path_response(
+            orchestrator,
+            {
+                "user_id": "test_user",
+                "user_input": "Do you have access to the tool repository?",
+                "chat_history": [],
+            },
+        )
+
+        assert "registered tool repository" in result
+        assert "web_search" in result
+        orchestrator.cognitive_router.route_to_system_1.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_process_message_handles_name_time_and_weather_followups(self):
+        async def fake_execute_tool(tool_name, arguments):
+            await asyncio.sleep(0)
+            if tool_name == "get_system_info":
+                return RouterResult(
+                    status="ok",
+                    content="DateTime: 2026-04-22 21:24:06 W. Europe Daylight Time +0200 | Platform: Windows 11 | Machine: AMD64",
+                )
+            if tool_name == "web_search":
+                return RouterResult(
+                    status="ok",
+                    content="1. Weather Vienna\n   URL: https://example.com\n   Vienna is currently 18C and cloudy.",
+                )
+            return RouterResult(status="ok", content="Unhandled tool")
+
+        async def fake_route_to_system_1(messages, allowed_tools=None):
+            await asyncio.sleep(0)
+            user_prompt = messages[-1]["content"]
+            if "Tool used: get_system_info" in user_prompt:
+                return RouterResult(status="ok", content="The current time is 21:24:06 (W. Europe Daylight Time, +0200) on April 22, 2026.")
+            if "Tool used: web_search" in user_prompt:
+                return RouterResult(status="ok", content="Today in Vienna it is about 18C and cloudy.")
+            return RouterResult(status="ok", content="Acknowledged.")
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            orchestrator = _build_process_message_test_orchestrator(
+                tmp_dir,
+                skill_names=["get_system_info", "web_search", "search_archival_memory", "update_core_memory"],
+                schemas=[
+                    {
+                        "name": "get_system_info",
+                        "description": "Returns the current date, time, timezone, and host platform details.",
+                        "parameters": {"type": "object", "properties": {}, "required": []},
+                    },
+                    {
+                        "name": "web_search",
+                        "description": "Search the web for current information, weather, and news.",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {
+                                "query": {"type": "string"},
+                                "max_results": {"type": "integer"},
+                            },
+                            "required": ["query"],
+                        },
+                    },
+                ],
+                execute_tool_side_effect=fake_execute_tool,
+                route_to_system_1_side_effect=fake_route_to_system_1,
+                current_time="2026-04-22 21:24:06",
+            )
+
+            missing_name_reply = await Orchestrator.process_message(
+                orchestrator,
+                "Can you tell my name",
+                "test_user",
+            )
+            assistant_name_reply = await Orchestrator.process_message(
+                orchestrator,
+                "What about yours",
+                "test_user",
+            )
+            time_reply = await Orchestrator.process_message(
+                orchestrator,
+                "Much better. Ok can you tell the time now?",
+                "test_user",
+            )
+            weather_reply = await Orchestrator.process_message(
+                orchestrator,
+                "What about the weather in Vienna, Austria today",
+                "test_user",
+            )
+            rename_ack = await Orchestrator.process_message(
+                orchestrator,
+                "Just for your information, your name is Aiden",
+                "test_user",
+            )
+            assistant_name_after_update = await Orchestrator.process_message(
+                orchestrator,
+                "What about yours",
+                "test_user",
+            )
+
+            stored_assistant_profile = await orchestrator.core_memory.get_all()
+
+            assert missing_name_reply == "Not yet. You have not told me your name."
+            assert assistant_name_reply == "My name is AIDEN."
+            assert "current time is 21:24:06" in time_reply.lower()
+            assert weather_reply == "Today in Vienna it is about 18C and cloudy."
+            assert "system diagnostic information" not in assistant_name_reply.lower()
+            assert "system information" not in weather_reply.lower()
+            assert rename_ack == "Understood. I will use Aiden as my name."
+            assert assistant_name_after_update == "My name is Aiden."
+            assert orchestrator.cognitive_router._execute_tool.await_count == 2
+            tool_names = [call.args[0] for call in orchestrator.cognitive_router._execute_tool.await_args_list]
+            assert tool_names == ["get_system_info", "web_search"]
+            assert stored_assistant_profile["assistant_profile"]["name"] == "Aiden"

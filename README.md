@@ -9,7 +9,7 @@ This project implements an autonomous, locally-hosted AI agent featuring a sophi
 The agent operates through several distinct cognitive systems and memory layers:
 
 #### Dual-System Cognitive Engine
-- **System 1 (Local LLM)**: Fast, private, and always available. Powered by local models (e.g., `gemma4:e4b` via Ollama). Used for routine pattern matching, tool calling, and initial responses. System 1 actively detects its own capability gaps.
+- **System 1 (Local LLM)**: Fast, private, and always available. Powered by local models (e.g., `gemma2:9b` via Ollama for optimal 8GB VRAM performance). Used for routine pattern matching, tool calling, and initial responses. System 1 actively detects its own capability gaps.
 - **System 2 (Cloud LLM)**: Deep reasoning, complex problem solving, and tool synthesis. Prioritises Groq (`llama-3.3-70b-versatile` - fast, free inference) and falls back to Gemini API via Google GenAI. Called when System 1 fails or encounters an explicit capability gap.
 
 #### Orchestrator & State Graph
@@ -60,6 +60,7 @@ AI_Prototype/
 - Python 3.10+
 - `pip`
 - [Ollama](https://ollama.com/) running locally (ensure `gemma4:e4b` or fallback model is pulled)
+- Ollama running locally (ensure `gemma2:9b` or your preferred 8B-9B model is pulled)
 - Telegram Bot Token & Admin User ID
 - API Keys for Groq (recommended) or Gemini.
 
@@ -89,7 +90,7 @@ Fill in the necessary credentials:
 ### 3. Start Local System 1
 Ensure Ollama is running and has the required model available:
 ```bash
-ollama run gemma4:e4b
+ollama run gemma2:9b
 ```
 
 ### 4. Run the Agent

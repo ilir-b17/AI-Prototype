@@ -398,6 +398,18 @@ async def _async_run(application: Application, orchestrator_inst: "Orchestrator"
         # a second parallel connection to the same DB (ISSUE-003).
         application.bot_data["ledger"] = orchestrator_inst.ledger_memory
 
+        # Re-send any HITL reminders that were queued before the outbound pipe
+        # existed (i.e. restored during async_init).  Now that the queue is live
+        # the admin will actually receive them in Telegram.
+        for _pending_state in orchestrator_inst.pending_hitl_state.values():
+            _question = _pending_state.get(
+                "_hitl_question",
+                "A task is awaiting your guidance. Please reply to continue.",
+            )
+            await outbound_queue.put(
+                f"\u26a0\ufe0f AIDEN restarted — pending task restored:\n\n{_question}"
+            )
+
         _heartbeat_task = asyncio.create_task(orchestrator_inst._heartbeat_loop())
         _sensory_task   = asyncio.create_task(orchestrator_inst._sensory_update_loop())
         _drain_task     = asyncio.create_task(_drain_outbound_queue(application.bot, outbound_queue))
@@ -419,13 +431,15 @@ async def _async_run(application: Application, orchestrator_inst: "Orchestrator"
             poll_interval=1.0,
         )
         await application.start()
-        logger.info("Telegram bot initialized and starting polling...")
+        logger.info("Telegram bot initialized and polling is active.")
+        logger.info(
+            "Waiting for Telegram updates. No further terminal output is expected until a message arrives "
+            "or shutdown begins."
+        )
 
         try:
             # Block here until cancelled by Ctrl+C or SIGTERM
             await asyncio.Event().wait()
-        except asyncio.CancelledError:
-            pass
         finally:
             logger.info("Shutting down — stopping polling and cleaning up...")
 
@@ -517,6 +531,8 @@ def main() -> None:
 
         try:
             asyncio.run(_named_run())
+        except asyncio.CancelledError:
+            logger.info("Bot shutdown requested")
         except KeyboardInterrupt:
             logger.info("Bot interrupted by user")
 

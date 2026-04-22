@@ -15,8 +15,9 @@ import json
 import asyncio
 import re
 import time
+from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
-from typing import Optional, Dict, Any, List
+from typing import Optional, Dict, Any, List, AsyncIterator
 from google import genai
 from google.genai import types as genai_types
 import ollama
@@ -97,6 +98,15 @@ _BLOCKED_TOP_LEVEL_MODULES = {
     "ast",          # can parse/compile/reconstruct blocked expressions at runtime
 }
 
+_BLOCKED_DUNDER_ATTRIBUTES = {
+    "__import__", "__loader__", "__builtins__", "__code__",
+    "__globals__", "__subclasses__", "__mro__", "__dict__",
+}
+
+_BLOCKED_TOOL_BUILTINS = {
+    "eval", "exec", "compile", "open", "__import__", "globals", "locals",
+}
+
 logger = logging.getLogger(__name__)
 
 GEMINI_API_KEY = os.getenv('GEMINI_API_KEY')
@@ -120,6 +130,9 @@ class CognitiveRouter:
         """
         # Normalize hallucinated / malformed tool names
         tool_name = self._normalize_tool_name(tool_name)
+
+        if arguments is None:
+            arguments = {}
 
         logger.info(f"Executing tool: {tool_name} with args: {list(arguments.keys())}")
 
@@ -213,7 +226,7 @@ class CognitiveRouter:
         logger.debug(f"sanitize_response output preview: {logged!r}")
         return text.strip()
 
-    def __init__(self, model_name: str = "gemini-2.0-flash", local_model: str = "gemma4:26b") -> None:
+    def __init__(self, model_name: str = "gemini-2.0-flash", local_model: str = "gemma4:e4b") -> None:
         self.model_name = model_name
         self.local_model = os.getenv("OLLAMA_MODEL", local_model)
         env_timeout = os.getenv("OLLAMA_TIMEOUT", "").strip()
@@ -221,6 +234,13 @@ class CognitiveRouter:
             self._ollama_timeout = float(env_timeout)
         else:
             self._ollama_timeout = 120.0 if "26b" in self.local_model else 60.0
+        self._system_1_max_concurrency = self._resolve_system_1_max_concurrency()
+        self._system_1_semaphore = asyncio.Semaphore(self._system_1_max_concurrency)
+        self._system_1_active_requests = 0
+        self._system_1_waiting_requests = 0
+        self._system_1_wait_events = 0
+        self._system_1_total_wait_seconds = 0.0
+        self._system_1_peak_waiting_requests = 0
         self._system2_cooldown_until = 0.0
 
         # SkillRegistry — single source of truth for all tool schemas and callables
@@ -262,7 +282,88 @@ class CognitiveRouter:
                 "Set GROQ_API_KEY (free at console.groq.com) or GEMINI_API_KEY + USE_GEMINI=True."
             )
 
-        logger.info(f"CognitiveRouter initialized. System 1: {local_model}")
+        logger.info(
+            "CognitiveRouter initialized. System 1: %s (max concurrency: %s)",
+            self.local_model,
+            self._system_1_max_concurrency,
+        )
+
+    @staticmethod
+    def _resolve_system_1_max_concurrency() -> int:
+        env_concurrency = os.getenv("SYSTEM_1_MAX_CONCURRENCY", "1").strip()
+        try:
+            return max(1, int(env_concurrency or "1"))
+        except ValueError:
+            logger.warning(
+                "Invalid SYSTEM_1_MAX_CONCURRENCY=%r. Falling back to 1.",
+                env_concurrency,
+            )
+            return 1
+
+    @asynccontextmanager
+    async def _system_1_slot(self) -> AsyncIterator[None]:
+        wait_started = time.perf_counter()
+        self._system_1_waiting_requests += 1
+        self._system_1_peak_waiting_requests = max(
+            self._system_1_peak_waiting_requests,
+            self._system_1_waiting_requests,
+        )
+        gate_busy = self._system_1_semaphore.locked()
+        if gate_busy:
+            logger.info(
+                "System 1 concurrency gate busy; queuing local request (active=%s waiting=%s max=%s)",
+                self._system_1_active_requests,
+                self._system_1_waiting_requests,
+                self._system_1_max_concurrency,
+            )
+
+        acquired = False
+        try:
+            await self._system_1_semaphore.acquire()
+            acquired = True
+            wait_seconds = time.perf_counter() - wait_started
+            self._system_1_waiting_requests -= 1
+            self._system_1_active_requests += 1
+
+            if gate_busy or wait_seconds >= 0.001:
+                self._system_1_wait_events += 1
+                self._system_1_total_wait_seconds += wait_seconds
+                logger.info(
+                    "System 1 slot acquired after %.3fs wait (active=%s waiting=%s max=%s)",
+                    wait_seconds,
+                    self._system_1_active_requests,
+                    self._system_1_waiting_requests,
+                    self._system_1_max_concurrency,
+                )
+
+            yield
+        finally:
+            if acquired:
+                self._system_1_active_requests = max(0, self._system_1_active_requests - 1)
+                self._system_1_semaphore.release()
+                logger.debug(
+                    "System 1 slot released (active=%s waiting=%s max=%s)",
+                    self._system_1_active_requests,
+                    self._system_1_waiting_requests,
+                    self._system_1_max_concurrency,
+                )
+            else:
+                self._system_1_waiting_requests = max(0, self._system_1_waiting_requests - 1)
+
+    def get_system_1_gate_metrics(self) -> Dict[str, float]:
+        average_wait = (
+            self._system_1_total_wait_seconds / self._system_1_wait_events
+            if self._system_1_wait_events else 0.0
+        )
+        return {
+            "active_requests": self._system_1_active_requests,
+            "waiting_requests": self._system_1_waiting_requests,
+            "max_concurrency": self._system_1_max_concurrency,
+            "wait_events": self._system_1_wait_events,
+            "total_wait_seconds": self._system_1_total_wait_seconds,
+            "average_wait_seconds": average_wait,
+            "peak_waiting_requests": self._system_1_peak_waiting_requests,
+        }
 
     async def close(self) -> None:
         """Release the cached Ollama client connection."""
@@ -315,7 +416,8 @@ class CognitiveRouter:
             raw_name = raw_name.rsplit(":", 1)[-1].strip()
 
         # Already a registered name?
-        skill_names = self.registry.get_skill_names()
+        registry = getattr(self, "registry", None)
+        skill_names = registry.get_skill_names() if registry is not None else []
         if raw_name in skill_names:
             return raw_name
 
@@ -332,6 +434,17 @@ class CognitiveRouter:
         return raw_name
 
     @staticmethod
+    def _is_invalid_tool_result(text: str) -> bool:
+        """Detect tool-execution failures caused by hallucinated names/args."""
+        if not text:
+            return False
+        lowered = text.strip().lower()
+        return (
+            lowered.startswith("error: unknown tool")
+            or lowered.startswith("error: bad arguments")
+        )
+
+    @staticmethod
     def _extract_failed_generation(err_text: str) -> str:
         if not err_text:
             return ""
@@ -345,18 +458,33 @@ class CognitiveRouter:
     def _extract_failed_generation_tool_call(text: str) -> Optional[tuple]:
         if not text:
             return None
-        m = re.search(
-            r"<function=([a-zA-Z0-9_]+)\s*\[?\]?\s*(\{.*?\})\s*</function>",
-            text,
-            re.DOTALL
-        )
-        if not m:
+
+        start = text.find("<function=")
+        if start == -1:
             return None
-        name = m.group(1).strip()
-        args_raw = m.group(2).strip()
+
+        end = text.find("</function>", start)
+        if end == -1:
+            return None
+
+        payload = text[start + len("<function="):end].strip()
+        name_match = re.match(r"(\w+)", payload)
+        if name_match is None:
+            return None
+
+        name = name_match.group(1).strip()
+        remainder = payload[name_match.end():].strip()
+        while remainder.startswith(("[", "]")):
+            remainder = remainder[1:].lstrip()
+
+        if not remainder.startswith("{"):
+            return name, {}
+
         try:
-            args = json.loads(args_raw)
+            args, _ = json.JSONDecoder().raw_decode(remainder)
         except (json.JSONDecodeError, TypeError):
+            args = {}
+        if not isinstance(args, dict):
             args = {}
         return name, args
 
@@ -465,15 +593,19 @@ class CognitiveRouter:
         return response, model
 
     @staticmethod
+    def _extract_tool_call_function_data(raw_tc: Any) -> Any:
+        if hasattr(raw_tc, "function"):
+            return raw_tc.function
+        if isinstance(raw_tc, dict):
+            return raw_tc.get("function", raw_tc)
+        return raw_tc
+
+    @staticmethod
     def _parse_native_tool_call(message: dict) -> tuple:
         """Extract (tool_name, arguments, success) from an Ollama tool_calls message."""
         try:
             raw_tc = message["tool_calls"][0]
-            fn_data = (
-                raw_tc.function if hasattr(raw_tc, "function")
-                else raw_tc.get("function", raw_tc) if isinstance(raw_tc, dict)
-                else raw_tc
-            )
+            fn_data = CognitiveRouter._extract_tool_call_function_data(raw_tc)
             tool_name = (
                 fn_data.get("name", "") if isinstance(fn_data, dict)
                 else getattr(fn_data, "name", "")
@@ -500,6 +632,254 @@ class CognitiveRouter:
             logger.error(f"Failed to parse tool_calls: {exc!r}", exc_info=True)
             return "", {}, False
 
+    @staticmethod
+    def _message_has_tool_calls(message: dict) -> bool:
+        return bool("tool_calls" in message and message["tool_calls"])
+
+    def _should_continue_tool_loop(self, message: dict, iters: int) -> bool:
+        return self._message_has_tool_calls(message) and iters < 10
+
+    @staticmethod
+    def _build_tool_signature(tool_name: str, arguments: dict) -> str:
+        try:
+            return json.dumps(
+                {"tool_name": tool_name, "arguments": arguments or {}},
+                sort_keys=True,
+                default=str,
+            )
+        except Exception:
+            return f"{tool_name}:{arguments!r}"
+
+    def _track_tool_call(
+        self,
+        tool_name: str,
+        arguments: dict,
+        seen_tool_calls: set,
+    ) -> str:
+        tool_signature = self._build_tool_signature(tool_name, arguments)
+        if tool_signature in seen_tool_calls:
+            logger.info(
+                f"System 1 repeated tool call '{tool_name}' — forcing text synthesis instead"
+            )
+            return (
+                "Do not call any more tools. Using only the successful tool results above, "
+                "answer the user's request directly."
+            )
+
+        seen_tool_calls.add(tool_signature)
+        return ""
+
+    def _handle_invalid_tool_request(
+        self,
+        exec_result: RouterResult,
+        tool_name: str,
+        current_messages: List[dict],
+        original_messages: List[dict],
+    ) -> tuple[Optional[RouterResult], str]:
+        if not self._is_invalid_tool_result(exec_result.content):
+            return None, ""
+
+        logger.warning(
+            f"System 1 requested invalid tool usage for '{tool_name}': {exec_result.content}"
+        )
+        if len(current_messages) == len(original_messages):
+            return RouterResult(
+                status="ok",
+                content=f"[System 1 - Error]: {exec_result.content}",
+            ), ""
+
+        return None, (
+            "A later tool request was invalid. Do not call any more tools. "
+            "Using only the successful tool results above, answer the user's request directly."
+        )
+
+    def _process_tool_execution_result(
+        self,
+        exec_result: RouterResult,
+        tool_name: str,
+        current_messages: List[dict],
+        original_messages: List[dict],
+    ) -> tuple[Optional[RouterResult], str]:
+        if exec_result.status != "ok":
+            return exec_result, ""
+        return self._handle_invalid_tool_request(
+            exec_result,
+            tool_name,
+            current_messages,
+            original_messages,
+        )
+
+    @staticmethod
+    def _append_tool_result_messages(
+        current_messages: List[dict],
+        tool_name: str,
+        arguments: dict,
+        tool_output: str,
+    ) -> List[dict]:
+        return current_messages + [
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [{"function": {"name": tool_name, "arguments": arguments}}],
+            },
+            {"role": "tool", "content": tool_output},
+        ]
+
+    async def _chat_with_ollama(
+        self,
+        client,
+        model: str,
+        messages: List[dict],
+        *,
+        tools=None,
+    ):
+        async with asyncio.timeout(self._ollama_timeout):
+            return await client.chat(
+                model=model,
+                messages=messages,
+                tools=tools,
+                options=self._ollama_options,
+            )
+
+    async def _chat_with_ollama_with_timeout(
+        self,
+        client,
+        model: str,
+        messages: List[dict],
+        timeout_seconds: float,
+        *,
+        tools=None,
+    ):
+        async with asyncio.timeout(timeout_seconds):
+            return await client.chat(
+                model=model,
+                messages=messages,
+                tools=tools,
+                options=self._ollama_options,
+            )
+
+    async def _summarize_pdf_tool_output(
+        self,
+        client,
+        model: str,
+        tool_name: str,
+        tool_output: str,
+    ) -> Optional[RouterResult]:
+        if not self._is_pdf_extraction_tool(tool_name):
+            return None
+        if tool_output.strip().lower().startswith("error:"):
+            return RouterResult(status="ok", content=tool_output.strip())
+
+        summary_messages = [
+            {
+                "role": "system",
+                "content": "You are a summarization engine. Summarize the provided PDF text faithfully."
+            },
+            {
+                "role": "user",
+                "content": (
+                    "PDF text:\n"
+                    f"{tool_output}\n\n"
+                    "Summarize in a concise report. Start with a 3–5 sentence abstract, "
+                    "then 5–8 bullet points. If the text ends with [TRUNCATED], mention "
+                    "the summary is based on a truncated excerpt."
+                ),
+            },
+        ]
+        try:
+            force_resp = await self._chat_with_ollama_with_timeout(
+                client,
+                model,
+                summary_messages,
+                60.0,
+            )
+            if force_resp and "message" in force_resp:
+                content = (force_resp["message"].get("content") or "").strip()
+                if content:
+                    logger.info("System 1 PDF summary generated")
+                    return RouterResult(status="ok", content=content)
+        except Exception as e:
+            logger.warning(f"PDF summary synthesis failed: {e}")
+        return RouterResult(status="ok", content="Error: Failed to summarize extracted PDF text.")
+
+    async def _fetch_tool_followup_message(
+        self,
+        client,
+        model: str,
+        current_messages: List[dict],
+        active_tools,
+    ) -> Optional[dict]:
+        response = await self._chat_with_ollama(
+            client,
+            model,
+            current_messages,
+            tools=active_tools,
+        )
+        if not (response and "message" in response):
+            logger.warning("Empty response during tool chain — stopping loop")
+            return None
+        return response["message"]
+
+    async def _advance_tool_loop(
+        self,
+        client,
+        model: str,
+        current_messages: List[dict],
+        tool_name: str,
+        arguments: dict,
+        tool_output: str,
+        active_tools,
+    ) -> tuple[List[dict], Optional[dict], Optional[RouterResult]]:
+        updated_messages = self._append_tool_result_messages(
+            current_messages,
+            tool_name,
+            arguments,
+            tool_output,
+        )
+        pdf_result = await self._summarize_pdf_tool_output(
+            client,
+            model,
+            tool_name,
+            tool_output,
+        )
+        if pdf_result is not None:
+            return updated_messages, None, pdf_result
+
+        next_message = await self._fetch_tool_followup_message(
+            client,
+            model,
+            updated_messages,
+            active_tools,
+        )
+        return updated_messages, next_message, None
+
+    async def _force_tool_result_synthesis(
+        self,
+        client,
+        model: str,
+        current_messages: List[dict],
+        force_synthesis_prompt: str,
+        content: str,
+        iters: int,
+    ) -> str:
+        if not (force_synthesis_prompt or not content) or iters <= 0:
+            return content
+
+        current_messages.append({
+            "role": "user",
+            "content": (
+                force_synthesis_prompt
+                or "Please summarise all the tool results above in a clear reply."
+            ),
+        })
+        try:
+            force_resp = await self._chat_with_ollama(client, model, current_messages)
+            if force_resp and "message" in force_resp:
+                return (force_resp["message"].get("content") or "").strip()
+        except Exception as e:
+            logger.warning(f"Force synthesis failed: {e}")
+        return content
+
     async def _run_tool_loop(self, client, model: str, first_message: dict,
                              messages: List[dict], active_tools) -> RouterResult:
         """Execute a chain of tool calls until the model returns plain text.
@@ -510,85 +890,63 @@ class CognitiveRouter:
         current_messages = list(messages)
         message = first_message
         iters = 0
+        seen_tool_calls = set()
+        force_synthesis_prompt = ""
 
-        while "tool_calls" in message and message["tool_calls"] and iters < 10:
+        while self._should_continue_tool_loop(message, iters):
             iters += 1
             tool_name, arguments, ok = self._parse_native_tool_call(message)
             if not ok:
                 break
 
+            tool_name = self._normalize_tool_name(tool_name)
+            force_synthesis_prompt = self._track_tool_call(
+                tool_name,
+                arguments,
+                seen_tool_calls,
+            )
+            if force_synthesis_prompt:
+                message = {"content": ""}
+                break
+
             exec_result = await self._execute_tool(tool_name, arguments)
-            if exec_result.status != "ok":
-                return exec_result
+            invalid_result, force_synthesis_prompt = self._process_tool_execution_result(
+                exec_result,
+                tool_name,
+                current_messages,
+                messages,
+            )
+            if invalid_result is not None:
+                return invalid_result
+            if force_synthesis_prompt:
+                message = {"content": ""}
+                break
 
             logger.info(f"System 1 tool call #{iters}: {tool_name} → {len(exec_result.content)} chars")
-            current_messages = current_messages + [
-                {"role": "assistant", "content": "",
-                 "tool_calls": [{"function": {"name": tool_name, "arguments": arguments}}]},
-                {"role": "tool", "content": exec_result.content},
-            ]
-
-            if self._is_pdf_extraction_tool(tool_name):
-                if exec_result.content.strip().lower().startswith("error:"):
-                    return RouterResult(status="ok", content=exec_result.content.strip())
-                summary_messages = [
-                    {
-                        "role": "system",
-                        "content": "You are a summarization engine. Summarize the provided PDF text faithfully."
-                    },
-                    {
-                        "role": "user",
-                        "content": (
-                            "PDF text:\n"
-                            f"{exec_result.content}\n\n"
-                            "Summarize in a concise report. Start with a 3–5 sentence abstract, "
-                            "then 5–8 bullet points. If the text ends with [TRUNCATED], mention "
-                            "the summary is based on a truncated excerpt."
-                        ),
-                    },
-                ]
-                try:
-                    force_resp = await asyncio.wait_for(
-                        client.chat(model=model, messages=summary_messages,
-                                    options=self._ollama_options),
-                        timeout=60.0,
-                    )
-                    if force_resp and "message" in force_resp:
-                        content = (force_resp["message"].get("content") or "").strip()
-                        if content:
-                            logger.info("System 1 PDF summary generated")
-                            return RouterResult(status="ok", content=content)
-                except Exception as e:
-                    logger.warning(f"PDF summary synthesis failed: {e}")
-                return RouterResult(status="ok", content="Error: Failed to summarize extracted PDF text.")
-            response = await asyncio.wait_for(
-                client.chat(model=model, messages=current_messages, tools=active_tools,
-                            options=self._ollama_options),
-                timeout=self._ollama_timeout,
+            current_messages, next_message, tool_result = await self._advance_tool_loop(
+                client,
+                model,
+                current_messages,
+                tool_name,
+                arguments,
+                exec_result.content,
+                active_tools,
             )
-            if not (response and "message" in response):
-                logger.warning("Empty response during tool chain — stopping loop")
+            if tool_result is not None:
+                return tool_result
+            if next_message is None:
                 break
-            message = response["message"]
+            message = next_message
 
         content = (message.get("content") or "").strip()
-        # If tools were executed but the model returned no text, force one synthesis
-        # pass regardless of whether the final message still carries tool_calls.
-        if not content and iters > 0:
-            current_messages.append({
-                "role": "user",
-                "content": "Please summarise all the tool results above in a clear reply.",
-            })
-            try:
-                force_resp = await asyncio.wait_for(
-                    client.chat(model=model, messages=current_messages,
-                                options=self._ollama_options),
-                    timeout=self._ollama_timeout,
-                )
-                if force_resp and "message" in force_resp:
-                    content = (force_resp["message"].get("content") or "").strip()
-            except Exception as e:
-                logger.warning(f"Force synthesis failed: {e}")
+        content = await self._force_tool_result_synthesis(
+            client,
+            model,
+            current_messages,
+            force_synthesis_prompt,
+            content,
+            iters,
+        )
 
         if content:
             logger.info(f"System 1 response after {iters} tool call(s) ({len(content)} chars)")
@@ -630,20 +988,21 @@ class CognitiveRouter:
         """
         logger.info(f"Routing to System 1 (Local Model - {self.local_model})")
         try:
-            client = self._get_or_create_ollama_client()
-            active_tools = self._format_ollama_tools(allowed_tools) or None
-            response, available_model = await self._call_ollama_with_model_fallback(
-                client, messages, active_tools
-            )
+            async with self._system_1_slot():
+                client = self._get_or_create_ollama_client()
+                active_tools = self._format_ollama_tools(allowed_tools) or None
+                response, available_model = await self._call_ollama_with_model_fallback(
+                    client, messages, active_tools
+                )
 
-            if not (response and "message" in response):
-                return RouterResult(status="ok", content="[System 1 - Error]: Unexpected response format from Ollama")
+                if not (response and "message" in response):
+                    return RouterResult(status="ok", content="[System 1 - Error]: Unexpected response format from Ollama")
 
-            message = response["message"]
-            if "tool_calls" in message and message["tool_calls"]:
-                return await self._run_tool_loop(client, available_model, message, list(messages), active_tools)
+                message = response["message"]
+                if "tool_calls" in message and message["tool_calls"]:
+                    return await self._run_tool_loop(client, available_model, message, list(messages), active_tools)
 
-            return await self._handle_text_response(message)
+                return await self._handle_text_response(message)
 
         except asyncio.TimeoutError:
             error_msg = (
@@ -833,6 +1192,39 @@ Rules:
             )
 
     @staticmethod
+    def _validate_ast_import_node(node: ast.AST, tool_name: str) -> bool:
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                CognitiveRouter._check_blocked_import(alias.name, tool_name)
+            return True
+        if isinstance(node, ast.ImportFrom) and node.module:
+            CognitiveRouter._check_blocked_import(node.module, tool_name)
+            return True
+        return False
+
+    @staticmethod
+    def _validate_ast_attribute_node(node: ast.AST, tool_name: str) -> bool:
+        if not isinstance(node, ast.Attribute):
+            return False
+        if node.attr in _BLOCKED_DUNDER_ATTRIBUTES:
+            raise ValueError(
+                f"Synthesised tool '{tool_name}' uses blocked dunder attribute access '{node.attr}'."
+            )
+        return True
+
+    @staticmethod
+    def _validate_ast_call_node(node: ast.AST, tool_name: str) -> bool:
+        if not isinstance(node, ast.Call):
+            return False
+
+        fn = node.func
+        if isinstance(fn, ast.Name) and fn.id in _BLOCKED_TOOL_BUILTINS:
+            raise ValueError(
+                f"Synthesised tool '{tool_name}' calls blocked builtin '{fn.id}'."
+            )
+        return True
+
+    @staticmethod
     def _validate_tool_code_ast(code: str, tool_name: str) -> None:
         """
         Parse the synthesised code as an AST and reject any import that
@@ -847,31 +1239,11 @@ Rules:
             raise ValueError(f"Synthesised code for '{tool_name}' has a syntax error: {exc}") from exc
 
         for node in ast.walk(tree):
-            if isinstance(node, ast.Import):
-                for alias in node.names:
-                    CognitiveRouter._check_blocked_import(alias.name, tool_name)
-            elif isinstance(node, ast.ImportFrom) and node.module:
-                CognitiveRouter._check_blocked_import(node.module, tool_name)
-            elif isinstance(node, ast.Attribute):
-                blocked_dunders = {
-                    "__import__", "__loader__", "__builtins__", "__code__",
-                    "__globals__", "__subclasses__", "__mro__", "__dict__",
-                }
-                if node.attr in blocked_dunders:
-                    raise ValueError(
-                        f"Synthesised tool '{tool_name}' uses blocked dunder attribute access '{node.attr}'."
-                    )
-            elif isinstance(node, ast.Call):
-                fn = node.func
-                # Dynamic synthesized tools are intentionally sandboxed to pure
-                # in-memory transformations. Direct file I/O or dynamic code
-                # execution calls are blocked at AST validation time.
-                if isinstance(fn, ast.Name) and fn.id in {
-                    "eval", "exec", "compile", "open", "__import__", "globals", "locals"
-                }:
-                    raise ValueError(
-                        f"Synthesised tool '{tool_name}' calls blocked builtin '{fn.id}'."
-                    )
+            if CognitiveRouter._validate_ast_import_node(node, tool_name):
+                continue
+            if CognitiveRouter._validate_ast_attribute_node(node, tool_name):
+                continue
+            CognitiveRouter._validate_ast_call_node(node, tool_name)
 
     def register_dynamic_tool(self, tool_name: str, code: str, schema_json: str) -> None:
         """Load synthesised Python code into the runtime via the SkillRegistry.
@@ -951,6 +1323,214 @@ Rules:
         else:
             raise RuntimeError("No System 2 provider configured. Set GROQ_API_KEY or GEMINI_API_KEY+USE_GEMINI=True.")
 
+    def _format_groq_tools(self, allowed_tools: Optional[List[str]]) -> List[dict]:
+        groq_tools = []
+        for tool in self.registry.get_schemas():
+            if allowed_tools is not None and tool["name"] not in allowed_tools:
+                continue
+            groq_tools.append({
+                "type": "function",
+                "function": {
+                    "name": tool["name"],
+                    "description": tool["description"],
+                    "parameters": tool["parameters"],
+                }
+            })
+        return groq_tools
+
+    async def _create_groq_completion(
+        self,
+        messages: List[Dict[str, str]],
+        allowed_tools: Optional[List[str]] = None,
+    ):
+        tool_kwargs = {}
+        groq_tools = self._format_groq_tools(allowed_tools)
+        if groq_tools:
+            tool_kwargs = {"tools": groq_tools, "tool_choice": "auto"}
+        return await self.groq_client.chat.completions.create(
+            model=self.groq_model,
+            messages=messages,
+            **tool_kwargs,
+            max_tokens=2048,
+        )
+
+    async def _create_groq_text_completion(self, messages: List[Dict[str, str]]):
+        return await self.groq_client.chat.completions.create(
+            model=self.groq_model,
+            messages=messages,
+            max_tokens=2048,
+        )
+
+    @staticmethod
+    def _choice_has_groq_tool_call(choice) -> bool:
+        return bool(choice.finish_reason == "tool_calls" and choice.message.tool_calls)
+
+    @staticmethod
+    def _parse_groq_tool_call(tool_call) -> tuple[str, dict]:
+        tool_name = tool_call.function.name
+        try:
+            arguments = json.loads(tool_call.function.arguments)
+        except (json.JSONDecodeError, TypeError):
+            arguments = {}
+        if not isinstance(arguments, dict):
+            arguments = {}
+        return tool_name, arguments
+
+    @staticmethod
+    def _build_pdf_summary_messages(tool_output: str) -> List[Dict[str, str]]:
+        return [
+            {
+                "role": "system",
+                "content": "You are a summarization engine. Summarize the provided PDF text faithfully."
+            },
+            {
+                "role": "user",
+                "content": (
+                    "PDF text:\n"
+                    f"{tool_output}\n\n"
+                    "Summarize in a concise report. Start with a 3–5 sentence abstract, "
+                    "then 5–8 bullet points. If the text ends with [TRUNCATED], mention "
+                    "the summary is based on a truncated excerpt."
+                ),
+            },
+        ]
+
+    async def _summarize_pdf_with_groq(self, tool_output: str) -> RouterResult:
+        if tool_output.strip().lower().startswith("error:"):
+            return RouterResult(status="ok", content=tool_output.strip())
+
+        final_response = await self._create_groq_text_completion(
+            self._build_pdf_summary_messages(tool_output)
+        )
+        result = (final_response.choices[0].message.content or "").strip()
+        logger.info(f"System 2 (Groq) PDF summary generated ({len(result)} chars)")
+        return RouterResult(status="ok", content=result)
+
+    @staticmethod
+    def _build_groq_followup_messages(
+        messages: List[Dict[str, str]],
+        tool_call,
+        tool_name: str,
+        tool_output: str,
+    ) -> List[dict]:
+        return list(messages) + [
+            {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [{
+                    "id": tool_call.id,
+                    "type": "function",
+                    "function": {"name": tool_name, "arguments": tool_call.function.arguments}
+                }]
+            },
+            {
+                "role": "tool",
+                "tool_call_id": tool_call.id,
+                "content": tool_output
+            }
+        ]
+
+    async def _handle_groq_tool_call(self, messages: List[Dict[str, str]], tool_call) -> RouterResult:
+        tool_name, arguments = self._parse_groq_tool_call(tool_call)
+        logger.info(f"Groq requested tool call: {tool_name}")
+
+        exec_result = await self._execute_tool(tool_name, arguments)
+        if exec_result.status != "ok":
+            return exec_result
+
+        logger.info(f"Groq tool '{tool_name}' executed: {exec_result.content[:100]}")
+        if tool_name == "extract_pdf_text":
+            return await self._summarize_pdf_with_groq(exec_result.content)
+
+        followup_messages = self._build_groq_followup_messages(
+            messages,
+            tool_call,
+            tool_name,
+            exec_result.content,
+        )
+        final_response = await self._create_groq_text_completion(followup_messages)
+        result = (final_response.choices[0].message.content or "").strip()
+        logger.info(f"System 2 (Groq) response after tool call ({len(result)} chars)")
+        return RouterResult(status="ok", content=result)
+
+    @staticmethod
+    def _extract_last_user_message(messages: List[Dict[str, str]]) -> str:
+        for msg in reversed(messages):
+            if msg.get("role") == "user":
+                return msg.get("content", "")
+        return ""
+
+    @staticmethod
+    def _extract_system_messages(messages: List[Dict[str, str]]) -> List[Dict[str, str]]:
+        return [msg for msg in messages if msg.get("role") == "system"]
+
+    @staticmethod
+    def _is_groq_rate_limit_error(err_text: str) -> bool:
+        lowered = err_text.lower()
+        return (
+            "rate limit" in lowered
+            or "rate_limit" in lowered
+            or "code: 429" in lowered
+        )
+
+    def _handle_groq_rate_limit(self, err_text: str) -> Optional[RouterResult]:
+        if not self._is_groq_rate_limit_error(err_text):
+            return None
+
+        cooldown_seconds = 1800
+        match = re.search(r"try again in (\d+)m(\d+(?:\.\d+)?)s", err_text)
+        if match:
+            cooldown_seconds = int(match.group(1)) * 60 + int(float(match.group(2)))
+        self._system2_cooldown_until = time.time() + cooldown_seconds
+        msg = self._format_cooldown_message() or "Rate limited. Please try again later."
+        logger.warning(f"Groq rate limit hit: {msg}")
+        return RouterResult(status="ok", content=f"[System 2 - Error]: {msg}")
+
+    @staticmethod
+    def _is_groq_tool_failure(err_text: str) -> bool:
+        return "tool_use_failed" in err_text or "failed_generation" in err_text
+
+    async def _retry_groq_after_tool_failure(
+        self,
+        messages: List[Dict[str, str]],
+        err_text: str,
+    ) -> Optional[RouterResult]:
+        failed_gen = self._extract_failed_generation(err_text)
+        parsed = self._extract_failed_generation_tool_call(failed_gen)
+        if not parsed:
+            return None
+
+        tool_name, arguments = parsed
+        logger.warning(f"Groq tool_use_failed; replaying tool call: {tool_name}")
+        exec_result = await self._execute_tool(tool_name, arguments)
+        if exec_result.status != "ok":
+            return exec_result
+
+        retry_messages = self._extract_system_messages(messages)
+        retry_messages.append({
+            "role": "user",
+            "content": (
+                f"User request: {self._extract_last_user_message(messages)}\n\n"
+                f"Tool output:\n{exec_result.content}\n\n"
+                "Answer using the tool output above. Do not call tools."
+            )
+        })
+        final_response = await self._create_groq_text_completion(retry_messages)
+        result = (final_response.choices[0].message.content or "").strip()
+        logger.info("System 2 (Groq) response generated after tool_use_failed recovery")
+        return RouterResult(status="ok", content=result)
+
+    async def _fallback_groq_without_tools(self, messages: List[Dict[str, str]]) -> RouterResult:
+        fallback_messages = self._extract_system_messages(messages)
+        fallback_messages.append({
+            "role": "user",
+            "content": "Tool calling failed. Respond without tools and explain any limitations."
+        })
+        final_response = await self._create_groq_text_completion(fallback_messages)
+        result = (final_response.choices[0].message.content or "").strip()
+        logger.info("System 2 (Groq) fallback response generated without tools")
+        return RouterResult(status="ok", content=result)
+
     async def _route_to_groq(
         self,
         messages: List[Dict[str, str]],
@@ -959,186 +1539,27 @@ Rules:
         """Route to Groq API (llama-3.3-70b or configured model) with full tool calling."""
         logger.info(f"Routing to System 2 (Groq/{self.groq_model})")
         try:
-            # Format tools in OpenAI-compatible format for Groq
-            groq_tools = []
-            for tool in self.registry.get_schemas():
-                if allowed_tools is not None and tool["name"] not in allowed_tools:
-                    continue
-                groq_tools.append({
-                    "type": "function",
-                    "function": {
-                        "name": tool["name"],
-                        "description": tool["description"],
-                        "parameters": tool["parameters"],
-                    }
-                })
-
-            tool_kwargs = {}
-            if groq_tools:
-                tool_kwargs = {"tools": groq_tools, "tool_choice": "auto"}
-
-            response = await self.groq_client.chat.completions.create(
-                model=self.groq_model,
-                messages=messages,
-                **tool_kwargs,
-                max_tokens=2048,
-            )
-
+            response = await self._create_groq_completion(messages, allowed_tools=allowed_tools)
             choice = response.choices[0]
 
-            # Handle tool calls
-            if choice.finish_reason == "tool_calls" and choice.message.tool_calls:
-                tool_call = choice.message.tool_calls[0]
-                tool_name = tool_call.function.name
-                try:
-                    arguments = json.loads(tool_call.function.arguments)
-                except (json.JSONDecodeError, TypeError):
-                    arguments = {}
+            if self._choice_has_groq_tool_call(choice):
+                return await self._handle_groq_tool_call(messages, choice.message.tool_calls[0])
 
-                logger.info(f"Groq requested tool call: {tool_name}")
-
-                # Delegate to _execute_tool — returns RouterResult
-                exec_result = await self._execute_tool(tool_name, arguments)
-                if exec_result.status != "ok":
-                    return exec_result  # Propagate MFA / HITL / capability-gap
-
-                logger.info(f"Groq tool '{tool_name}' executed: {exec_result.content[:100]}")
-
-                if tool_name == "extract_pdf_text":
-                    if exec_result.content.strip().lower().startswith("error:"):
-                        return RouterResult(status="ok", content=exec_result.content.strip())
-                    summary_messages = [
-                        {
-                            "role": "system",
-                            "content": "You are a summarization engine. Summarize the provided PDF text faithfully."
-                        },
-                        {
-                            "role": "user",
-                            "content": (
-                                "PDF text:\n"
-                                f"{exec_result.content}\n\n"
-                                "Summarize in a concise report. Start with a 3–5 sentence abstract, "
-                                "then 5–8 bullet points. If the text ends with [TRUNCATED], mention "
-                                "the summary is based on a truncated excerpt."
-                            ),
-                        },
-                    ]
-                    final_response = await self.groq_client.chat.completions.create(
-                        model=self.groq_model,
-                        messages=summary_messages,
-                        max_tokens=2048,
-                    )
-                    result = final_response.choices[0].message.content.strip()
-                    logger.info(f"System 2 (Groq) PDF summary generated ({len(result)} chars)")
-                    return RouterResult(status="ok", content=result)
-
-                # Follow-up in proper OpenAI tool-result format
-                followup_messages = list(messages) + [
-                    {
-                        "role": "assistant",
-                        "content": None,
-                        "tool_calls": [{
-                            "id": tool_call.id,
-                            "type": "function",
-                            "function": {"name": tool_name, "arguments": tool_call.function.arguments}
-                        }]
-                    },
-                    {
-                        "role": "tool",
-                        "tool_call_id": tool_call.id,
-                        "content": exec_result.content
-                    }
-                ]
-                if tool_name == "extract_pdf_text":
-                    followup_messages.append({
-                        "role": "user",
-                        "content": (
-                            "Summarize the extracted PDF text above in a concise report. "
-                            "Start with a 3–5 sentence abstract, then 5–8 bullet points. "
-                            "If the text ends with [TRUNCATED], mention that the summary is based on a truncated excerpt."
-                        ),
-                    })
-
-                final_response = await self.groq_client.chat.completions.create(
-                    model=self.groq_model,
-                    messages=followup_messages,
-                    max_tokens=2048,
-                )
-                result = final_response.choices[0].message.content.strip()
-                logger.info(f"System 2 (Groq) response after tool call ({len(result)} chars)")
-                return RouterResult(status="ok", content=result)
-
-            # Standard text response
-            result = choice.message.content.strip()
+            result = (choice.message.content or "").strip()
             logger.info(f"System 2 (Groq) response received ({len(result)} chars)")
             return RouterResult(status="ok", content=result)
 
         except Exception as e:
             err_text = str(e)
-            if "rate limit" in err_text.lower() or "rate_limit" in err_text.lower() or "code: 429" in err_text.lower():
-                cooldown_seconds = 1800
-                m = re.search(r"try again in (\d+)m(\d+(?:\.\d+)?)s", err_text)
-                if m:
-                    cooldown_seconds = int(m.group(1)) * 60 + int(float(m.group(2)))
-                self._system2_cooldown_until = time.time() + cooldown_seconds
-                msg = self._format_cooldown_message() or "Rate limited. Please try again later."
-                logger.warning(f"Groq rate limit hit: {msg}")
-                return RouterResult(status="ok", content=f"[System 2 - Error]: {msg}")
+            rate_limit_result = self._handle_groq_rate_limit(err_text)
+            if rate_limit_result is not None:
+                return rate_limit_result
 
-            if "tool_use_failed" in err_text or "failed_generation" in err_text:
-                failed_gen = self._extract_failed_generation(err_text)
-                parsed = self._extract_failed_generation_tool_call(failed_gen)
-                if parsed:
-                    tool_name, arguments = parsed
-                    logger.warning(f"Groq tool_use_failed; replaying tool call: {tool_name}")
-                    exec_result = await self._execute_tool(tool_name, arguments)
-                    if exec_result.status != "ok":
-                        return exec_result
-
-                    last_user = ""
-                    for msg in reversed(messages):
-                        if msg.get("role") == "user":
-                            last_user = msg.get("content", "")
-                            break
-
-                    retry_messages = []
-                    for msg in messages:
-                        if msg.get("role") == "system":
-                            retry_messages.append(msg)
-                    retry_messages.append({
-                        "role": "user",
-                        "content": (
-                            f"User request: {last_user}\n\n"
-                            f"Tool output:\n{exec_result.content}\n\n"
-                            "Answer using the tool output above. Do not call tools."
-                        )
-                    })
-                    final_response = await self.groq_client.chat.completions.create(
-                        model=self.groq_model,
-                        messages=retry_messages,
-                        max_tokens=2048,
-                    )
-                    result = final_response.choices[0].message.content.strip()
-                    logger.info("System 2 (Groq) response generated after tool_use_failed recovery")
-                    return RouterResult(status="ok", content=result)
-
-                # Fallback: respond without tools
-                fallback_messages = []
-                for msg in messages:
-                    if msg.get("role") == "system":
-                        fallback_messages.append(msg)
-                fallback_messages.append({
-                    "role": "user",
-                    "content": "Tool calling failed. Respond without tools and explain any limitations."
-                })
-                final_response = await self.groq_client.chat.completions.create(
-                    model=self.groq_model,
-                    messages=fallback_messages,
-                    max_tokens=2048,
-                )
-                result = final_response.choices[0].message.content.strip()
-                logger.info("System 2 (Groq) fallback response generated without tools")
-                return RouterResult(status="ok", content=result)
+            if self._is_groq_tool_failure(err_text):
+                retry_result = await self._retry_groq_after_tool_failure(messages, err_text)
+                if retry_result is not None:
+                    return retry_result
+                return await self._fallback_groq_without_tools(messages)
 
             logger.error(f"Groq error: {e}", exc_info=True)
             return RouterResult(status="ok", content=f"[System 2 - Error]: {str(e)[:200]}")
