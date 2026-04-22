@@ -1,6 +1,9 @@
 from __future__ import annotations
 
-from typing import Any, Dict, Optional
+from typing import Any, Optional, TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from src.core.orchestrator import Orchestrator
 
 try:
     from langgraph.graph import END, StateGraph
@@ -11,7 +14,7 @@ except Exception:
     LANGGRAPH_AVAILABLE = False
 
 
-def build_orchestrator_graph(orchestrator) -> Optional[Any]:
+def build_orchestrator_graph(orchestrator: "Orchestrator") -> Optional[Any]:
     """Build a LangGraph workflow for one supervisor->workers->critic pass."""
     if not LANGGRAPH_AVAILABLE:
         return None

@@ -583,6 +583,8 @@ class Orchestrator:
         messages = [{"role": "system", "content": system_prompt}]
         for turn in state.get("chat_history", []):
             messages.append({"role": turn["role"], "content": turn["content"]})
+        if state.get("critic_instructions"):
+            messages.append({"role": "system", "content": state["critic_instructions"]})
         messages.append({"role": "user", "content": f"<user_input>{user_input}</user_input>"})
 
         try:
@@ -930,7 +932,9 @@ class Orchestrator:
                 return await self._handle_blocked_result(state.pop(_BLOCKED_KEY), user_id, state)
 
             if state["iteration_count"] > 0:
-                state["user_input"] += f"\n[CRITIC FEEDBACK: {state['critic_feedback']}. Fix your output.]"
+                state["critic_instructions"] = (
+                    f"[CRITIC FEEDBACK: {state['critic_feedback']}. Fix your output.]"
+                )
 
             if self._compiled_graph is not None:
                 state = await self._compiled_graph.ainvoke(state)
@@ -947,12 +951,13 @@ class Orchestrator:
                 return await self._handle_blocked_result(state.pop(_BLOCKED_KEY), user_id, state)
 
             if state["critic_feedback"] == "PASS":
+                state["critic_instructions"] = ""
                 break
             logger.warning(f"Critic rejected output on iteration {state['iteration_count']}")
             state["final_response"] = ""
             state["worker_outputs"] = {}
             # Clear the stale plan so the supervisor re-plans with the Critic
-            # feedback injected into user_input (ISSUE-006).
+            # feedback injected via state["critic_instructions"] (ISSUE-006).
             state["current_plan"] = []
 
         if state["iteration_count"] >= max_iterations and state.get("critic_feedback") != "PASS":

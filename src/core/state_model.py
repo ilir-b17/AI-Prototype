@@ -19,6 +19,7 @@ class AgentState:
     energy_remaining: int = 100
     hitl_count: int = 0
     critic_feedback: str = ""
+    critic_instructions: str = ""
 
     @classmethod
     def new(cls, user_id: str, user_input: str) -> "AgentState":
@@ -38,6 +39,7 @@ class AgentState:
             energy_remaining=int(raw.get("energy_remaining", 100) or 100),
             hitl_count=int(raw.get("hitl_count", 0) or 0),
             critic_feedback=str(raw.get("critic_feedback", "") or ""),
+            critic_instructions=str(raw.get("critic_instructions", "") or ""),
         )
 
     def to_dict(self) -> Dict[str, Any]:

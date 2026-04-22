@@ -852,13 +852,23 @@ Rules:
                     CognitiveRouter._check_blocked_import(alias.name, tool_name)
             elif isinstance(node, ast.ImportFrom) and node.module:
                 CognitiveRouter._check_blocked_import(node.module, tool_name)
-            elif isinstance(node, ast.Attribute) and node.attr.startswith("__"):
-                raise ValueError(
-                    f"Synthesised tool '{tool_name}' uses blocked dunder attribute access '{node.attr}'."
-                )
+            elif isinstance(node, ast.Attribute):
+                blocked_dunders = {
+                    "__import__", "__loader__", "__builtins__", "__code__",
+                    "__globals__", "__subclasses__", "__mro__", "__dict__",
+                }
+                if node.attr in blocked_dunders:
+                    raise ValueError(
+                        f"Synthesised tool '{tool_name}' uses blocked dunder attribute access '{node.attr}'."
+                    )
             elif isinstance(node, ast.Call):
                 fn = node.func
-                if isinstance(fn, ast.Name) and fn.id in {"eval", "exec", "compile", "open", "__import__"}:
+                # Dynamic synthesized tools are intentionally sandboxed to pure
+                # in-memory transformations. Direct file I/O or dynamic code
+                # execution calls are blocked at AST validation time.
+                if isinstance(fn, ast.Name) and fn.id in {
+                    "eval", "exec", "compile", "open", "__import__", "globals", "locals"
+                }:
                     raise ValueError(
                         f"Synthesised tool '{tool_name}' calls blocked builtin '{fn.id}'."
                     )

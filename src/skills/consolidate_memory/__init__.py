@@ -1,3 +1,4 @@
+import asyncio
 import json
 import logging
 import os
@@ -34,9 +35,10 @@ async def consolidate_memory() -> str:
 
         try:
             user_ids = await ledger.get_recent_user_ids(limit=10)
-            history = []
-            for user_id in user_ids:
-                history.extend(await ledger.get_chat_history(user_id, limit=5))
+            histories = await asyncio.gather(
+                *(ledger.get_chat_history(user_id, limit=5) for user_id in user_ids)
+            ) if user_ids else []
+            history = [turn for user_history in histories for turn in user_history]
         finally:
             if owns_ledger:
                 await ledger.close()
