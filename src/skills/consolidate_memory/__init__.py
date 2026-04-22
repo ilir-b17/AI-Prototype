@@ -1,8 +1,7 @@
+import asyncio
 import json
 import logging
 import os
-
-import aiosqlite
 
 logger = logging.getLogger(__name__)
 
@@ -22,23 +21,28 @@ async def consolidate_memory() -> str:
     """Long-term cognitive compression: distil recent chat history into core memory."""
     logger.info("consolidate_memory: starting compression pass")
 
-    ledger_db_path = "data/ledger.db"
-    core_memory_path = "data/core_memory.json"
-
     try:
-        # Read chat history directly via aiosqlite (cross-user, no user_id filter)
-        async with aiosqlite.connect(ledger_db_path) as db:
-            db.row_factory = aiosqlite.Row
-            cursor = await db.execute(
-                "SELECT role, content FROM ("
-                "  SELECT id, role, content FROM chat_history"
-                "  WHERE user_id != 'heartbeat'"
-                "  ORDER BY id DESC LIMIT 50"
-                ") ORDER BY id ASC"
-            )
-            rows = await cursor.fetchall()
+        from src.core.runtime_context import get_core_memory, get_ledger
+        from src.memory.core_memory import CoreMemory
+        from src.memory.ledger_db import LedgerMemory
 
-        history = [{"role": r["role"], "content": r["content"]} for r in rows]
+        ledger = get_ledger()
+        owns_ledger = False
+        if ledger is None:
+            ledger = LedgerMemory()
+            await ledger.initialize()
+            owns_ledger = True
+
+        try:
+            user_ids = await ledger.get_recent_user_ids(limit=10)
+            histories = await asyncio.gather(
+                *(ledger.get_chat_history(user_id, limit=5) for user_id in user_ids)
+            ) if user_ids else []
+            history = [turn for user_history in histories for turn in user_history]
+        finally:
+            if owns_ledger:
+                await ledger.close()
+
         if not history:
             return "No chat history to consolidate."
 
@@ -75,8 +79,7 @@ async def consolidate_memory() -> str:
         if not insights:
             return "Consolidation complete: no new insights extracted."
 
-        from src.memory.core_memory import CoreMemory
-        core = CoreMemory(memory_file_path=core_memory_path)
+        core = get_core_memory() or CoreMemory()
         state = await core.get_all()
         existing = state.get("consolidated_insights", "")
         new_block = " | ".join(insights)

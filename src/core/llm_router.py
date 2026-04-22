@@ -102,6 +102,7 @@ logger = logging.getLogger(__name__)
 GEMINI_API_KEY = os.getenv('GEMINI_API_KEY')
 GROQ_API_KEY = os.getenv('GROQ_API_KEY')
 USE_GEMINI = os.getenv('USE_GEMINI', 'False').strip().lower() == 'true'
+TOOL_EXEC_TIMEOUT_SECONDS = float(os.getenv("TOOL_EXEC_TIMEOUT_SECONDS", "30"))
 
 
 class CognitiveRouter:
@@ -145,8 +146,20 @@ class CognitiveRouter:
             )
 
         # ── Registry dispatch ────────────────────────────────────────────────
-        content = await self.registry.execute(tool_name, arguments)
-        return RouterResult(status="ok", content=content)
+        try:
+            content = await asyncio.wait_for(
+                self.registry.execute(tool_name, arguments),
+                timeout=TOOL_EXEC_TIMEOUT_SECONDS,
+            )
+            return RouterResult(status="ok", content=content)
+        except asyncio.TimeoutError:
+            return RouterResult(
+                status="ok",
+                content=(
+                    f"Error: Tool '{tool_name}' exceeded "
+                    f"{int(TOOL_EXEC_TIMEOUT_SECONDS)}s timeout."
+                ),
+            )
 
     @staticmethod
     def sanitize_response(text: str) -> str:
@@ -839,6 +852,26 @@ Rules:
                     CognitiveRouter._check_blocked_import(alias.name, tool_name)
             elif isinstance(node, ast.ImportFrom) and node.module:
                 CognitiveRouter._check_blocked_import(node.module, tool_name)
+            elif isinstance(node, ast.Attribute):
+                blocked_dunders = {
+                    "__import__", "__loader__", "__builtins__", "__code__",
+                    "__globals__", "__subclasses__", "__mro__", "__dict__",
+                }
+                if node.attr in blocked_dunders:
+                    raise ValueError(
+                        f"Synthesised tool '{tool_name}' uses blocked dunder attribute access '{node.attr}'."
+                    )
+            elif isinstance(node, ast.Call):
+                fn = node.func
+                # Dynamic synthesized tools are intentionally sandboxed to pure
+                # in-memory transformations. Direct file I/O or dynamic code
+                # execution calls are blocked at AST validation time.
+                if isinstance(fn, ast.Name) and fn.id in {
+                    "eval", "exec", "compile", "open", "__import__", "globals", "locals"
+                }:
+                    raise ValueError(
+                        f"Synthesised tool '{tool_name}' calls blocked builtin '{fn.id}'."
+                    )
 
     def register_dynamic_tool(self, tool_name: str, code: str, schema_json: str) -> None:
         """Load synthesised Python code into the runtime via the SkillRegistry.

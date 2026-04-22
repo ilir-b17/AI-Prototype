@@ -83,6 +83,8 @@ Fill in the necessary credentials:
 - `GROQ_API_KEY`: Groq API Key (Preferred System 2)
 - `GEMINI_API_KEY`: Gemini API Key (Fallback System 2)
 - `USE_GEMINI`: `True` if you want to use Gemini.
+- `AIDEN_DOWNLOADS_DIR`: Optional downloads directory used by file/PDF/table skills (default: `downloads`)
+- `TOOL_EXEC_TIMEOUT_SECONDS`: Per-tool execution timeout guard (default: `30`)
 
 ### 3. Start Local System 1
 Ensure Ollama is running and has the required model available:
