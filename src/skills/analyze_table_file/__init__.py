@@ -5,11 +5,16 @@ import pandas as pd
 
 logger = logging.getLogger(__name__)
 
-_DOWNLOADS_DIR = os.path.abspath(os.path.join(
-    os.path.dirname(os.path.dirname(os.path.dirname(__file__))),
-    "..",
-    "downloads"
-))
+_DOWNLOADS_DIR = os.path.abspath(
+    os.getenv(
+        "AIDEN_DOWNLOADS_DIR",
+        os.path.join(
+            os.path.dirname(os.path.dirname(os.path.dirname(__file__))),
+            "..",
+            "downloads",
+        ),
+    )
+)
 
 
 def _resolve_data_path(file_path: str) -> str:

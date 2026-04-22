@@ -25,6 +25,10 @@ from src.memory.vector_db import VectorMemory
 from src.memory.ledger_db import LedgerMemory, LogLevel
 from src.memory.core_memory import CoreMemory
 from src.core.llm_router import CognitiveRouter, RouterResult, RequiresMFAError, RequiresHITLError, RequiresCapabilitySynthesisError
+from src.core.prompt_config import load_prompt_config, build_supervisor_prompt
+from src.core.runtime_context import set_runtime_context
+from src.core.state_model import AgentState, normalize_state
+from src.core.workflow_graph import build_orchestrator_graph
 from src.core.security import verify_mfa_challenge
 
 try:
@@ -77,6 +81,7 @@ class Orchestrator:
             self.ledger_memory = LedgerMemory(db_path=ledger_db_path)
             self.core_memory = CoreMemory(memory_file_path=core_memory_path)
             self.cognitive_router = CognitiveRouter(model_name=gemini_model, local_model=local_model)
+            self.prompt_config = load_prompt_config()
 
             self.charter_text = self._load_charter()
             self.pending_mfa: Dict[str, dict] = {}
@@ -89,6 +94,7 @@ class Orchestrator:
             # Per-user async locks to serialise concurrent messages (ISSUE-012)
             self._user_locks: Dict[str, asyncio.Lock] = {}
             self._user_locks_lock: asyncio.Lock = asyncio.Lock()
+            self._compiled_graph = None
             self._refresh_sensory_state()
 
             logger.info("Orchestrator __init__ complete — call async_init() to finish setup")
@@ -107,6 +113,8 @@ class Orchestrator:
         await self._load_approved_tools()
         await self._load_pending_approvals()
         await self._load_pending_hitl()
+        self._compiled_graph = build_orchestrator_graph(self)
+        set_runtime_context(self.ledger_memory, self.core_memory)
         # Record the host OS now that we're in an async context
         await self.core_memory.update("host_os", platform.system())
         logger.info("Orchestrator async_init complete")
@@ -198,18 +206,7 @@ class Orchestrator:
             return ""
 
     def _new_state(self, user_id: str, user_message: str) -> Dict[str, Any]:
-        return {
-            "user_id": user_id,
-            "user_input": user_message,
-            "chat_history": [],
-            "current_plan": [],
-            "worker_outputs": {},
-            "final_response": "",
-            "iteration_count": 0,
-            "admin_guidance": "",
-            "energy_remaining": 100,
-            "hitl_count": 0,
-        }
+        return AgentState.new(user_id=user_id, user_input=user_message).to_dict()
 
     def _deduct_energy(self, state: Dict[str, Any], amount: int, reason: str) -> Dict[str, Any]:
         """Deduct energy and raise HITL if exhausted."""
@@ -565,6 +562,7 @@ class Orchestrator:
 
     async def supervisor_node(self, state: Dict[str, Any]) -> Dict[str, Any]:
         """Plans execution. Tries System 1 (local) first per Directive 1.3; escalates to System 2 only on failure."""
+        state = normalize_state(state)
         state = self._deduct_energy(state, ENERGY_COST_SUPERVISOR, "supervisor")
         user_input = state["user_input"]
         core_mem_str = await self.core_memory.get_context_string()
@@ -572,31 +570,14 @@ class Orchestrator:
         capabilities_str = self._get_capabilities_string()
         archival_block = f"{archival_context}\n\n" if archival_context else ""
 
-        system_prompt = (
-            f"You are AIDEN — a local autonomous AI agent on the Admin's machine (Ollama). "
-            f"You are NOT ChatGPT/Claude/Gemini. "
-            f"You have persistent memory: the chat history above is real (SQLite). "
-            f"You have tools — never deny capabilities listed below. "
-            f"Reply in plain conversational text, no markdown headers. "
-            f"Private reasoning: wrap in <think>...</think> — it will be stripped.\n\n"
-            f"CRITICAL RULES:\n"
-            f"- NEVER fabricate or simulate tool results. If a tool returns an error, report the exact error to the user honestly. Do NOT invent summaries, page counts, or any content that the tool did not actually return.\n"
-            f"- If you cannot complete a task due to a tool error, say so clearly and ask the user for help.\n\n"
-            f"FILE ACCESS: The Admin's downloads folder for you to read files from is: "
-            f"C:\\Users\\iboci\\Live-Trading-bot\\AI_Prototype\\downloads\\\n\n"
-            f"PDF RULE: If the user asks to read or summarize a PDF, you MUST call "
-            f"`extract_pdf_text` first (use the downloads folder if only a filename is given).\n\n"
-            f"WEB RULE: After `web_search`, call `extract_web_article` to read the chosen URL before summarizing.\n\n"
-            f"DATA RULE: For CSV/Excel analysis, use `analyze_table_file` instead of reading raw text.\n\n"
-            f"{self._get_sensory_context()}\n\n"
-            f"OS CONTEXT: You are running on {self.sensory_state.get('os', platform.system())}. "
-            f"Use OS-appropriate shell commands (e.g., 'dir' instead of 'ls' on Windows). "
-            f"Preferentially use your `manage_file_system` Python tool for OS-agnostic file exploration.\n\n"
-            f"{self.charter_text}\n{core_mem_str}\n\n"
-            f"{archival_block}"
-            f"{capabilities_str}\n\n"
-            f"Respond to the user, then on the very last line declare which workers are needed.\n"
-            f'Format: WORKERS: [] for chat, WORKERS: ["research_agent"] or ["coder_agent"] for tasks.'
+        system_prompt = build_supervisor_prompt(
+            charter_text=self.charter_text,
+            core_mem_str=core_mem_str,
+            archival_block=archival_block,
+            capabilities_str=capabilities_str,
+            sensory_context=self._get_sensory_context(),
+            os_name=self.sensory_state.get("os", platform.system()),
+            downloads_dir=self.prompt_config.downloads_dir,
         )
 
         messages = [{"role": "system", "content": system_prompt}]
@@ -642,8 +623,26 @@ class Orchestrator:
 
         return state
 
+    async def execute_workers_node(self, state: Dict[str, Any]) -> Dict[str, Any]:
+        """LangGraph worker-execution node: runs all workers declared in current_plan."""
+        state = normalize_state(state)
+        if not state.get("current_plan"):
+            if not state.get("final_response"):
+                state["final_response"] = "No response could be generated. Please try again."
+            return state
+
+        for task in state["current_plan"]:
+            if "research" in task.lower():
+                state = await self.research_agent(state)
+            elif "coder" in task.lower():
+                state = await self.coder_agent(state)
+            if state.get(_BLOCKED_KEY):
+                return state
+        return state
+
     async def research_agent(self, state: Dict[str, Any]) -> Dict[str, Any]:
         """Worker: searches archival memory for relevant context."""
+        state = normalize_state(state)
         state = self._deduct_energy(state, ENERGY_COST_WORKER, "research_agent")
         core_mem_str = await self.core_memory.get_context_string()
 
@@ -693,6 +692,7 @@ class Orchestrator:
 
     async def coder_agent(self, state: Dict[str, Any]) -> Dict[str, Any]:
         """Worker: executes coding tasks, updates memory/ledger."""
+        state = normalize_state(state)
         state = self._deduct_energy(state, ENERGY_COST_WORKER, "coder_agent")
         core_mem_str = await self.core_memory.get_context_string()
         research_context = state["worker_outputs"].get("research", "")
@@ -748,6 +748,7 @@ class Orchestrator:
 
     async def critic_node(self, state: Dict[str, Any]) -> Dict[str, Any]:
         """Checks worker output against the charter. Skipped for direct supervisor responses."""
+        state = normalize_state(state)
         state = self._deduct_energy(state, ENERGY_COST_CRITIC, "critic")
         output_to_eval = self._get_output_to_evaluate(state)
 
@@ -878,7 +879,7 @@ class Orchestrator:
     async def _load_state(self, user_id: str, user_message: str) -> Dict[str, Any]:
         """Return a state dict: resumes a HITL conversation if pending, else creates fresh."""
         if user_id in self.pending_hitl_state:
-            state = self.pending_hitl_state.pop(user_id)
+            state = normalize_state(self.pending_hitl_state.pop(user_id))
             # Clear the persisted DB record now that we've resumed (ISSUE-013)
             try:
                 await self.ledger_memory.clear_hitl_state(user_id)
@@ -905,17 +906,18 @@ class Orchestrator:
                     "could not be completed. The request has been abandoned to prevent "
                     "an infinite loop. Please rephrase or break it into smaller steps."
                 )
-            return state
+            return normalize_state(state)
         state = self._new_state(user_id, user_message)
         if user_id != "heartbeat":
             try:
                 state["chat_history"] = await self.ledger_memory.get_chat_history(user_id, limit=5)
             except Exception as e:
                 logger.warning(f"Failed to load chat history for {user_id}: {e}")
-        return state
+        return normalize_state(state)
 
     async def _run_graph_loop(self, state: Dict[str, Any], user_id: str, user_message: str) -> str:
         """Execute the supervisor → workers → critic loop. Returns the final sanitized response."""
+        state = normalize_state(state)
         max_iterations = 3
 
         # Fast-exit if the state already carries a final response before we enter
@@ -927,30 +929,19 @@ class Orchestrator:
             if state.get(_BLOCKED_KEY):
                 return await self._handle_blocked_result(state.pop(_BLOCKED_KEY), user_id, state)
 
-            if not state["current_plan"] and state["iteration_count"] == 0:
-                state = await self.supervisor_node(state)
-            else:
+            if state["iteration_count"] > 0:
                 state["user_input"] += f"\n[CRITIC FEEDBACK: {state['critic_feedback']}. Fix your output.]"
 
-            if state.get(_BLOCKED_KEY):
-                return await self._handle_blocked_result(state.pop(_BLOCKED_KEY), user_id, state)
-
-            if not state["current_plan"] and state.get("final_response"):
-                break
-
-            for task in state["current_plan"]:
-                if "research" in task.lower():
-                    state = await self.research_agent(state)
-                elif "coder" in task.lower():
-                    state = await self.coder_agent(state)
+            if self._compiled_graph is not None:
+                state = await self._compiled_graph.ainvoke(state)
+            else:
+                state = await self.supervisor_node(state)
                 if state.get(_BLOCKED_KEY):
                     return await self._handle_blocked_result(state.pop(_BLOCKED_KEY), user_id, state)
-
-            if not state["current_plan"] and not state.get("final_response"):
-                state["final_response"] = "No response could be generated. Please try again."
-                break
-
-            state = await self.critic_node(state)
+                state = await self.execute_workers_node(state)
+                if state.get(_BLOCKED_KEY):
+                    return await self._handle_blocked_result(state.pop(_BLOCKED_KEY), user_id, state)
+                state = await self.critic_node(state)
 
             if state.get(_BLOCKED_KEY):
                 return await self._handle_blocked_result(state.pop(_BLOCKED_KEY), user_id, state)
@@ -1077,6 +1068,7 @@ class Orchestrator:
 
     def close(self) -> None:
         try:
+            set_runtime_context(None, None)
             if hasattr(self, 'vector_memory') and self.vector_memory:
                 self.vector_memory.close()
             if hasattr(self, 'cognitive_router') and self.cognitive_router:
