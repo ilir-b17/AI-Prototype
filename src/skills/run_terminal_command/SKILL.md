@@ -1,21 +1,20 @@
 # run_terminal_command
 
-Execute shell commands on the system. Security controls block inherently destructive commands, and a strict 10-second timeout applies.
-
-Use this to inspect system resources, run `git status`, or run `pip install` when a newly proposed skill requires new dependencies.
+Executes a command in the underlying shell (bash/cmd).
+Outputs standard STDOUT and STDERR or returns detailed JSON error messages upon failure.
 
 ## Schema
 
 ```json
 {
   "name": "run_terminal_command",
-  "description": "Execute shell commands safely. Use this to inspect system resources, run `git status`, or run `pip install` when a newly proposed skill requires new dependencies.",
+  "description": "Executes a string command in the underlying system terminal. Useful for running shell utilities, git commands, checking processes, etc. Destructive commands (rm, mv, shutdown) will be blocked. Includes a configurable execution timeout to prevent hanging. Returns standard output/error, or JSON error details if execution fails.",
   "parameters": {
     "type": "object",
     "properties": {
       "command": {
         "type": "string",
-        "description": "The shell command to execute."
+        "description": "The shell command string to execute."
       }
     },
     "required": ["command"]

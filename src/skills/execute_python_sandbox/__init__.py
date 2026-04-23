@@ -6,9 +6,11 @@ import logging
 
 logger = logging.getLogger(__name__)
 
+import json
+
 async def execute_python_sandbox(code_string: str) -> str:
     """
-    Executes Python code safely in a subprocess with a strict 10-second timeout.
+    Executes Python code safely in a subprocess with a configurable timeout.
 
     Uses asyncio.create_subprocess_exec so that:
     - The event loop is never blocked (no thread pool required).
@@ -16,6 +18,18 @@ async def execute_python_sandbox(code_string: str) -> str:
       leaving it orphaned in a thread-pool worker.
     """
     logger.info("execute_python_sandbox called.")
+
+    if not isinstance(code_string, str) or not code_string.strip():
+        return json.dumps({
+            "status": "error",
+            "message": "Invalid code_string",
+            "details": "The code_string must be a non-empty Python script."
+        })
+
+    try:
+        timeout_seconds = float(os.getenv("TOOL_EXEC_TIMEOUT_SECONDS", "10.0"))
+    except ValueError:
+        timeout_seconds = 10.0
 
     tmp_dir_obj = tempfile.TemporaryDirectory()
     process: asyncio.subprocess.Process = None
@@ -28,7 +42,11 @@ async def execute_python_sandbox(code_string: str) -> str:
                 f.write(code_string)
         except Exception as e:
             logger.error(f"Failed to write temporary script: {e}", exc_info=True)
-            return "Error: Failed to write the temporary script to disk."
+            return json.dumps({
+                "status": "error",
+                "message": "Failed to write temporary script",
+                "details": str(e)
+            })
 
         try:
             process = await asyncio.create_subprocess_exec(
@@ -38,15 +56,16 @@ async def execute_python_sandbox(code_string: str) -> str:
             )
             try:
                 stdout, stderr = await asyncio.wait_for(
-                    process.communicate(), timeout=10
+                    process.communicate(), timeout=timeout_seconds
                 )
             except asyncio.TimeoutError:
                 process.kill()
                 await process.wait()
-                return (
-                    "Error: The python script execution exceeded the strict "
-                    "10-second timeout limit and was terminated."
-                )
+                return json.dumps({
+                    "status": "error",
+                    "message": f"Execution timeout exceeded ({timeout_seconds}s)",
+                    "details": "The Python script took too long to complete and was terminated. Check for infinite loops or long network requests."
+                })
         except asyncio.CancelledError:
             # Ensure the child process is terminated when the parent task is
             # cancelled so it does not continue running in the background.
@@ -67,6 +86,10 @@ async def execute_python_sandbox(code_string: str) -> str:
         raise
     except Exception as e:
         logger.error(f"execute_python_sandbox error: {e}", exc_info=True)
-        return "An error occurred while trying to execute the python script."
+        return json.dumps({
+            "status": "error",
+            "message": "An error occurred during sandbox execution",
+            "details": str(e)
+        })
     finally:
         tmp_dir_obj.cleanup()

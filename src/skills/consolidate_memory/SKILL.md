@@ -1,20 +1,13 @@
 # consolidate_memory
 
-Performs long-term cognitive compression on recent chat history.
-Retrieves the last 50 chat turns (excluding heartbeat tasks), uses
-System 2 (Groq `llama-3.1-8b-instant`) to extract persistent user
-preferences, facts, and patterns, then writes the distilled insights
-to `core_memory.json` under the `consolidated_insights` key.
-
-Intended for use by the heartbeat loop on the scheduled
-"Run memory consolidation on recent chat history" Task.
+Distills recent episodic chat history into permanent core memory.
 
 ## Schema
 
 ```json
 {
   "name": "consolidate_memory",
-  "description": "Performs long-term cognitive compression on recent chat history, extracting persistent user preferences and facts into core memory.",
+  "description": "Performs long-term cognitive compression. Analyzes the recent conversation ledger to extract permanent insights, user preferences, and constraints, saving them to core memory. Use this periodically (e.g., at the end of a long interaction or complex task) to ensure the AI remembers important facts for future sessions.",
   "parameters": {
     "type": "object",
     "properties": {},

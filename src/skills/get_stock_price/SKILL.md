@@ -1,22 +1,19 @@
 # get_stock_price
 
-Fetches the latest market price for a stock ticker using `yfinance` (Yahoo Finance).
-Returns the current price, previous close, and percentage change.
-
-Use this whenever the user asks about a stock price, share price, or market quote.
+Retrieves current market data for a given stock ticker symbol.
 
 ## Schema
 
 ```json
 {
   "name": "get_stock_price",
-  "description": "Fetch the latest stock market price for a given ticker symbol (e.g. GOOGL, AAPL, TSLA). Returns current price, previous close, and daily change. Use whenever the user asks about a stock price or market quote.",
+  "description": "Fetches the latest market price, daily change, and previous close for a given stock ticker symbol (e.g., 'AAPL', 'MSFT') using Yahoo Finance. Returns structured JSON containing the financial data or detailed error messages if the ticker is invalid.",
   "parameters": {
     "type": "object",
     "properties": {
       "ticker": {
         "type": "string",
-        "description": "The stock ticker symbol, e.g. 'GOOGL', 'AAPL', 'TSLA', 'MSFT'."
+        "description": "The stock ticker symbol to look up (e.g., 'TSLA')."
       }
     },
     "required": ["ticker"]

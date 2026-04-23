@@ -14,16 +14,35 @@ BLACKLIST_REGEX = re.compile(
     re.IGNORECASE
 )
 
+import os
+import json
+
 async def run_terminal_command(command: str) -> str:
     """
     Executes a terminal command safely via shell.
     Blocks inherently destructive commands using a blacklist regex.
-    Applies a strict 10-second timeout.
+    Applies a strict timeout, configurable via TOOL_EXEC_TIMEOUT_SECONDS.
     """
     logger.info(f"run_terminal_command called with command: {command}")
 
+    if not isinstance(command, str) or not command.strip():
+        return json.dumps({
+            "status": "error",
+            "message": "Invalid command",
+            "details": "The command must be a non-empty string."
+        })
+
     if BLACKLIST_REGEX.search(command):
-        return "Error: Command is blocked by security policy. Destructive operations are not allowed."
+        return json.dumps({
+            "status": "error",
+            "message": "Command blocked by security policy",
+            "details": "Destructive operations (like rm, mv, shutdown) are not allowed. Please modify your command."
+        })
+
+    try:
+        timeout_seconds = float(os.getenv("TOOL_EXEC_TIMEOUT_SECONDS", "10.0"))
+    except ValueError:
+        timeout_seconds = 10.0
 
     try:
         # Use create_subprocess_shell to run the command
@@ -33,19 +52,22 @@ async def run_terminal_command(command: str) -> str:
             stderr=asyncio.subprocess.PIPE
         )
 
-        # Apply a 10-second timeout
         try:
-            stdout_bytes, stderr_bytes = await asyncio.wait_for(process.communicate(), timeout=10.0)
+            stdout_bytes, stderr_bytes = await asyncio.wait_for(process.communicate(), timeout=timeout_seconds)
         except asyncio.TimeoutError:
             try:
                 process.kill()
                 await process.wait() # Make sure process is properly cleaned up
             except ProcessLookupError:
                 pass
-            return "Error: The terminal command exceeded the strict 10-second timeout limit and was terminated."
+            return json.dumps({
+                "status": "error",
+                "message": f"Timeout exceeded ({timeout_seconds}s)",
+                "details": "The command took too long to complete and was terminated. Check if it requires user input or runs an infinite loop."
+            })
 
-        stdout = stdout_bytes.decode('utf-8') if stdout_bytes else ""
-        stderr = stderr_bytes.decode('utf-8') if stderr_bytes else ""
+        stdout = stdout_bytes.decode('utf-8', errors='replace') if stdout_bytes else ""
+        stderr = stderr_bytes.decode('utf-8', errors='replace') if stderr_bytes else ""
 
         output = ""
         if stdout:
@@ -60,4 +82,8 @@ async def run_terminal_command(command: str) -> str:
 
     except Exception as e:
         logger.error(f"run_terminal_command error: {str(e)}", exc_info=True)
-        return "An error occurred while trying to execute the terminal command."
+        return json.dumps({
+            "status": "error",
+            "message": f"Failed to execute command: {str(e)}",
+            "details": "Check syntax or verify if the shell environment supports this command."
+        })
