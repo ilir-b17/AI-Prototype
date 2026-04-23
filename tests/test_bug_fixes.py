@@ -740,6 +740,49 @@ class TestTranscriptRegressionFixes:
         assert Orchestrator._is_capability_question(prompt) is False
 
     @pytest.mark.asyncio
+    async def test_optional_web_fallback_knowledge_request_is_answered_without_web_search(self):
+        orchestrator = Orchestrator.__new__(Orchestrator)
+        orchestrator.cognitive_router = MagicMock()
+        orchestrator.cognitive_router.registry.get_skill_names.return_value = [
+            "web_search",
+            "extract_web_article",
+        ]
+        orchestrator.cognitive_router.registry.get_schemas.return_value = [
+            {
+                "name": "web_search",
+                "description": "Search the web for current information, weather, and news.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "query": {"type": "string"},
+                        "max_results": {"type": "integer"},
+                    },
+                    "required": ["query"],
+                },
+            }
+        ]
+        orchestrator.cognitive_router._execute_tool = AsyncMock()
+        orchestrator.cognitive_router.route_to_system_1 = AsyncMock(
+            return_value=RouterResult(
+                status="ok",
+                content="A paradox is a statement or situation that seems self-contradictory but may reveal a deeper truth.",
+            )
+        )
+
+        result = await Orchestrator._try_fast_path_response(
+            orchestrator,
+            {
+                "user_id": "test_user",
+                "user_input": "Can you tell me what is the meaning of paradox? Please search the web if you must",
+                "chat_history": [],
+            },
+        )
+
+        assert "paradox" in result.lower()
+        orchestrator.cognitive_router._execute_tool.assert_not_awaited()
+        orchestrator.cognitive_router.route_to_system_1.assert_awaited_once()
+
+    @pytest.mark.asyncio
     async def test_capability_question_is_answered_without_running_web_search(self):
         orchestrator = Orchestrator.__new__(Orchestrator)
         orchestrator.cognitive_router = MagicMock()

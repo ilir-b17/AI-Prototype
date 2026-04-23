@@ -326,6 +326,17 @@ class Orchestrator:
             if tok not in Orchestrator._TICKER_STOPWORDS
         ]
 
+    @staticmethod
+    def _strip_optional_tool_fallback_clause(user_message: str) -> str:
+        text = (user_message or "").strip()
+        stripped = re.sub(
+            r"(?:[,.!?]\s*|\s+)(?:please\s+)?(?:search|browse|check|look(?:\s+up)?|find|get|use)\s+(?:the\s+)?(?:web|internet|online)\b[^.?!]*?\bif\s+(?:you\s+)?(?:must|need(?:\s+to)?|have\s+to|required|necessary)\b.*$",
+            "",
+            text,
+            flags=re.IGNORECASE,
+        ).strip(" ,.!?;")
+        return stripped or text
+
     def _prepare_utility_tool_arguments(
         self,
         schema: Dict[str, Any],
@@ -412,11 +423,12 @@ class Orchestrator:
         user_message: str,
         chat_history: Optional[List[Dict[str, str]]] = None,
     ) -> Dict[str, Any]:
-        complexity = self._estimate_request_complexity(user_message)
+        routing_message = self._strip_optional_tool_fallback_clause(user_message)
+        complexity = self._estimate_request_complexity(routing_message)
 
         # Multi-ticker: two or more valid stock symbols → sequential get_stock_price calls.
         # Checked before general scoring so the supervisor never sees this pattern.
-        tickers = self._extract_multiple_tickers(user_message)
+        tickers = self._extract_multiple_tickers(routing_message)
         if len(tickers) >= 2:
             return {
                 "mode": "multi_ticker",
@@ -429,10 +441,10 @@ class Orchestrator:
         for schema in self.cognitive_router.registry.get_schemas():
             if not self._is_utility_tool_schema(schema):
                 continue
-            arguments = self._prepare_utility_tool_arguments(schema, user_message, chat_history)
+            arguments = self._prepare_utility_tool_arguments(schema, routing_message, chat_history)
             if arguments is None:
                 continue
-            score = self._score_tool_for_request(user_message, schema)
+            score = self._score_tool_for_request(routing_message, schema)
             if score <= 0:
                 continue
             candidates.append({
