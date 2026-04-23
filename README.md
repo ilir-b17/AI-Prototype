@@ -10,13 +10,13 @@ The agent operates through several distinct cognitive systems and memory layers:
 
 #### Dual-System Cognitive Engine
 - **System 1 (Local LLM)**: Fast, private, and always available. Powered by local models (e.g., `gemma2:9b` via Ollama for optimal 8GB VRAM performance). Used for routine pattern matching, tool calling, and initial responses. System 1 actively detects its own capability gaps.
-- **System 2 (Cloud LLM)**: Deep reasoning, complex problem solving, and tool synthesis. Prioritises Groq (`llama-3.3-70b-versatile` - fast, free inference) and falls back to Gemini API via Google GenAI. Called when System 1 fails or encounters an explicit capability gap.
+- **System 2 (Cloud LLM)**: Deep reasoning, complex problem solving, tool synthesis, and aggregation. Prioritises Groq (`llama-3.3-70b-versatile` - fast, free inference) and falls back to Gemini API via Google GenAI. Called when System 1 fails, encounters a capability gap, or when an agent explicitly requests it via `preferred_model: system_2` (e.g., Synthesis Agent).
 
 #### Orchestrator & State Graph
 The core engine operates on a multi-node **State Graph Architecture** with a built-in energy budget, mimicking human cognitive fatigue and multi-step reasoning.
 - **Supervisor Node**: Initial planner. It breaks down the user request and delegates to specialized workers.
-- **Worker Agents (Research & Coder)**: Execute tasks (e.g., querying vector memory, calling system tools, updating the ledger).
-- **Critic Node**: A strict evaluation stage checking all outputs against the AI's core charter. It can force re-iterations (up to 3 times) before falling back to Admin guidance.
+- **Dynamic Worker Agents**: Agents are registered dynamically via `src/agents/*/AGENT.md` (e.g., Research, Coder, Synthesis). The Orchestrator resolves dependencies and runs independent agents in parallel while managing energy budgets. They execute specific tools based on task requirements and their declared capabilities.
+- **Critic Node (Selective)**: A strict evaluation stage checking meaningful outputs against the AI's core charter. It skips trivial outputs to save compute, but when engaged, it can force re-iterations (up to 3 times) before falling back to Admin guidance.
 - **Energy Budget**: Each operation (supervisor, worker, critic) costs "energy". If the 100-point budget depletes, the system pauses and demands human-in-the-loop prioritization.
 - **Proactive Heartbeat**: Every 30 minutes, the agent wakes autonomously, checks its Objective Backlog, picks a prioritized task, executes it, and sends the Admin an update.
 
@@ -60,7 +60,6 @@ AI_Prototype/
 - Python 3.10+
 - `pip`
 - [Ollama](https://ollama.com/) running locally (ensure `gemma4:e4b` or fallback model is pulled)
-- Ollama running locally (ensure `gemma2:9b` or your preferred 8B-9B model is pulled)
 - Telegram Bot Token & Admin User ID
 - API Keys for Groq (recommended) or Gemini.
 
@@ -86,11 +85,13 @@ Fill in the necessary credentials:
 - `USE_GEMINI`: `True` if you want to use Gemini.
 - `AIDEN_DOWNLOADS_DIR`: Optional downloads directory used by file/PDF/table skills (default: `downloads`)
 - `TOOL_EXEC_TIMEOUT_SECONDS`: Per-tool execution timeout guard (default: `30`)
+- Timeout settings have been increased (e.g. `AGENT_TIMEOUT_SECONDS=300`) to better support 8GB VRAM local models like `gemma4:e4b`.
+- ChromaDB telemetry warnings are explicitly suppressed in logging.
 
 ### 3. Start Local System 1
 Ensure Ollama is running and has the required model available:
 ```bash
-ollama run gemma2:9b
+ollama run gemma4:e4b
 ```
 
 ### 4. Run the Agent
@@ -98,8 +99,9 @@ ollama run gemma2:9b
 python main.py
 ```
 
-## Next Steps / Future Enhancements (Sprint 7+)
+## Next Steps / Future Enhancements
 
+- Full Model Context Protocol (MCP) Integration for external data sources.
 - Goal-driven autonomous exploration.
 - Expanded sensor capabilities (filesystem monitoring, active web browsing).
 - Deeper reinforcement learning on Critic feedback.
