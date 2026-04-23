@@ -163,6 +163,21 @@ class LedgerMemory:
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 )
             """)
+            await self._db.execute("""
+                CREATE TABLE IF NOT EXISTS system_state (
+                    key TEXT NOT NULL PRIMARY KEY,
+                    value TEXT NOT NULL,
+                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            """)
+            await self._db.execute("""
+                CREATE TABLE IF NOT EXISTS pending_mfa_states (
+                    user_id TEXT NOT NULL PRIMARY KEY,
+                    tool_name TEXT NOT NULL,
+                    arguments_json TEXT NOT NULL,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            """)
             await self._db.commit()
         logger.debug("Database tables initialized")
 
@@ -437,6 +452,23 @@ class LedgerMemory:
             deleted = cursor.rowcount
         return deleted
 
+    async def prune_old_chat_history(self, days: int = 90, keep_minimum: int = 20) -> int:
+        """Delete chat_history rows older than *days* days, always keeping the most recent
+        *keep_minimum* rows per user so active users are never over-pruned."""
+        async with self._lock:
+            cursor = await self._db.execute(
+                "DELETE FROM chat_history "
+                "WHERE timestamp < datetime('now', ? || ' days') "
+                "AND id NOT IN ("
+                "  SELECT id FROM chat_history ch2 "
+                "  WHERE ch2.user_id = chat_history.user_id "
+                "  ORDER BY id DESC LIMIT ?"
+                ")",
+                (f"-{days}", keep_minimum),
+            )
+            await self._db.commit()
+        return cursor.rowcount
+
     async def get_recent_user_ids(self, limit: int = 20) -> List[str]:
         """Return up to *limit* user_ids ordered by most recent chat activity."""
         async with self._lock:
@@ -573,5 +605,73 @@ class LedgerMemory:
         async with self._lock:
             await self._db.execute(
                 "DELETE FROM pending_hitl_states WHERE user_id=?", (user_id,)
+            )
+            await self._db.commit()
+
+    # ─────────────────────────────────────────────────────────────
+    # System State  (generic key-value store for runtime flags)
+    # ─────────────────────────────────────────────────────────────
+
+    async def set_system_state(self, key: str, value: str) -> None:
+        """Upsert a key-value pair in the system_state table."""
+        async with self._lock:
+            await self._db.execute(
+                "INSERT INTO system_state (key, value) VALUES (?, ?) "
+                "ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=CURRENT_TIMESTAMP",
+                (key, value),
+            )
+            await self._db.commit()
+
+    async def get_system_state(self, key: str) -> Optional[str]:
+        """Retrieve a value from the system_state table, or None if absent."""
+        async with self._lock:
+            cursor = await self._db.execute(
+                "SELECT value FROM system_state WHERE key=?", (key,)
+            )
+            row = await cursor.fetchone()
+        return row["value"] if row else None
+
+    # ─────────────────────────────────────────────────────────────
+    # MFA State  (persisted so bot restarts don't lose pending MFA)
+    # ─────────────────────────────────────────────────────────────
+
+    async def save_mfa_state(self, user_id: str, tool_name: str, arguments: dict) -> None:
+        """Persist a pending MFA challenge to survive bot restarts."""
+        import json as _json
+        async with self._lock:
+            await self._db.execute(
+                "INSERT INTO pending_mfa_states (user_id, tool_name, arguments_json) "
+                "VALUES (?, ?, ?) ON CONFLICT(user_id) DO UPDATE SET "
+                "tool_name=excluded.tool_name, arguments_json=excluded.arguments_json, "
+                "created_at=CURRENT_TIMESTAMP",
+                (user_id, tool_name, _json.dumps(arguments)),
+            )
+            await self._db.commit()
+
+    async def load_mfa_states(self) -> dict:
+        """Return {user_id: {name, arguments, _created_at}} for all persisted MFA states."""
+        import json as _json
+        async with self._lock:
+            cursor = await self._db.execute(
+                "SELECT user_id, tool_name, arguments_json, created_at FROM pending_mfa_states"
+            )
+            rows = await cursor.fetchall()
+        result = {}
+        for row in rows:
+            try:
+                result[row["user_id"]] = {
+                    "name": row["tool_name"],
+                    "arguments": _json.loads(row["arguments_json"]),
+                    "_created_at": row["created_at"],
+                }
+            except Exception as e:
+                logger.warning("Could not deserialize MFA state for '%s': %s", row["user_id"], e)
+        return result
+
+    async def clear_mfa_state(self, user_id: str) -> None:
+        """Remove a persisted MFA state after it is resolved or expired."""
+        async with self._lock:
+            await self._db.execute(
+                "DELETE FROM pending_mfa_states WHERE user_id=?", (user_id,)
             )
             await self._db.commit()

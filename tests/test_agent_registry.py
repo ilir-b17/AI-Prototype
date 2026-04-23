@@ -131,7 +131,7 @@ def test_build_execution_plan_deduplicates_dependencies():
     orchestrator = Orchestrator.__new__(Orchestrator)
     orchestrator.agent_registry = AgentRegistry(agents_dir=Path("does-not-matter"))
 
-    plan = Orchestrator._build_execution_batches(
+    plan, _ = Orchestrator._build_execution_batches(
         orchestrator,
         ["research_agent", "coder_agent", "research_agent"],
     )
@@ -152,7 +152,7 @@ def test_build_execution_plan_skips_unknown_dependency_and_continues():
         )
     )
 
-    plan = Orchestrator._build_execution_batches(orchestrator, ["planner_agent"])
+    plan, _ = Orchestrator._build_execution_batches(orchestrator, ["planner_agent"])
 
     flattened = [agent.name for batch in plan for agent, _step in batch]
     assert flattened == ["planner_agent"]
@@ -186,7 +186,7 @@ def test_build_execution_plan_respects_task_packet_dependencies():
         )
     )
 
-    plan = Orchestrator._build_execution_batches(
+    plan, _ = Orchestrator._build_execution_batches(
         orchestrator,
         [
             {"agent": "research_agent", "task": "Gather facts", "reason": "Need evidence"},

@@ -253,6 +253,8 @@ class CognitiveRouter:
         self._system_1_total_wait_seconds = 0.0
         self._system_1_peak_waiting_requests = 0
         self._system2_cooldown_until = 0.0
+        # Optional callback to persist cooldown expiry to DB; set by Orchestrator.async_init
+        self._persist_cooldown_cb = None  # Optional[Callable[[float], Awaitable[None]]]
 
         # SkillRegistry — single source of truth for all tool schemas and callables
         self.registry = SkillRegistry()
@@ -328,9 +330,20 @@ class CognitiveRouter:
                 self._system_1_max_concurrency,
             )
 
+        _queue_timeout = float(os.environ.get("SYSTEM_1_QUEUE_TIMEOUT_SECONDS", "120"))
         acquired = False
         try:
-            await self._system_1_semaphore.acquire()
+            try:
+                await asyncio.wait_for(self._system_1_semaphore.acquire(), timeout=_queue_timeout)
+            except asyncio.TimeoutError:
+                self._system_1_waiting_requests = max(0, self._system_1_waiting_requests - 1)
+                logger.error(
+                    "System 1 queue timeout after %.0fs — dropping request (active=%s waiting=%s)",
+                    _queue_timeout,
+                    self._system_1_active_requests,
+                    self._system_1_waiting_requests,
+                )
+                raise
             acquired = True
             wait_seconds = time.perf_counter() - wait_started
             self._system_1_waiting_requests -= 1
@@ -1493,6 +1506,13 @@ Rules:
         if match:
             cooldown_seconds = int(match.group(1)) * 60 + int(float(match.group(2)))
         self._system2_cooldown_until = time.time() + cooldown_seconds
+        # Persist cooldown so it survives a bot restart
+        if self._persist_cooldown_cb is not None:
+            import asyncio as _asyncio
+            try:
+                _asyncio.create_task(self._persist_cooldown_cb(self._system2_cooldown_until))
+            except RuntimeError:
+                pass  # No running event loop (e.g., during tests)
         msg = self._format_cooldown_message() or "Rate limited. Please try again later."
         logger.warning(f"Groq rate limit hit: {msg}")
         return RouterResult(status="ok", content=f"[System 2 - Error]: {msg}")

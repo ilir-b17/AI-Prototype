@@ -12,6 +12,7 @@ import logging
 import json
 import asyncio
 import re
+import time
 from datetime import datetime
 from typing import Dict, Any, List, Optional
 
@@ -45,9 +46,11 @@ ENERGY_COST_SUPERVISOR = 10
 ENERGY_COST_WORKER = 15
 ENERGY_COST_CRITIC = 10
 ENERGY_COST_TOOL = 5
-HEARTBEAT_INTERVAL = 1800  # 30 minutes
+HEARTBEAT_INTERVAL = int(os.getenv("HEARTBEAT_INTERVAL_SECONDS", "1800"))  # default 30 minutes
 MEMORY_SAVE_THRESHOLD = int(os.getenv("MEMORY_SAVE_THRESHOLD", "120"))
 MEMORY_CONSOLIDATION_INTERVAL = int(os.getenv("MEMORY_CONSOLIDATION_INTERVAL", "21600"))  # 6 hours
+# How long an unanswered MFA/HITL/tool-approval entry stays alive before auto-expiry
+_PENDING_STATE_TTL_SECONDS = int(os.getenv("PENDING_STATE_TTL_SECONDS", "86400"))  # 24 hours
 _SYSTEM_1_ERROR_PREFIX = "[System 1 - Error]"
 _ROUTING_STOPWORDS = {
     "a", "an", "and", "are", "at", "be", "can", "could", "do", "for", "from",
@@ -143,14 +146,48 @@ class Orchestrator:
         reloads previously approved dynamic tools.
         """
         await self.ledger_memory.initialize()
+
+        # Register Groq cooldown persistence callback and reload any saved cooldown
+        async def _save_groq_cooldown(expiry: float) -> None:
+            await self.ledger_memory.set_system_state("groq_cooldown_until", str(expiry))
+
+        self.cognitive_router._persist_cooldown_cb = _save_groq_cooldown
+        try:
+            saved_cooldown = await self.ledger_memory.get_system_state("groq_cooldown_until")
+            if saved_cooldown:
+                expiry = float(saved_cooldown)
+                if expiry > time.time():
+                    self.cognitive_router._system2_cooldown_until = expiry
+                    logger.info(
+                        "Restored Groq rate-limit cooldown from DB: %.0fs remaining.",
+                        expiry - time.time(),
+                    )
+        except Exception as _ce:
+            logger.warning("Failed to restore Groq cooldown from DB: %s", _ce)
+
         await self.ledger_memory.seed_initial_goals()
         await self._load_approved_tools()
         await self._load_pending_approvals()
+        await self._load_pending_mfa()
         await self._load_pending_hitl()
         self._compiled_graph = build_orchestrator_graph(self)
         set_runtime_context(self.ledger_memory, self.core_memory)
         # Record the host OS now that we're in an async context
         await self.core_memory.update("host_os", platform.system())
+        # Startup pruning: remove stale chat_history rows
+        try:
+            deleted = await self.ledger_memory.prune_old_chat_history(
+                days=int(os.getenv("CHAT_HISTORY_MAX_DAYS", "90")),
+                keep_minimum=int(os.getenv("CHAT_HISTORY_MIN_ROWS", "20")),
+            )
+            if deleted:
+                logger.info("Startup pruning: removed %d stale chat_history rows.", deleted)
+        except Exception as _prune_err:
+            logger.warning("Startup chat history pruning failed: %s", _prune_err)
+        if self.charter_text == self._CHARTER_FALLBACK:
+            logger.warning(
+                "SECURITY: Running without a full charter. Charter enforcement will be minimal."
+            )
         logger.info("Orchestrator async_init complete")
 
     def _refresh_sensory_state(self) -> None:
@@ -781,14 +818,25 @@ class Orchestrator:
             return result.content.strip()
         return tool_result.content.strip()
 
+    _CHARTER_FALLBACK = "Core Directive: Do no harm."
+
     def _load_charter(self, filepath: str = "charter.md") -> str:
+        resolved = os.getenv("CHARTER_PATH", filepath)
         try:
-            if os.path.exists(filepath):
-                with open(filepath, 'r') as f:
-                    return f.read().strip()
-            return "Core Directive: Do no harm."
-        except Exception:
-            return "Core Directive: Do no harm."
+            if os.path.exists(resolved):
+                text = open(resolved, "r", encoding="utf-8").read().strip()
+                if text:
+                    return text
+                logger.warning("Charter file at '%s' is empty — using minimal fallback.", resolved)
+            else:
+                logger.warning(
+                    "Charter file not found at '%s'. Agent will operate with minimal directives. "
+                    "Set CHARTER_PATH or place charter.md in the working directory.",
+                    resolved,
+                )
+        except Exception as e:
+            logger.error("Failed to read charter at '%s': %s", resolved, e)
+        return self._CHARTER_FALLBACK
 
     def _get_capabilities_string(self) -> str:
         """Compact tool names list derived live from the SkillRegistry.
@@ -882,15 +930,22 @@ class Orchestrator:
         """Retrieve top archival memory snippets relevant to the user query."""
         if not query:
             return ""
+        _max_chunk = int(os.getenv("MAX_ARCHIVAL_CHUNK_CHARS", "2000"))
+        _max_total = int(os.getenv("MAX_ARCHIVAL_TOTAL_CHARS", "6000"))
         try:
             results = await self.vector_memory.query_memory_async(query, n_results=3)
             if not results:
                 return ""
             lines = ["<Archival_Memory>"]
+            total = 0
             for item in results:
-                snippet = item.get("document", "")
-                if snippet:
-                    lines.append(f"  <Memory>{snippet}</Memory>")
+                snippet = (item.get("document", "") or "")[:_max_chunk]
+                if not snippet:
+                    continue
+                if total + len(snippet) > _max_total:
+                    break
+                lines.append(f"  <Memory>{snippet}</Memory>")
+                total += len(snippet)
             lines.append("</Archival_Memory>")
             return "\n".join(lines)
         except Exception as e:
@@ -909,6 +964,12 @@ class Orchestrator:
                 f"Energy Budget Exhausted: The system consumed all cognitive energy on this task.\n"
                 f"Question: How should I prioritize the remaining work for: '{state.get('user_input', '')}'"
             )
+        return state
+
+    def _refund_energy(self, state: Dict[str, Any], amount: int, reason: str) -> Dict[str, Any]:
+        """Refund energy deducted by a failed or timed-out operation."""
+        state["energy_remaining"] = state.get("energy_remaining", 0) + amount
+        logger.debug("Energy +%d refunded (%s). Remaining: %d", amount, reason, state["energy_remaining"])
         return state
 
     @staticmethod
@@ -1300,12 +1361,15 @@ class Orchestrator:
         step_order: Dict[str, int],
         visiting: set,
         order_counter: int,
+        skipped_cycles: Optional[List[str]] = None,
     ) -> int:
         agent_name = step["agent"]
         if self._merge_execution_step(step_map, step):
             return order_counter
         if agent_name in visiting:
-            logger.warning("Dependency cycle detected while planning agent %r", agent_name)
+            logger.warning("Dependency cycle detected while planning agent %r — skipping.", agent_name)
+            if skipped_cycles is not None:
+                skipped_cycles.append(agent_name)
             return order_counter
 
         agent_def = registry.get(agent_name)
@@ -1322,6 +1386,7 @@ class Orchestrator:
                 step_order,
                 visiting,
                 order_counter,
+                skipped_cycles,
             )
         visiting.remove(agent_name)
 
@@ -1372,8 +1437,9 @@ class Orchestrator:
     def _build_execution_batches(
         self,
         plan_steps: List[Dict[str, Any]],
-    ) -> List[List[tuple[AgentDefinition, Dict[str, Any]]]]:
-        """Return dependency-aware execution batches for the requested plan steps."""
+    ) -> tuple:
+        """Return (batches, skipped_cycles) where batches is a list of dependency-aware execution
+        batches and skipped_cycles lists agents dropped due to cyclic dependencies."""
         registry = self._get_agent_registry()
         normalized_steps = self._normalize_current_plan(plan_steps)
         step_map: Dict[str, Dict[str, Any]] = {}
@@ -1381,6 +1447,7 @@ class Orchestrator:
         order_counter = 0
         visiting = set()
         resolving_depth = set()
+        skipped_cycles: List[str] = []
 
         for step in normalized_steps:
             order_counter = self._visit_execution_step(
@@ -1390,6 +1457,7 @@ class Orchestrator:
                 step_order,
                 visiting,
                 order_counter,
+                skipped_cycles,
             )
 
         depth_cache: Dict[str, int] = {}
@@ -1408,7 +1476,7 @@ class Orchestrator:
             )
             batched.setdefault(depth, []).append((agent_def, step))
 
-        return self._group_execution_batches(batched, step_order)
+        return self._group_execution_batches(batched, step_order), skipped_cycles
 
     @staticmethod
     def _build_agent_state_snapshot(state: Dict[str, Any]) -> Dict[str, Any]:
@@ -1542,24 +1610,31 @@ class Orchestrator:
         state = normalize_state(state)
         if deduct_energy:
             state = self._deduct_energy(state, agent_def.energy_cost, agent_def.name)
-        core_mem_str = await self.core_memory.get_context_string()
+        try:
+            core_mem_str = await self.core_memory.get_context_string()
 
-        capabilities_str = self._get_capabilities_string()
-        handoff = self._build_agent_handoff(agent_def, state, task_packet=task_packet)
-        messages = [
-            {
-                "role": "system",
-                "content": f"{agent_def.system_prompt}\n{self.charter_text}\n{core_mem_str}\n\n{capabilities_str}",
-            },
-            {"role": "user", "content": handoff},
-        ]
-        router_result, attempted_system_2 = await self._route_agent_request(
-            messages,
-            agent_def,
-            task_packet=task_packet,
-        )
+            capabilities_str = self._get_capabilities_string()
+            handoff = self._build_agent_handoff(agent_def, state, task_packet=task_packet)
+            messages = [
+                {
+                    "role": "system",
+                    "content": f"{agent_def.system_prompt}\n{self.charter_text}\n{core_mem_str}\n\n{capabilities_str}",
+                },
+                {"role": "user", "content": handoff},
+            ]
+            router_result, attempted_system_2 = await self._route_agent_request(
+                messages,
+                agent_def,
+                task_packet=task_packet,
+            )
+        except Exception as _agent_exc:
+            if deduct_energy:
+                state = self._refund_energy(state, agent_def.energy_cost, f"{agent_def.name}_exception")
+            raise _agent_exc
 
         if router_result is None:
+            if deduct_energy:
+                state = self._refund_energy(state, agent_def.energy_cost, f"{agent_def.name}_null_result")
             if attempted_system_2:
                 state["worker_outputs"][agent_def.name] = (
                     f"Error: {agent_def.name} failed after System 1 error and System 2 fallback."
@@ -1616,7 +1691,7 @@ class Orchestrator:
                         logger.info("Heartbeat: Backlog is empty. Nothing to do.")
                         continue
 
-                    energy_available = 100  # Heartbeat starts with full budget
+                    energy_available = int(os.getenv("INITIAL_ENERGY_BUDGET", "100"))
                     if task["estimated_energy"] > energy_available:
                         logger.info(
                             f"Heartbeat: Task #{task['id']} needs {task['estimated_energy']} energy "
@@ -1678,6 +1753,23 @@ class Orchestrator:
                     continue
                 for user_id in user_ids:
                     await self._consolidate_memory(user_id)
+                # Periodic DB pruning — delete old chat rows and vector memories
+                try:
+                    deleted = await self.ledger_memory.prune_old_chat_history(
+                        days=int(os.getenv("CHAT_HISTORY_MAX_DAYS", "90")),
+                        keep_minimum=int(os.getenv("CHAT_HISTORY_MIN_ROWS", "20")),
+                    )
+                    if deleted:
+                        logger.info("Consolidation pruning: removed %d chat_history rows.", deleted)
+                except Exception as _p_err:
+                    logger.warning("Periodic chat history pruning failed: %s", _p_err)
+                try:
+                    await asyncio.to_thread(
+                        self.vector_memory.prune_old_memories,
+                        int(os.getenv("VECTOR_MEMORY_MAX_DAYS", "180")),
+                    )
+                except Exception as _vp_err:
+                    logger.warning("Periodic vector memory pruning failed: %s", _vp_err)
             except Exception as e:
                 logger.warning(f"Memory consolidation loop error: {e}", exc_info=True)
 
@@ -1728,6 +1820,17 @@ class Orchestrator:
         except Exception as e:
             logger.warning(f"_load_pending_approvals failed: {e}")
 
+    async def _load_pending_mfa(self) -> None:
+        """Reload persisted MFA states from DB so bot restarts don't drop pending challenges."""
+        try:
+            states = await self.ledger_memory.load_mfa_states()
+            for user_id, entry in states.items():
+                self.pending_mfa[user_id] = entry
+            if states:
+                logger.info("Restored %d pending MFA state(s) from DB", len(states))
+        except Exception as e:
+            logger.warning("_load_pending_mfa failed: %s", e)
+
     async def _load_pending_hitl(self) -> None:
         """Reload any HITL states that were persisted before the last shutdown (ISSUE-013)."""
         try:
@@ -1757,11 +1860,19 @@ class Orchestrator:
         return task
 
     async def _get_user_lock(self, user_id: str) -> asyncio.Lock:
-        """Return the per-user asyncio.Lock, creating it lazily (ISSUE-012)."""
+        """Return the per-user asyncio.Lock with LRU eviction to bound memory usage."""
+        _max = int(os.getenv("USER_LOCKS_MAX_SIZE", "500"))
         async with self._user_locks_lock:
-            if user_id not in self._user_locks:
-                self._user_locks[user_id] = asyncio.Lock()
-            return self._user_locks[user_id]
+            if user_id in self._user_locks:
+                # Move to end (most-recently-used)
+                self._user_locks[user_id] = self._user_locks.pop(user_id)
+                return self._user_locks[user_id]
+            lock = asyncio.Lock()
+            self._user_locks[user_id] = lock
+            # Evict oldest entries when over the cap
+            while len(self._user_locks) > _max:
+                self._user_locks.pop(next(iter(self._user_locks)))
+            return lock
 
     async def tool_synthesis_node(
         self,
@@ -1803,6 +1914,7 @@ class Orchestrator:
         self.pending_tool_approval[user_id] = {
             "synthesis": synthesis,
             "original_state": state,
+            "_created_at": time.time(),
         }
         await self.ledger_memory.save_pending_approval(
             user_id, synthesis, state["user_input"]
@@ -1866,7 +1978,9 @@ class Orchestrator:
 
             if router_result is not None and router_result.status == "cognitive_escalation":
                 solution = await self._handle_cognitive_escalation(state, router_result)
-                state["final_response"] = solution
+                # Route through worker_outputs so critic_node evaluates the answer against the charter
+                state["worker_outputs"]["system_2_escalation"] = solution
+                state["current_plan"] = [{"agent": "system_2_escalation", "task": "", "reason": "cognitive escalation", "depends_on": [], "preferred_model": "system_2"}]
                 return state
 
             if router_result is not None and router_result.status != "ok":
@@ -1893,12 +2007,14 @@ class Orchestrator:
 
         except asyncio.TimeoutError:
             logger.error("Supervisor node timeout (60s)")
+            state = self._refund_energy(state, ENERGY_COST_SUPERVISOR, "supervisor_timeout")
             state["current_plan"] = []
             state["final_response"] = "Planning timed out. Please try again."
         except RequiresHITLError:
             raise
         except Exception as e:
             logger.error(f"Supervisor Node failed: {e}", exc_info=True)
+            state = self._refund_energy(state, ENERGY_COST_SUPERVISOR, "supervisor_error")
             state["current_plan"] = []
             state["final_response"] = "Supervisor encountered an error. Please try again."
 
@@ -1914,7 +2030,11 @@ class Orchestrator:
 
         state["current_plan"] = self._get_requested_plan_steps(state)
         executed_agent = False
-        execution_batches = self._build_execution_batches(state["current_plan"])
+        execution_batches, skipped_cycles = self._build_execution_batches(state["current_plan"])
+        for skipped in skipped_cycles:
+            state["worker_outputs"][skipped] = (
+                f"Warning: agent '{skipped}' was skipped due to a cyclic dependency in the plan."
+            )
         for batch in execution_batches:
             if not batch:
                 continue
@@ -2019,6 +2139,7 @@ class Orchestrator:
                 state = self._apply_critic_response(state, output_to_eval, router_result.content)
         except Exception as e:
             logger.warning(f"Critic node failed/timed out: {e}. Defaulting to PASS.", exc_info=True)
+            state = self._refund_energy(state, ENERGY_COST_CRITIC, "critic_error")
             state = self._finalize_critic_pass(state, output_to_eval)
 
         if state["iteration_count"] >= 3 and state["critic_feedback"] != "PASS":
@@ -2072,7 +2193,14 @@ class Orchestrator:
         if user_id not in self.pending_mfa:
             return None
         pending_tool = self.pending_mfa[user_id]
+        age = time.time() - pending_tool.get("_created_at", 0)
+        if age > _PENDING_STATE_TTL_SECONDS:
+            del self.pending_mfa[user_id]
+            self._fire_and_forget(self.ledger_memory.clear_mfa_state(user_id))
+            logger.info("Expired stale pending_mfa for %s (age %.0fs).", user_id, age)
+            return None
         del self.pending_mfa[user_id]
+        self._fire_and_forget(self.ledger_memory.clear_mfa_state(user_id))
         if not verify_mfa_challenge(user_message):
             return "Error: MFA authorization failed. Action aborted."
         exec_result = await self.cognitive_router._execute_tool(
@@ -2086,7 +2214,14 @@ class Orchestrator:
         """Handle YES/NO tool synthesis approval. Returns a reply string, or None if not pending."""
         if user_id not in self.pending_tool_approval:
             return None
-        payload = self.pending_tool_approval.pop(user_id)
+        payload = self.pending_tool_approval[user_id]
+        age = time.time() - payload.get("_created_at", 0)
+        if age > _PENDING_STATE_TTL_SECONDS:
+            self.pending_tool_approval.pop(user_id, None)
+            await self.ledger_memory.clear_pending_approval(user_id)
+            logger.info("Expired stale pending_tool_approval for %s (age %.0fs).", user_id, age)
+            return None
+        self.pending_tool_approval.pop(user_id)
         await self.ledger_memory.clear_pending_approval(user_id)
         synthesis = payload["synthesis"]
         original_state = payload["original_state"]
@@ -2114,34 +2249,45 @@ class Orchestrator:
     async def _load_state(self, user_id: str, user_message: str) -> Dict[str, Any]:
         """Return a state dict: resumes a HITL conversation if pending, else creates fresh."""
         if user_id in self.pending_hitl_state:
-            state = normalize_state(self.pending_hitl_state.pop(user_id))
-            # Clear the persisted DB record now that we've resumed (ISSUE-013)
-            try:
-                await self.ledger_memory.clear_hitl_state(user_id)
-            except Exception as e:
-                logger.warning(f"Failed to clear HITL state from DB for {user_id}: {e}")
-            state["admin_guidance"] = user_message
-            state["user_input"] += f"\n[ADMIN GUIDANCE: {user_message}]"
-            state["iteration_count"] = 0
-            state["current_plan"] = []
-            # Track how many HITL cycles have been spent on this task (ISSUE-005)
-            state["hitl_count"] = state.get("hitl_count", 0) + 1
-            # Cap recharge to 75 so energy budget is never fully restored — this
-            # ensures a perpetually failing task eventually becomes unrecoverable
-            # rather than cycling indefinitely at full energy (ISSUE-005).
-            state["energy_remaining"] = min(state.get("energy_remaining", 0) + 50, 75)
-            # If the admin has guided this task 3+ times without success, abandon it
-            if state["hitl_count"] >= 3:
-                logger.warning(
-                    f"HITL cycle limit (3) reached for user {user_id}. "
-                    f"Abandoning task: {state.get('user_input', '')[:80]}"
-                )
-                state["final_response"] = (
-                    "This task has been attempted 3 times with admin guidance and "
-                    "could not be completed. The request has been abandoned to prevent "
-                    "an infinite loop. Please rephrase or break it into smaller steps."
-                )
-            return normalize_state(state)
+            _hitl_entry = self.pending_hitl_state[user_id]
+            _age = time.time() - _hitl_entry.get("_hitl_created_at", 0)
+            if _age > _PENDING_STATE_TTL_SECONDS:
+                self.pending_hitl_state.pop(user_id, None)
+                try:
+                    await self.ledger_memory.clear_hitl_state(user_id)
+                except Exception:
+                    pass
+                logger.warning("Expired stale pending_hitl_state for %s (age %.0fs); creating fresh state.", user_id, _age)
+                # Fall through to fresh state below
+            else:
+                state = normalize_state(self.pending_hitl_state.pop(user_id))
+                # Clear the persisted DB record now that we've resumed (ISSUE-013)
+                try:
+                    await self.ledger_memory.clear_hitl_state(user_id)
+                except Exception as e:
+                    logger.warning(f"Failed to clear HITL state from DB for {user_id}: {e}")
+                state["admin_guidance"] = user_message
+                state["user_input"] += f"\n[ADMIN GUIDANCE: {user_message}]"
+                state["iteration_count"] = 0
+                state["current_plan"] = []
+                # Track how many HITL cycles have been spent on this task (ISSUE-005)
+                state["hitl_count"] = state.get("hitl_count", 0) + 1
+                # Cap recharge to 75 so energy budget is never fully restored — this
+                # ensures a perpetually failing task eventually becomes unrecoverable
+                # rather than cycling indefinitely at full energy (ISSUE-005).
+                state["energy_remaining"] = min(state.get("energy_remaining", 0) + 50, 75)
+                # If the admin has guided this task 3+ times without success, abandon it
+                if state["hitl_count"] >= 3:
+                    logger.warning(
+                        f"HITL cycle limit (3) reached for user {user_id}. "
+                        f"Abandoning task: {state.get('user_input', '')[:80]}"
+                    )
+                    state["final_response"] = (
+                        "This task has been attempted 3 times with admin guidance and "
+                        "could not be completed. The request has been abandoned to prevent "
+                        "an infinite loop. Please rephrase or break it into smaller steps."
+                    )
+                return normalize_state(state)
         state = self._new_state(user_id, user_message)
         if user_id != "heartbeat":
             try:
@@ -2294,6 +2440,7 @@ class Orchestrator:
                 return await self._run_graph_loop(state, user_id, user_message)
             except RequiresHITLError as hitl_err:
                 state["_hitl_question"] = str(hitl_err)
+                state["_hitl_created_at"] = time.time()
                 self.pending_hitl_state[user_id] = state
                 # Persist so the state survives a bot restart (ISSUE-013)
                 self._fire_and_forget(self.ledger_memory.save_hitl_state(user_id, state))
@@ -2316,11 +2463,16 @@ class Orchestrator:
             self.pending_mfa[user_id] = {
                 "name": result.mfa_tool_name,
                 "arguments": result.mfa_arguments,
+                "_created_at": time.time(),
             }
+            self._fire_and_forget(
+                self.ledger_memory.save_mfa_state(user_id, result.mfa_tool_name, result.mfa_arguments)
+            )
             return "SECURITY LOCK: To authorize this core change, complete the phrase: 'The sky is...'"
 
         if result.status == "hitl_required":
             state["_hitl_question"] = result.hitl_message
+            state["_hitl_created_at"] = time.time()
             self.pending_hitl_state[user_id] = state
             # Persist so the HITL state survives a bot restart (ISSUE-013)
             self._fire_and_forget(self.ledger_memory.save_hitl_state(user_id, state))
@@ -2372,11 +2524,22 @@ class Orchestrator:
 
         if blueprint_text:
             logger.info("System 2 blueprint extracted. Triggering non-blocking save to Archival Memory.")
-            save_coro = self.vector_memory.add_memory_async(
-                document=f"System 2 Reasoning Blueprint for: {router_result.escalation_problem}\nBlueprint: {blueprint_text}",
-                metadata={"type": "system_2_learned_pattern"}
-            )
-            self._fire_and_forget(save_coro)
+            doc_text = f"System 2 Reasoning Blueprint for: {router_result.escalation_problem}\nBlueprint: {blueprint_text}"
+            meta = {"type": "system_2_learned_pattern"}
+
+            async def _save_blueprint_with_retry() -> None:
+                for attempt in range(2):
+                    try:
+                        await self.vector_memory.add_memory_async(text=doc_text, metadata=meta)
+                        logger.info("Blueprint saved to archival memory (attempt %d).", attempt + 1)
+                        return
+                    except Exception as exc:
+                        logger.error("Blueprint save failed (attempt %d/2): %s", attempt + 1, exc)
+                logger.critical(
+                    "Blueprint permanently lost — ChromaDB insert failed twice: %.200s", doc_text
+                )
+
+            self._fire_and_forget(_save_blueprint_with_retry())
 
         return solution_text
 

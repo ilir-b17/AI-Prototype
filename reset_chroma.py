@@ -44,8 +44,9 @@ if __name__ == "__main__":
     logger.info("\nThis will reset ChromaDB by removing corrupted storage.")
     logger.info("All previously stored memories will be cleared.\n")
     
-    response = input("Are you sure? (yes/no): ").strip().lower()
-    if response == "yes":
+    logger.warning("WARNING: This will permanently delete all long-term vector memories!")
+    response = input("Type 'RESET' to confirm complete ChromaDB wipe: ").strip()
+    if response == "RESET":
         reset_chroma_storage()
     else:
-        logger.info("Reset cancelled.")
+        logger.info("Reset cancelled (confirmation phrase did not match).")
