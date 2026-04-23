@@ -42,8 +42,9 @@ class RouterResult:
       - "mfa_required"     — the model requested a privileged core update
       - "hitl_required"    — human-in-the-loop guidance is needed
       - "capability_gap"   — System 1 cannot fulfil the request; synthesis needed
+      - "cognitive_escalation" — escalate complex reasoning to System 2
     """
-    status: str  # "ok" | "mfa_required" | "hitl_required" | "capability_gap"
+    status: str  # "ok" | "mfa_required" | "hitl_required" | "capability_gap" | "cognitive_escalation"
     content: str = ""
     # MFA fields
     mfa_tool_name: str = ""
@@ -53,6 +54,9 @@ class RouterResult:
     # Capability-gap fields
     gap_description: str = ""
     suggested_tool_name: str = ""
+    # Escalation fields
+    escalation_problem: str = ""
+    escalation_context: str = ""
 
 
 # ── Legacy exception classes kept for backward compatibility ─────────────────
@@ -156,6 +160,13 @@ class CognitiveRouter:
                 status="capability_gap",
                 gap_description=arguments.get("gap_description", "unspecified gap"),
                 suggested_tool_name=arguments.get("suggested_tool_name", "new_tool"),
+            )
+
+        if tool_name == "escalate_to_system_2":
+            return RouterResult(
+                status="cognitive_escalation",
+                escalation_problem=arguments.get("problem_description", "unspecified problem"),
+                escalation_context=arguments.get("context_scratchpad", ""),
             )
 
         # ── Registry dispatch ────────────────────────────────────────────────

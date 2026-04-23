@@ -48,6 +48,7 @@ def build_supervisor_prompt(
         - WEB HANDLING: After performing a `web_search`, you MUST call `extract_web_article` on the target URL before attempting to summarize it.
         - DATA HANDLING: For CSV/Excel files, do not read raw text. Use the `analyze_table_file` tool.
         - SHELL COMMANDS: Use strictly {os_name}-appropriate shell commands when interacting with the terminal.
+        - COGNITIVE SYNERGY: If you face a complex reasoning problem or get stuck, use `escalate_to_system_2`. You may also search Archival Memory for past "System 2 blueprints" (e.g. past problem solutions).
         </tool_and_data_rules>
 
         <agent_charter>

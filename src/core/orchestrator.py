@@ -1570,6 +1570,11 @@ class Orchestrator:
                 )
             return state
 
+        if router_result.status == "cognitive_escalation":
+            solution = await self._handle_cognitive_escalation(state, router_result)
+            state["worker_outputs"][agent_def.name] = solution
+            return state
+
         if router_result.status != "ok":
             state[_BLOCKED_KEY] = router_result
         else:
@@ -1859,6 +1864,11 @@ class Orchestrator:
         try:
             router_result = await self._route_supervisor_request(messages)
 
+            if router_result is not None and router_result.status == "cognitive_escalation":
+                solution = await self._handle_cognitive_escalation(state, router_result)
+                state["final_response"] = solution
+                return state
+
             if router_result is not None and router_result.status != "ok":
                 state[_BLOCKED_KEY] = router_result
                 return state
@@ -1999,10 +2009,14 @@ class Orchestrator:
 
         try:
             router_result = await self._route_critic_request(messages)
-            if router_result.status != "ok":
+            if router_result.status == "cognitive_escalation":
+                solution = await self._handle_cognitive_escalation(state, router_result)
+                state = self._apply_critic_response(state, output_to_eval, solution)
+            elif router_result.status != "ok":
                 state[_BLOCKED_KEY] = router_result
                 return state
-            state = self._apply_critic_response(state, output_to_eval, router_result.content)
+            else:
+                state = self._apply_critic_response(state, output_to_eval, router_result.content)
         except Exception as e:
             logger.warning(f"Critic node failed/timed out: {e}. Defaulting to PASS.", exc_info=True)
             state = self._finalize_critic_pass(state, output_to_eval)
@@ -2323,6 +2337,48 @@ class Orchestrator:
 
         # Fallback
         return f"An unexpected router status was received: {result.status}"
+
+    async def _handle_cognitive_escalation(
+        self,
+        state: Dict[str, Any],
+        router_result: RouterResult,
+    ) -> str:
+        """
+        Escalate a complex reasoning problem directly to System 2 inline.
+        Extracts the solution and blueprint, saves blueprint to memory async,
+        and returns the solution string.
+        """
+        prompt = (
+            "You are System 2. System 1 has escalated a complex problem to you.\n\n"
+            f"Problem Description: {router_result.escalation_problem}\n\n"
+            f"Context Scratchpad: {router_result.escalation_context}\n\n"
+            "Please provide a direct solution to the user's problem. "
+            "Additionally, generate a brief 'Reasoning Blueprint' on how to solve this class of problem. "
+            "You MUST format your output strictly using XML tags:\n"
+            "<solution> The actual answer to the user's problem... </solution>\n"
+            "<blueprint> How to solve this problem: Step 1, Step 2... </blueprint>"
+        )
+
+        messages = [{"role": "user", "content": prompt}]
+        sys2_result = await self.cognitive_router.route_to_system_2(messages)
+
+        content = sys2_result.content if sys2_result.status == "ok" else "[System 2 - Error]: Escalation failed."
+
+        solution_match = re.search(r"<solution>(.*?)</solution>", content, flags=re.DOTALL | re.IGNORECASE)
+        blueprint_match = re.search(r"<blueprint>(.*?)</blueprint>", content, flags=re.DOTALL | re.IGNORECASE)
+
+        solution_text = solution_match.group(1).strip() if solution_match else content.strip()
+        blueprint_text = blueprint_match.group(1).strip() if blueprint_match else None
+
+        if blueprint_text:
+            logger.info("System 2 blueprint extracted. Triggering non-blocking save to Archival Memory.")
+            save_coro = self.vector_memory.add_memory_async(
+                document=f"System 2 Reasoning Blueprint for: {router_result.escalation_problem}\nBlueprint: {blueprint_text}",
+                metadata={"type": "system_2_learned_pattern"}
+            )
+            self._fire_and_forget(save_coro)
+
+        return solution_text
 
     async def _async_tool_synthesis(
         self,

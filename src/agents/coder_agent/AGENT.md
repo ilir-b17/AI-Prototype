@@ -8,6 +8,7 @@ allowed_tools:
   - spawn_new_objective
   - update_objective_status
   - extract_pdf_text
+  - search_archival_memory
 preferred_model: system_1
 max_tool_calls: 5
 energy_cost: 15

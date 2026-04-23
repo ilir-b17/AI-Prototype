@@ -24,6 +24,11 @@ The core engine operates on a multi-node **State Graph Architecture** with a bui
 When System 1 encounters an explicit gap in its toolset, it raises a signal to the Orchestrator. The Orchestrator routes the request to System 2, which dynamically writes Python code for a new tool to bridge the gap.
 The system uses a **Human-in-the-Loop (HITL)** prompt to ask the Admin to approve the synthesized code before it is actively deployed and registered in the database.
 
+#### Cognitive Synergy & The Learning Loop (System 1 & System 2)
+When System 1 encounters a complex reasoning task or gets stuck, it can trigger the `escalate_to_system_2` tool.
+System 2 solves the problem and provides a "Reasoning Blueprint." This blueprint is seamlessly written into the agent's Vector Database (Archival Memory).
+In the future, System 1 can retrieve this pattern via `search_archival_memory` and solve similar tasks locally, continuously expanding its capabilities.
+
 #### Memory Subsystems
 - **Core Memory (Short-Term)**: A lightweight JSON memory store tracking immediate environment variables, active focus, user preferences, and known capabilities.
 - **Hippocampus / Vector Database (Long-Term)**: An asynchronous chroma-db driven embedding storage capturing semantic concepts, past conversations, and experiences.
