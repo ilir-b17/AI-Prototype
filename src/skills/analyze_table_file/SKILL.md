@@ -1,33 +1,33 @@
 # analyze_table_file
 
-Load a CSV/TSV/Excel file and return a concise summary of its contents using pandas.
-
-Use this for quick inspection of data files before deeper analysis.
+Loads a local CSV, TSV, or Excel file and returns a concise summary.
 
 ## Schema
 
 ```json
 {
   "name": "analyze_table_file",
-  "description": "Load a CSV/TSV/Excel file and return a concise summary of its contents using pandas.",
+  "description": "Analyzes a local tabular data file (CSV, TSV, XLSX). Resolves relative paths to the AIDEN_DOWNLOADS_DIR. Returns a JSON summary including shape, column types, missing values, and a brief data preview.",
   "parameters": {
     "type": "object",
     "properties": {
       "file_path": {
         "type": "string",
-        "description": "Path to the data file. Relative paths are resolved under the downloads directory."
+        "description": "The path to the file. If relative, it assumes the downloads directory."
       },
       "sheet_name": {
         "type": "string",
-        "description": "Excel sheet name to load (optional)."
+        "description": "The specific sheet name to read for Excel files (optional)."
       },
       "max_rows": {
         "type": "integer",
-        "description": "Maximum number of rows to display in the preview (default 20)."
+        "description": "Number of preview rows to include. Default 20.",
+        "default": 20
       },
       "max_chars": {
         "type": "integer",
-        "description": "Maximum number of characters to return (default 12000)."
+        "description": "Maximum characters in the output string to prevent context bloat. Default 12000.",
+        "default": 12000
       }
     },
     "required": ["file_path"]

@@ -3,6 +3,8 @@ import logging
 logger = logging.getLogger(__name__)
 
 
+import json
+
 async def query_highest_priority_task() -> str:
     logger.info("query_highest_priority_task called")
     ledger = None
@@ -17,17 +19,29 @@ async def query_highest_priority_task() -> str:
             owns_connection = True
         task = await ledger.get_highest_priority_task()
         if not task:
-            return "BACKLOG: No pending Tasks found."
-        return (
-            f"BACKLOG TASK\n"
-            f"  ID: {task['id']}\n"
-            f"  Title: {task['title']}\n"
-            f"  Estimated Energy: {task['estimated_energy']}\n"
-            f"  Priority: {task['priority']}\n"
-            f"  Origin: {task['origin']}"
-        )
+            return json.dumps({
+                "status": "success",
+                "message": "No pending tasks found in the backlog.",
+                "task": None
+            })
+
+        return json.dumps({
+            "status": "success",
+            "task": {
+                "id": task['id'],
+                "title": task['title'],
+                "estimated_energy": task['estimated_energy'],
+                "priority": task['priority'],
+                "origin": task['origin']
+            }
+        }, indent=2)
     except Exception as exc:
-        return f"Error: Could not query backlog due to [{exc}]."
+        return json.dumps({
+            "status": "error",
+            "message": "Could not query the backlog",
+            "details": str(exc),
+            "suggestion": "Check the SQLite ledger database connection."
+        })
     finally:
         if ledger and owns_connection:
             await ledger.close()

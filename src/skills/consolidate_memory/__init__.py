@@ -44,7 +44,11 @@ async def consolidate_memory() -> str:
                 await ledger.close()
 
         if not history:
-            return "No chat history to consolidate."
+            return json.dumps({
+                "status": "success",
+                "message": "No chat history to consolidate.",
+                "insights": []
+            })
 
         history_text = "\n".join(
             f"{t['role'].upper()}: {t['content'][:200]}" for t in history
@@ -52,19 +56,40 @@ async def consolidate_memory() -> str:
 
         groq_key = os.environ.get("GROQ_API_KEY")
         if not groq_key:
-            return "Consolidation skipped: GROQ_API_KEY not configured."
+            return json.dumps({
+                "status": "error",
+                "message": "Consolidation skipped: GROQ_API_KEY not configured.",
+                "suggestion": "Configure GROQ_API_KEY in the .env file to enable LLM-driven memory consolidation."
+            })
 
         import groq as groq_lib
-        client = groq_lib.Groq(api_key=groq_key)
-        resp = client.chat.completions.create(
-            model="llama-3.1-8b-instant",
-            messages=[
-                {"role": "system", "content": _SYSTEM_PROMPT},
-                {"role": "user", "content": f"Chat history:\n{history_text}"},
-            ],
-            max_tokens=500,
-            temperature=0.3,
-        )
+        client = groq_lib.AsyncGroq(api_key=groq_key)
+
+        try:
+            timeout_seconds = float(os.getenv("TOOL_EXEC_TIMEOUT_SECONDS", "30.0"))
+        except ValueError:
+            timeout_seconds = 30.0
+
+        async def _call_llm():
+            return await client.chat.completions.create(
+                model="llama-3.1-8b-instant",
+                messages=[
+                    {"role": "system", "content": _SYSTEM_PROMPT},
+                    {"role": "user", "content": f"Chat history:\n{history_text}"},
+                ],
+                max_tokens=500,
+                temperature=0.3,
+            )
+
+        try:
+            resp = await asyncio.wait_for(_call_llm(), timeout=timeout_seconds)
+        except asyncio.TimeoutError:
+            return json.dumps({
+                "status": "error",
+                "message": f"Consolidation LLM call timed out after {timeout_seconds}s.",
+                "suggestion": "The LLM API might be slow. Try again later."
+            })
+
         raw = resp.choices[0].message.content.strip()
 
         # Strip markdown code fences if present
@@ -77,7 +102,11 @@ async def consolidate_memory() -> str:
         insights: list = data.get("insights", [])
 
         if not insights:
-            return "Consolidation complete: no new insights extracted."
+            return json.dumps({
+                "status": "success",
+                "message": "Consolidation complete: no new insights extracted.",
+                "insights": []
+            })
 
         core = get_core_memory() or CoreMemory()
         state = await core.get_all()
@@ -87,10 +116,23 @@ async def consolidate_memory() -> str:
         await core.update("consolidated_insights", merged)
 
         logger.info(f"consolidate_memory: wrote {len(insights)} insights to core memory")
-        return f"Memory consolidation complete. Extracted {len(insights)} insights: {new_block[:200]}"
+        return json.dumps({
+            "status": "success",
+            "message": f"Memory consolidation complete. Extracted {len(insights)} insights.",
+            "insights": insights
+        }, indent=2)
 
     except json.JSONDecodeError as e:
-        return f"Consolidation failed: could not parse LLM response ({e})."
+        return json.dumps({
+            "status": "error",
+            "message": "Consolidation failed",
+            "details": f"Could not parse LLM response: {str(e)}",
+            "suggestion": "The LLM returned malformed JSON. This is usually transient, try again."
+        })
     except Exception as e:
         logger.error(f"consolidate_memory error: {e}", exc_info=True)
-        return f"Consolidation failed: {e}"
+        return json.dumps({
+            "status": "error",
+            "message": "Consolidation failed",
+            "details": str(e)
+        })

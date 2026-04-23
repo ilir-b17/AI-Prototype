@@ -1,21 +1,19 @@
 # execute_python_sandbox
 
-Execute arbitrary Python code in an isolated sandbox with a strict 10-second timeout.
-
-Use this as your internal calculator and data processor. Use it to perform complex math, parse data, or test newly drafted Python logic safely before requesting it be made into a permanent skill.
+Executes isolated Python code locally via a temporary subprocess.
 
 ## Schema
 
 ```json
 {
   "name": "execute_python_sandbox",
-  "description": "Execute arbitrary Python code in an isolated sandbox with a strict 10-second timeout. Use this as your internal calculator and data processor. Use it to perform complex math, parse data, or test newly drafted Python logic safely before requesting it be made into a permanent skill.",
+  "description": "Executes Python code locally in a secure subprocess. Excellent for data processing, complex calculations, analyzing local repository code, or testing API calls. Will timeout if it hangs. The python environment has access to the installed packages in the main bot environment.",
   "parameters": {
     "type": "object",
     "properties": {
       "code_string": {
         "type": "string",
-        "description": "The Python code to execute."
+        "description": "The raw string representation of the Python script to execute. Ensure it contains a print statement if you expect output."
       }
     },
     "required": ["code_string"]

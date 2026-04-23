@@ -3,8 +3,27 @@ import logging
 logger = logging.getLogger(__name__)
 
 
+import json
+
 async def spawn_new_objective(tier: str, title: str, estimated_energy: int) -> str:
     logger.info(f"spawn_new_objective: [{tier}] {title}")
+
+    if not isinstance(title, str) or not title.strip():
+         return json.dumps({
+             "status": "error",
+             "message": "Invalid title",
+             "details": "The title must be a non-empty string."
+         })
+
+    try:
+        estimated_energy = int(estimated_energy)
+    except ValueError:
+        return json.dumps({
+             "status": "error",
+             "message": "Invalid estimated_energy",
+             "details": "estimated_energy must be an integer."
+         })
+
     ledger = None
     owns_connection = False
     try:
@@ -19,9 +38,21 @@ async def spawn_new_objective(tier: str, title: str, estimated_energy: int) -> s
             tier=tier, title=title,
             estimated_energy=estimated_energy, origin="System"
         )
-        return f"Success: New {tier} added to backlog (id={obj_id}): {title!r}"
+        return json.dumps({
+            "status": "success",
+            "message": f"New {tier} added to backlog.",
+            "data": {
+                "id": obj_id,
+                "tier": tier,
+                "title": title
+            }
+        }, indent=2)
     except Exception as exc:
-        return f"Error: Could not spawn objective due to [{exc}]."
+        return json.dumps({
+            "status": "error",
+            "message": "Could not spawn objective",
+            "details": str(exc)
+        })
     finally:
         if ledger and owns_connection:
             await ledger.close()

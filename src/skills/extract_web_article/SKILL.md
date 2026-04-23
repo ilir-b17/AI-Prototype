@@ -1,25 +1,24 @@
 # extract_web_article
 
-Fetch a URL and extract the main article text (boilerplate removed) using trafilatura.
-
-Use this after `web_search` to read the content of a page before summarizing.
+Downloads and extracts the main text content from a web URL.
 
 ## Schema
 
 ```json
 {
   "name": "extract_web_article",
-  "description": "Fetch a URL and extract the main article text with trafilatura (boilerplate removed). Use after web_search to read page content.",
+  "description": "Fetches a URL and extracts the main article text, stripping out ads, navigation, and boilerplate. Ideal for reading blog posts, news articles, or documentation pages. Returns JSON containing the extracted text (up to max_chars limit) or detailed error info if the fetch fails.",
   "parameters": {
     "type": "object",
     "properties": {
       "url": {
         "type": "string",
-        "description": "The URL to fetch and extract text from."
+        "description": "The full HTTP/HTTPS URL of the article to extract."
       },
       "max_chars": {
         "type": "integer",
-        "description": "Maximum number of characters to return (default 12000)."
+        "description": "The maximum number of characters to return (default 12000) to prevent blowing up the LLM context.",
+        "default": 12000
       }
     },
     "required": ["url"]

@@ -1,29 +1,29 @@
 # manage_file_system
 
-Manage the file system through 'read', 'list', 'write', and 'delete' operations.
-
-Use this to read system logs, inspect project data, or review your own python code. If you discover a bug in your logic, read the file here first, then use `request_core_update` to propose the fix.
+Provides basic file system operations: `read` and `list`.
+The `write` and `delete` operations will immediately return a SECURITY LOCK requiring the use of `request_core_update` to get admin approval.
 
 ## Schema
 
 ```json
 {
   "name": "manage_file_system",
-  "description": "Manage the file system through read, list, write, and delete operations. Use this to read system logs, inspect project data, or review your own python code. If you discover a bug in your logic, read the file here first, then use `request_core_update` to propose the fix.",
+  "description": "Manages file system operations. Can 'read' files or 'list' directories. 'write' and 'delete' operations will trigger a SECURITY LOCK. Returns file content, directory listing JSON, or detailed JSON error messages if the path is invalid.",
   "parameters": {
     "type": "object",
     "properties": {
       "action": {
         "type": "string",
-        "description": "The file system action to perform: 'read', 'write', 'list', or 'delete'."
+        "description": "The action to perform: 'read', 'list', 'write', or 'delete'.",
+        "enum": ["read", "list", "write", "delete"]
       },
       "file_path": {
         "type": "string",
-        "description": "The path to the file or directory."
+        "description": "The absolute or relative path to the file or directory."
       },
       "content": {
         "type": "string",
-        "description": "The content to write to the file. Only used when action is 'write'."
+        "description": "The content to write (only used if action is 'write')."
       }
     },
     "required": ["action", "file_path"]
