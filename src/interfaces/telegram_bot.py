@@ -471,6 +471,12 @@ async def _async_run(application: Application, orchestrator_inst: "Orchestrator"
                 except Exception:
                     pass
 
+            # Close synchronous resources
+            try:
+                orchestrator_inst.vector_memory.close()
+            except Exception:
+                pass
+
             logger.info("Shutdown complete.")
 
 

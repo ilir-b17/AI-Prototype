@@ -9,6 +9,7 @@ contextual awareness in agent decision-making.
 import os
 import logging
 import uuid
+from datetime import datetime, timedelta
 from typing import Dict, List, Any, Optional
 import chromadb
 from chromadb.config import Settings
@@ -86,7 +87,8 @@ class VectorMemory:
         self,
         text: str,
         metadata: Optional[Dict[str, Any]] = None,
-        memory_id: Optional[str] = None
+        memory_id: Optional[str] = None,
+        dedup_threshold: float = 0.98,
     ) -> str:
         """
         Add a semantic memory to the vector database with retry logic.
@@ -110,6 +112,26 @@ class VectorMemory:
 
         if metadata is None:
             metadata = {}
+
+        # Near-duplicate guard: skip insert if a very similar entry already exists
+        try:
+            existing = self.collection.query(query_texts=[text], n_results=1)
+            if existing.get("distances") and existing["distances"][0]:
+                similarity = 1.0 - existing["distances"][0][0]  # cosine: distance = 1 − sim
+                if similarity >= dedup_threshold:
+                    existing_id = existing["ids"][0][0]
+                    logger.debug(
+                        "Dedup: skipping insert, near-identical memory exists (sim=%.4f, id=%s)",
+                        similarity, existing_id,
+                    )
+                    return existing_id
+        except Exception as _dedup_err:
+            logger.warning("Dedup check failed, proceeding with insert: %s", _dedup_err)
+
+        # Stamp metadata with current time if not already present
+        if "timestamp" not in metadata:
+            metadata = dict(metadata)
+            metadata["timestamp"] = datetime.now().isoformat()
 
         # Generate ID if not provided
         if not memory_id:
@@ -272,6 +294,23 @@ class VectorMemory:
                 self.client = None
         except Exception as e:
             logger.warning(f"Error closing VectorMemory: {e}")
+
+    def prune_old_memories(self, days: int = 180) -> int:
+        """Delete memories whose metadata timestamp is older than *days* days."""
+        cutoff = (datetime.now() - timedelta(days=days)).isoformat()
+        try:
+            results = self.collection.get(
+                where={"timestamp": {"$lt": cutoff}},
+                include=["metadatas"],
+            )
+            ids = results.get("ids", [])
+            if ids:
+                self.collection.delete(ids=ids)
+                logger.info("Pruned %d old vector memories (older than %d days).", len(ids), days)
+            return len(ids)
+        except Exception as e:
+            logger.warning("Vector memory pruning failed: %s", e)
+            return 0
 
     # â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     # Async wrappers â€” non-blocking via asyncio.to_thread()
