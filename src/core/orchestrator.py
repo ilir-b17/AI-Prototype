@@ -10,8 +10,11 @@ import os
 import platform
 import logging
 import json
+import hashlib
 import asyncio
 import re
+import sys
+import tempfile
 import time
 from datetime import datetime
 from typing import Dict, Any, List, Optional
@@ -33,6 +36,20 @@ from src.core.runtime_context import set_runtime_context
 from src.core.state_model import AgentState, normalize_state
 from src.core.workflow_graph import build_orchestrator_graph
 from src.core.security import verify_mfa_challenge
+from src.core.nocturnal_consolidation import NocturnalConsolidationSlice1
+from src.core.goal_planner import GoalPlanner, PlanningResult
+from src.core.energy_judge import EnergyJudge, EnergyEvaluation
+from src.core.energy_roi_engine import EnergyROIEngine, EnergyDecision
+from src.core.moral_ledger import (
+    MORAL_DIMENSIONS,
+    MORAL_RUBRIC_VERSION,
+    MORAL_TIER_1_DIMENSIONS,
+    MoralDecision,
+    build_legacy_binary_decision,
+    build_local_skip_decision,
+    build_triviality_bypass_decision,
+    parse_moral_decision_response,
+)
 
 try:
     from google.api_core.exceptions import ResourceExhausted
@@ -51,6 +68,8 @@ MEMORY_SAVE_THRESHOLD = int(os.getenv("MEMORY_SAVE_THRESHOLD", "120"))
 MEMORY_CONSOLIDATION_INTERVAL = int(os.getenv("MEMORY_CONSOLIDATION_INTERVAL", "21600"))  # 6 hours
 # How long an unanswered MFA/HITL/tool-approval entry stays alive before auto-expiry
 _PENDING_STATE_TTL_SECONDS = int(os.getenv("PENDING_STATE_TTL_SECONDS", "86400"))  # 24 hours
+_SYNTHESIS_SELF_TEST_TIMEOUT_DEFAULT_SECONDS = 12.0
+_MAX_SYNTHESIS_RETRIES = int(os.getenv("MAX_SYNTHESIS_RETRIES", "3"))
 _SYSTEM_1_ERROR_PREFIX = "[System 1 - Error]"
 _ROUTING_STOPWORDS = {
     "a", "an", "and", "are", "at", "be", "can", "could", "do", "for", "from",
@@ -82,10 +101,39 @@ _SINGLE_TOOL_MIN_MARGIN = 0.75
 _FAST_PATH_DIRECT_MAX_TOKENS = 12
 _FAST_PATH_SINGLE_TOOL_MAX_TOKENS = 14
 _FAST_PATH_SINGLE_TOOL_ALLOWLIST = frozenset({"get_system_info", "get_stock_price", "web_search"})
+_MORAL_TRIVIALITY_READ_ONLY_HINTS = (
+    "time",
+    "date",
+    "timezone",
+    "weather",
+    "stock",
+    "price",
+    "score",
+    "headline",
+    "system info",
+)
+_MORAL_TRIVIALITY_BLOCK_HINTS = (
+    "modify",
+    "delete",
+    "write",
+    "update_",
+    "request_capability",
+    "escalate_to_system_2",
+    "run_terminal_command",
+    "execute_python_sandbox",
+    "manage_file_system",
+    "spawn_new_objective",
+    "approval",
+    "mfa",
+    "deploy",
+)
 _RECENT_CHAT_HISTORY_LIMIT = 12
 _CRITIC_SHORT_OUTPUT_THRESHOLD = 220
 _SYSTEM_2_ERROR_PREFIX = "[System 2 - Error]"
 _SYSTEM_2_EMPTY_PREFIX = "[System 2 - No Response]"
+_GOAL_PLANNER_COMPLEXITY_THRESHOLD = int(os.getenv("GOAL_PLANNER_COMPLEXITY_THRESHOLD", "4"))
+_HEARTBEAT_FAILURE_STRIKES = int(os.getenv("HEARTBEAT_FAILURE_STRIKES", "3"))
+_HEARTBEAT_FAILURE_STATE_KEY = "heartbeat_task_failure_counts"
 _ERROR_RESPONSE_PREFIXES = (
     "Supervisor encountered an error",
     "Both local and cloud reasoning failed",
@@ -94,6 +142,39 @@ _ERROR_RESPONSE_PREFIXES = (
     "Unable to fulfill this request",
     "No valid response could be generated",
     "An internal error occurred",
+)
+_CLOUD_REDACTION_BLOCK_PATTERNS = (
+    r"<context_and_memory>.*?</context_and_memory>",
+    r"<Core_Working_Memory>.*?</Core_Working_Memory>",
+    r"<Archival_Memory>.*?</Archival_Memory>",
+    r"<chat_history>.*?</chat_history>",
+)
+_CLOUD_REDACTION_LINE_PATTERNS = (
+    (r"\[Machine Context[^\]]*\].*?(?=\n\s*\n|$)", "[REDACTED_SENSORY_STATE]"),
+    (
+        r"^\s*(Host[_ ]?OS|OS|CPU(?:[_ ]?usage)?|CWD|Platform|Memory Usage|Disk Usage)\s*[:=].*$",
+        "[REDACTED_SENSORY_STATE]",
+    ),
+    (
+        r"<\s*(host_os|os|cpu_usage|cwd|machine|platform)\s*>.*?<\s*/\s*(host_os|os|cpu_usage|cwd|machine|platform)\s*>",
+        "[REDACTED_SENSORY_STATE]",
+    ),
+)
+_CLOUD_REDACTION_PII_PATTERNS = (
+    (r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b", "[REDACTED_EMAIL]"),
+    (r"\+?\d[\d\-\s().]{7,}\d", "[REDACTED_PHONE]"),
+    (
+        r"\b\d{1,5}\s+[A-Za-z0-9.\- ]+\s(?:Street|St|Avenue|Ave|Road|Rd|Boulevard|Blvd|Lane|Ln|Drive|Dr)\b",
+        "[REDACTED_ADDRESS]",
+    ),
+    (r"\b(?:my name is|i am|i'm)\s+[A-Za-z][A-Za-z'\-]+(?:\s+[A-Za-z][A-Za-z'\-]+){0,2}\b", "[REDACTED_NAME]"),
+    (r"\b(?:i live in|located in|from)\s+[A-Za-z][A-Za-z'\-]+(?:[\s,]+[A-Za-z][A-Za-z'\-]+){0,2}\b", "[REDACTED_LOCATION]"),
+    (r"\b(?:user[_ ]?id|ssn|social security|passport|account number)\b[^\n]*", "[REDACTED_PII_FIELD]"),
+    (r"[A-Za-z]:\\[^\n]*", "[REDACTED_PATH]"),
+)
+_SENSITIVE_CONTEXT_HINT_RE = re.compile(
+    r"\b(use|include|review|analy[sz]e|consider|reference)\b.{0,120}\b(chat[_\s-]*history|sensory[_\s-]*state|core[_\s-]*memory|user\s+profile|full\s+name|location|email|phone|pii)\b",
+    flags=re.IGNORECASE | re.DOTALL,
 )
 
 # Key used in the state dict to signal a blocked (non-ok) router result
@@ -132,6 +213,21 @@ class Orchestrator:
             self.cognitive_router = CognitiveRouter(model_name=gemini_model, local_model=local_model)
             self.prompt_config = load_prompt_config()
             self.agent_registry = AgentRegistry()
+            self.nocturnal_consolidation = NocturnalConsolidationSlice1(
+                min_chars=int(os.getenv("NOCTURNAL_MIN_CHARS", "30")),
+                batch_semantic_jaccard_threshold=float(os.getenv("NOCTURNAL_BATCH_DEDUP_THRESHOLD", "0.82")),
+                vector_distance_threshold=float(os.getenv("NOCTURNAL_VECTOR_DEDUP_DISTANCE", "0.08")),
+            )
+            self.goal_planner = GoalPlanner(
+                max_context_chars=int(os.getenv("GOAL_PLANNER_CONTEXT_CHARS", "1600"))
+            )
+            self.energy_judge = EnergyJudge()
+            self.energy_roi_engine = EnergyROIEngine()
+            self._predictive_energy_budget_remaining = max(
+                0,
+                int(os.getenv("INITIAL_ENERGY_BUDGET", "100")),
+            )
+            self._predictive_energy_budget_lock: asyncio.Lock = asyncio.Lock()
 
             self.charter_text = self._load_charter()
             self.pending_mfa: Dict[str, dict] = {}
@@ -145,6 +241,7 @@ class Orchestrator:
             self._user_locks: Dict[str, asyncio.Lock] = {}
             self._user_locks_lock: asyncio.Lock = asyncio.Lock()
             self._compiled_graph = None
+            self._heartbeat_failure_counts: Dict[int, int] = {}
             self._refresh_sensory_state()
 
             logger.info("Orchestrator __init__ complete — call async_init() to finish setup")
@@ -183,6 +280,7 @@ class Orchestrator:
         await self._load_pending_approvals()
         await self._load_pending_mfa()
         await self._load_pending_hitl()
+        await self._restore_heartbeat_failure_counts()
         if getattr(self.cognitive_router, "_preload_system_1_on_startup", False):
             try:
                 await self.cognitive_router.preload_system_1()
@@ -997,6 +1095,13 @@ class Orchestrator:
         ]
 
         if assessment["mode"] == "direct":
+            deferred = await self._try_ad_hoc_dispatch_energy_gate(
+                state,
+                dispatch_context="fast_path_direct",
+            )
+            if deferred is not None:
+                return deferred
+
             archival_ctx = ""
             if hasattr(self, "vector_memory"):
                 archival_ctx = await self._get_archival_context(user_message)
@@ -1031,6 +1136,13 @@ class Orchestrator:
             return None
 
         if assessment["mode"] == "multi_ticker":
+            deferred = await self._try_ad_hoc_dispatch_energy_gate(
+                state,
+                dispatch_context="fast_path_multi_ticker",
+            )
+            if deferred is not None:
+                return deferred
+
             tickers = assessment["tickers"]
             ticker_results = []
             for ticker in tickers:
@@ -1073,6 +1185,13 @@ class Orchestrator:
             return None
 
         tool_name = assessment["tool_name"]
+        deferred = await self._try_ad_hoc_dispatch_energy_gate(
+            state,
+            dispatch_context=f"fast_path_single_tool:{tool_name}",
+        )
+        if deferred is not None:
+            return deferred
+
         tool_result = await self.cognitive_router._execute_tool(tool_name, assessment["arguments"])
         if tool_result.status != "ok":
             return None
@@ -1161,6 +1280,114 @@ class Orchestrator:
             and result.content.startswith((_SYSTEM_2_ERROR_PREFIX, _SYSTEM_2_EMPTY_PREFIX))
         )
 
+    @staticmethod
+    def _requires_sensitive_cloud_context(*segments: str) -> bool:
+        combined = "\n".join(str(segment or "") for segment in segments)
+        if not combined.strip():
+            return False
+        return bool(_SENSITIVE_CONTEXT_HINT_RE.search(combined))
+
+    @staticmethod
+    def _redact_text_for_cloud(
+        text: str,
+        *,
+        allow_sensitive_context: bool = False,
+        max_chars: int = 3500,
+    ) -> str:
+        raw_text = str(text or "")
+        if not raw_text:
+            return ""
+
+        if allow_sensitive_context:
+            compact = raw_text.strip()
+            if len(compact) > max_chars:
+                return compact[:max_chars].rstrip() + "\n[TRUNCATED_FOR_SIZE]"
+            return compact
+
+        redacted = raw_text
+        for pattern in _CLOUD_REDACTION_BLOCK_PATTERNS:
+            redacted = re.sub(pattern, "[REDACTED_CONTEXT_BLOCK]", redacted, flags=re.IGNORECASE | re.DOTALL)
+
+        for pattern, replacement in _CLOUD_REDACTION_LINE_PATTERNS:
+            redacted = re.sub(pattern, replacement, redacted, flags=re.IGNORECASE | re.DOTALL | re.MULTILINE)
+
+        for pattern, replacement in _CLOUD_REDACTION_PII_PATTERNS:
+            redacted = re.sub(pattern, replacement, redacted, flags=re.IGNORECASE)
+
+        redacted = re.sub(r"\n{3,}", "\n\n", redacted).strip()
+        if not redacted:
+            return "[REDACTED_EMPTY_PAYLOAD]"
+        if len(redacted) > max_chars:
+            return redacted[:max_chars].rstrip() + "\n[TRUNCATED_FOR_PRIVACY]"
+        return redacted
+
+    def _redact_messages_for_cloud(
+        self,
+        messages: List[Dict[str, str]],
+        *,
+        allow_sensitive_context: bool = False,
+    ) -> List[Dict[str, str]]:
+        if not messages:
+            return [{"role": "user", "content": "[REDACTED_EMPTY_PAYLOAD]"}]
+
+        source_messages: List[Dict[str, Any]]
+        if allow_sensitive_context:
+            source_messages = list(messages)
+        else:
+            system_messages = [msg for msg in messages if str(msg.get("role", "")).lower() == "system"]
+            user_messages = [msg for msg in messages if str(msg.get("role", "")).lower() == "user"]
+
+            source_messages = []
+            if system_messages:
+                source_messages.append(system_messages[0])
+                if len(system_messages) > 1:
+                    source_messages.append(system_messages[-1])
+            if user_messages:
+                source_messages.append(user_messages[-1])
+            elif messages:
+                source_messages.append(messages[-1])
+
+        sanitized: List[Dict[str, str]] = []
+        seen: set[tuple[str, str]] = set()
+        for message in source_messages:
+            role = str(message.get("role") or "user")
+            content = self._redact_text_for_cloud(
+                str(message.get("content") or ""),
+                allow_sensitive_context=allow_sensitive_context,
+            )
+            if not content:
+                continue
+            key = (role, content)
+            if key in seen:
+                continue
+            seen.add(key)
+            sanitized.append({"role": role, "content": content})
+
+        return sanitized or [{"role": "user", "content": "[REDACTED_EMPTY_PAYLOAD]"}]
+
+    async def _route_to_system_2_redacted(
+        self,
+        messages: List[Dict[str, str]],
+        *,
+        allowed_tools: Optional[List[str]] = None,
+        purpose: str = "system_2",
+        allow_sensitive_context: bool = False,
+    ) -> RouterResult:
+        minimized_messages = self._redact_messages_for_cloud(
+            messages,
+            allow_sensitive_context=allow_sensitive_context,
+        )
+        logger.info(
+            "System 2 payload redacted for %s: %d -> %d message(s)",
+            purpose,
+            len(messages),
+            len(minimized_messages),
+        )
+        return await self.cognitive_router.route_to_system_2(
+            minimized_messages,
+            allowed_tools=allowed_tools,
+        )
+
     def _get_system_1_gate_metrics(self) -> Dict[str, Any]:
         getter = getattr(self.cognitive_router, "get_system_1_gate_metrics", None)
         if not callable(getter):
@@ -1245,8 +1472,356 @@ class Orchestrator:
             logger.warning(f"Archival memory lookup failed: {e}")
             return ""
 
+    def _energy_gate_available(self) -> bool:
+        return (
+            getattr(self, "energy_judge", None) is not None
+            and getattr(self, "energy_roi_engine", None) is not None
+            and getattr(self, "_predictive_energy_budget_lock", None) is not None
+            and hasattr(self, "_predictive_energy_budget_remaining")
+        )
+
+    async def _get_predictive_energy_budget_remaining(self) -> int:
+        if not self._energy_gate_available():
+            return max(0, int(os.getenv("INITIAL_ENERGY_BUDGET", "100")))
+        async with self._predictive_energy_budget_lock:
+            return max(0, int(self._predictive_energy_budget_remaining))
+
+    async def _try_reserve_predictive_energy_budget(
+        self,
+        *,
+        predicted_cost: int,
+        min_reserve: int,
+        reason: str,
+    ) -> bool:
+        if not self._energy_gate_available():
+            return True
+
+        cost = max(0, int(predicted_cost))
+        reserve = max(0, int(min_reserve))
+        async with self._predictive_energy_budget_lock:
+            remaining = max(0, int(self._predictive_energy_budget_remaining))
+            if remaining - cost < reserve:
+                return False
+            self._predictive_energy_budget_remaining = remaining - cost
+            logger.info(
+                "Predictive energy budget reserved: -%s (%s). Remaining=%s",
+                cost,
+                reason,
+                self._predictive_energy_budget_remaining,
+            )
+            return True
+
+    @staticmethod
+    def _build_energy_evaluation_record(
+        *,
+        evaluation: EnergyEvaluation,
+        decision: EnergyDecision,
+        available_energy: int,
+        context: str,
+    ) -> Dict[str, Any]:
+        return {
+            "context": str(context or ""),
+            "available_energy": int(available_energy),
+            "estimated_effort": int(evaluation.estimated_effort),
+            "expected_value": int(evaluation.expected_value),
+            "defer_count": int(decision.defer_count),
+            "used_fallback": bool(evaluation.used_fallback),
+            "fallback_reason": str(evaluation.fallback_reason or ""),
+            "should_execute": bool(decision.should_execute),
+            "reason": str(decision.reason or ""),
+            "roi": float(decision.roi),
+            "base_roi": float(decision.base_roi),
+            "effective_roi": float(decision.effective_roi),
+            "predicted_cost": int(decision.predicted_cost),
+            "reserve_after_execution": int(decision.reserve_after_execution),
+            "roi_threshold": float(decision.roi_threshold),
+            "min_reserve": int(decision.min_reserve),
+            "fairness_boost_multiplier": float(decision.fairness_boost_multiplier),
+            "max_defer_count": int(decision.max_defer_count),
+            "defer_cooldown_seconds": int(decision.defer_cooldown_seconds),
+            "evaluated_at": datetime.now().isoformat(),
+        }
+
+    async def _route_energy_judge_messages(self, messages: List[Dict[str, str]]) -> RouterResult:
+        return await self._route_to_system_1(
+            messages,
+            allowed_tools=[],
+            deadline_seconds=45.0,
+            context="energy_judge",
+        )
+
+    async def _evaluate_energy_for_context(
+        self,
+        *,
+        task: Dict[str, Any],
+        story: Optional[Dict[str, Any]],
+        epic: Optional[Dict[str, Any]],
+        additional_context: str,
+    ) -> tuple[EnergyEvaluation, EnergyDecision, int]:
+        available_energy = await self._get_predictive_energy_budget_remaining()
+        defer_count = int(task.get("defer_count") or 0)
+        evaluation = await self.energy_judge.evaluate_with_system1(
+            task=task,
+            story=story,
+            epic=epic,
+            route_to_system_1=self._route_energy_judge_messages,
+            additional_context=additional_context,
+        )
+        decision = self.energy_roi_engine.evaluate(
+            estimated_effort=evaluation.estimated_effort,
+            expected_value=evaluation.expected_value,
+            available_energy=available_energy,
+            defer_count=defer_count,
+        )
+        return evaluation, decision, available_energy
+
+    def _build_synthesized_ad_hoc_energy_context(
+        self,
+        state: Dict[str, Any],
+    ) -> Dict[str, Optional[Dict[str, Any]]]:
+        user_message = str(state.get("user_input") or "").strip()
+        complexity = max(1, self._estimate_request_complexity(user_message) + 1)
+        history_context = self._build_goal_planning_context(state)
+
+        task = {
+            "title": user_message,
+            "acceptance_criteria": "Provide a correct and concise answer to the current user request.",
+            "estimated_energy": min(10, complexity),
+            "status": "pending",
+            "depends_on_ids": [],
+            "defer_count": 0,
+        }
+        story = {
+            "title": "Ad-hoc user response",
+            "status": "active",
+            "acceptance_criteria": "Answer the user request with useful and policy-compliant output.",
+        }
+        epic = {
+            "title": "Sustain reliable operator assistance",
+            "status": "active",
+            "acceptance_criteria": "Serve user requests while preserving energy reserves for critical work.",
+        }
+        return {
+            "task": task,
+            "story": story,
+            "epic": epic,
+            "additional_context": history_context,
+        }
+
+    @staticmethod
+    def _format_ad_hoc_energy_deferral_message(
+        *,
+        decision: EnergyDecision,
+        available_energy: int,
+    ) -> str:
+        return (
+            "Deferred due to energy policy. "
+            f"Reason: {decision.reason}. "
+            f"ROI={decision.roi:.2f} (base={decision.base_roi:.2f}, defer_count={decision.defer_count}), "
+            f"predicted_cost={decision.predicted_cost}, "
+            f"available_budget={int(available_energy)}, reserve_floor={decision.min_reserve}."
+        )
+
+    async def _try_ad_hoc_dispatch_energy_gate(
+        self,
+        state: Dict[str, Any],
+        *,
+        dispatch_context: str,
+    ) -> Optional[str]:
+        if not self._energy_gate_available():
+            return None
+
+        user_id = str(state.get("user_id") or "")
+        if user_id == "heartbeat":
+            return None
+
+        user_message = str(state.get("user_input") or "").strip()
+        if not user_message:
+            return None
+
+        context = self._build_synthesized_ad_hoc_energy_context(state)
+        evaluation, decision, available_energy = await self._evaluate_energy_for_context(
+            task=context["task"] or {},
+            story=context["story"],
+            epic=context["epic"],
+            additional_context=str(context.get("additional_context") or ""),
+        )
+
+        if not decision.should_execute:
+            message = self._format_ad_hoc_energy_deferral_message(
+                decision=decision,
+                available_energy=available_energy,
+            )
+            logger.warning(
+                "Ad-hoc dispatch deferred by energy gate (%s): %s",
+                dispatch_context,
+                message,
+            )
+            return message
+
+        reserved = await self._try_reserve_predictive_energy_budget(
+            predicted_cost=decision.predicted_cost,
+            min_reserve=decision.min_reserve,
+            reason=f"ad_hoc:{dispatch_context}:{user_id}",
+        )
+        if not reserved:
+            current_budget = await self._get_predictive_energy_budget_remaining()
+            race_decision = self.energy_roi_engine.evaluate(
+                estimated_effort=evaluation.estimated_effort,
+                expected_value=evaluation.expected_value,
+                available_energy=current_budget,
+                defer_count=decision.defer_count,
+            )
+            message = self._format_ad_hoc_energy_deferral_message(
+                decision=race_decision,
+                available_energy=current_budget,
+            )
+            logger.warning(
+                "Ad-hoc dispatch deferred after budget reservation race (%s): %s",
+                dispatch_context,
+                message,
+            )
+            return message
+
+        logger.info(
+            "Ad-hoc dispatch approved by energy gate (%s): roi=%.2f cost=%s remaining=%s",
+            dispatch_context,
+            decision.roi,
+            decision.predicted_cost,
+            await self._get_predictive_energy_budget_remaining(),
+        )
+        return None
+
     def _new_state(self, user_id: str, user_message: str) -> Dict[str, Any]:
         return AgentState.new(user_id=user_id, user_input=user_message).to_dict()
+
+    @staticmethod
+    def _is_explicit_epic_request(user_message: str) -> bool:
+        lowered = str(user_message or "").lower()
+        return bool(
+            re.search(
+                r"\b(epic\s*:|create\s+epic|new\s+epic|define\s+epic|epic\s+goal)\b",
+                lowered,
+            )
+        )
+
+    def _should_invoke_goal_planner(self, user_message: str) -> bool:
+        text = str(user_message or "").strip()
+        if not text:
+            return False
+
+        if self._is_explicit_epic_request(text):
+            return True
+
+        complexity = self._estimate_request_complexity(text)
+        if complexity < _GOAL_PLANNER_COMPLEXITY_THRESHOLD:
+            return False
+
+        lowered = text.lower()
+        planning_markers = (
+            "plan",
+            "roadmap",
+            "phases",
+            "milestones",
+            "decompose",
+            "break down",
+            "architecture",
+            "multi-step",
+            "multi step",
+            "workflow",
+        )
+        marker_hits = sum(1 for marker in planning_markers if marker in lowered)
+        if marker_hits >= 2:
+            return True
+
+        action_markers = (
+            "build",
+            "implement",
+            "launch",
+            "ship",
+            "refactor",
+            "migrate",
+        )
+        has_action = any(marker in lowered for marker in action_markers)
+        return has_action and bool(re.search(r"\b(and|then|after|before|plus)\b", lowered))
+
+    @staticmethod
+    def _build_goal_planning_context(state: Dict[str, Any]) -> str:
+        history = list(state.get("chat_history", []) or [])
+        if not history:
+            return ""
+
+        lines: List[str] = []
+        for turn in history[-4:]:
+            role = str(turn.get("role") or "").strip().lower()
+            if role not in {"user", "assistant"}:
+                continue
+            content = re.sub(r"\s+", " ", str(turn.get("content") or "")).strip()
+            if not content:
+                continue
+            if len(content) > 240:
+                content = content[:237] + "..."
+            lines.append(f"{role}: {content}")
+
+        return "\n".join(lines)
+
+    @staticmethod
+    def _format_goal_planner_ack(result: PlanningResult) -> str:
+        return (
+            "Planning only complete. "
+            f"Created Epic #{result.epic_id} ({result.epic_title}) with "
+            f"{result.story_count} Stories and {result.task_count} Tasks. "
+            "No task execution was performed."
+        )
+
+    async def _try_goal_planning_response(self, state: Dict[str, Any]) -> Optional[str]:
+        user_id = str(state.get("user_id") or "")
+        if user_id == "heartbeat":
+            return None
+
+        user_message = str(state.get("user_input") or "").strip()
+        if not self._should_invoke_goal_planner(user_message):
+            return None
+
+        if not self.cognitive_router.get_system_2_available():
+            logger.info("GoalPlanner skipped because System 2 is unavailable.")
+            return None
+
+        planning_context = self._build_goal_planning_context(state)
+        allow_sensitive_context = self._requires_sensitive_cloud_context(
+            user_message,
+            planning_context,
+        )
+
+        async def _route(messages: List[Dict[str, str]]) -> RouterResult:
+            return await self._route_to_system_2_redacted(
+                messages,
+                allowed_tools=[],
+                purpose="goal_planner",
+                allow_sensitive_context=allow_sensitive_context,
+            )
+
+        try:
+            result = await self.goal_planner.plan_goal(
+                user_message,
+                context=planning_context,
+                route_to_system_2=_route,
+                ledger_memory=self.ledger_memory,
+                redactor=self._redact_text_for_cloud,
+                origin=f"User:{user_id}",
+            )
+        except Exception as e:
+            logger.warning(f"GoalPlanner failed; falling back to normal execution path: {e}")
+            return None
+
+        logger.info(
+            "GoalPlanner created planning tree for user %s: epic=%s stories=%s tasks=%s",
+            user_id,
+            result.epic_id,
+            result.story_count,
+            result.task_count,
+        )
+        return self._format_goal_planner_ack(result)
 
     def _deduct_energy(self, state: Dict[str, Any], amount: int, reason: str) -> Dict[str, Any]:
         """Deduct energy and raise HITL if exhausted."""
@@ -1497,6 +2072,84 @@ class Orchestrator:
 
         return len(output_to_eval.strip()) >= _CRITIC_SHORT_OUTPUT_THRESHOLD
 
+    @staticmethod
+    def _store_moral_decision_trace(state: Dict[str, Any], decision: MoralDecision) -> None:
+        state["moral_decision"] = decision.to_dict()
+        state["moral_audit_mode"] = str(decision.decision_mode)
+        state["moral_audit_trace"] = str(decision.bypass_reason or decision.reasoning)
+        state["moral_audit_bypassed"] = decision.decision_mode in {"triviality_bypass", "local_skip"}
+
+    @staticmethod
+    def _contains_any_hint(text: str, hints: tuple[str, ...]) -> bool:
+        lowered = str(text or "").lower()
+        return any(hint in lowered for hint in hints)
+
+    def _build_moral_triviality_text(self, state: Dict[str, Any], output_to_eval: str) -> str:
+        parts: List[str] = [
+            str(state.get("user_input") or ""),
+            str(output_to_eval or ""),
+        ]
+        for step in state.get("current_plan", []) or []:
+            if isinstance(step, dict):
+                parts.append(str(step.get("agent") or ""))
+                parts.append(str(step.get("task") or ""))
+                parts.append(str(step.get("reason") or ""))
+            else:
+                parts.append(str(step))
+        return "\n".join(part for part in parts if part)
+
+    def _is_triviality_bypass_blocked(self, state: Dict[str, Any], inspection_text: str) -> bool:
+        if state.get("critic_instructions"):
+            return True
+        if int(state.get("iteration_count") or 0) > 0:
+            return True
+        if not str(inspection_text or "").strip():
+            return True
+        if self._contains_any_hint(inspection_text, _MORAL_TRIVIALITY_BLOCK_HINTS):
+            return True
+        if len(state.get("current_plan", []) or []) > 1:
+            return True
+        return False
+
+    def _try_route_assessment_triviality_bypass(self, user_input: str) -> Optional[MoralDecision]:
+        try:
+            assessment = self._assess_request_route(user_input)
+        except Exception:
+            return None
+
+        mode = str(assessment.get("mode") or "")
+        if mode == "single_tool":
+            tool_name = str(assessment.get("tool_name") or "")
+            if tool_name in _FAST_PATH_SINGLE_TOOL_ALLOWLIST:
+                return build_triviality_bypass_decision(
+                    f"single_tool_read_only:{tool_name}"
+                )
+        if mode == "direct" and self._is_trivial_direct_intent(user_input):
+            return build_triviality_bypass_decision("direct_trivial_read_only")
+        return None
+
+    def _try_triviality_bypass_decision(
+        self,
+        state: Dict[str, Any],
+        output_to_eval: str,
+    ) -> Optional[MoralDecision]:
+        inspection_text = self._build_moral_triviality_text(state, output_to_eval)
+        if self._is_triviality_bypass_blocked(state, inspection_text):
+            return None
+
+        user_input = str(state.get("user_input") or "").strip()
+        if not user_input:
+            return None
+
+        route_based_decision = self._try_route_assessment_triviality_bypass(user_input)
+        if route_based_decision is not None:
+            return route_based_decision
+
+        if self._contains_any_hint(inspection_text, _MORAL_TRIVIALITY_READ_ONLY_HINTS):
+            return build_triviality_bypass_decision("keyword_read_only")
+
+        return None
+
     async def _spawn_debug_task(self, state: Dict[str, Any]) -> None:
         """Inject a high-priority debug Task into the backlog after 3 critic failures."""
         try:
@@ -1540,8 +2193,15 @@ class Orchestrator:
 
         try:
             logger.info("Escalating Supervisor to System 2")
+            allow_sensitive_context = self._requires_sensitive_cloud_context(
+                messages[-1].get("content", "") if messages else "",
+            )
             router_result = await asyncio.wait_for(
-                self.cognitive_router.route_to_system_2(messages),
+                self._route_to_system_2_redacted(
+                    messages,
+                    purpose="supervisor_fallback",
+                    allow_sensitive_context=allow_sensitive_context,
+                ),
                 timeout=60.0,
             )
             return router_result
@@ -1883,15 +2543,25 @@ class Orchestrator:
         self,
         messages: List[Dict[str, str]],
         agent_def: AgentDefinition,
+        *,
+        task_packet: Optional[Dict[str, Any]] = None,
+        state: Optional[Dict[str, Any]] = None,
     ) -> Optional[RouterResult]:
         if not self.cognitive_router.get_system_2_available():
             return None
 
         try:
+            allow_sensitive_context = self._requires_sensitive_cloud_context(
+                (task_packet or {}).get("task", ""),
+                (task_packet or {}).get("reason", ""),
+                (state or {}).get("user_input", ""),
+            )
             router_result = await asyncio.wait_for(
-                self.cognitive_router.route_to_system_2(
+                self._route_to_system_2_redacted(
                     messages,
                     allowed_tools=agent_def.allowed_tools,
+                    purpose=f"{agent_def.name}_fallback",
+                    allow_sensitive_context=allow_sensitive_context,
                 ),
                 timeout=60.0,
             )
@@ -1907,13 +2577,20 @@ class Orchestrator:
         messages: List[Dict[str, str]],
         agent_def: AgentDefinition,
         task_packet: Optional[Dict[str, Any]] = None,
+        *,
+        state: Optional[Dict[str, Any]] = None,
     ) -> tuple[Optional[RouterResult], bool]:
         preferred_model = self._get_step_preferred_model(task_packet, agent_def)
 
         if preferred_model == "system_2":
             attempted_system_2 = self.cognitive_router.get_system_2_available()
             logger.info("Routing %s through System 2 (agent preference)", agent_def.name)
-            router_result = await self._try_route_agent_system_2(messages, agent_def)
+            router_result = await self._try_route_agent_system_2(
+                messages,
+                agent_def,
+                task_packet=task_packet,
+                state=state,
+            )
             if router_result is not None:
                 return router_result, attempted_system_2
 
@@ -1931,7 +2608,12 @@ class Orchestrator:
         attempted_system_2 = self.cognitive_router.get_system_2_available()
         if attempted_system_2:
             logger.info("Escalating %s to System 2 after System 1 failure", agent_def.name)
-        return await self._try_route_agent_system_2(messages, agent_def), attempted_system_2
+        return await self._try_route_agent_system_2(
+            messages,
+            agent_def,
+            task_packet=task_packet,
+            state=state,
+        ), attempted_system_2
 
     async def _run_agent(
         self,
@@ -1960,6 +2642,7 @@ class Orchestrator:
                 messages,
                 agent_def,
                 task_packet=task_packet,
+                state=state,
             )
         except Exception as _agent_exc:
             if deduct_energy:
@@ -1998,16 +2681,290 @@ class Orchestrator:
         else:
             logger.info(f"[Admin notification (no queue)]: {message}")
 
+    @staticmethod
+    def _heartbeat_result_indicates_failure(result: str) -> bool:
+        lowered = str(result or "").lower()
+        return any(
+            marker in lowered
+            for marker in ("error", "cannot", "unable", "failed", "i cannot", "i am unable")
+        )
+
+    @staticmethod
+    def _build_heartbeat_execution_prompt(task: Dict[str, Any]) -> str:
+        return (
+            f"[HEARTBEAT TASK #{task['id']}]: {task['title']}\n"
+            f"You MUST execute this task right now by calling the appropriate tools. "
+            f"Do NOT describe what you plan to do — use your tools and report the actual results. "
+            f"If the task requires storing data, call update_core_memory or update_ledger explicitly. "
+            f"If you cannot complete it, explain exactly why."
+        )
+
+    @staticmethod
+    def _is_executable_heartbeat_task_candidate(
+        node: Dict[str, Any],
+        unresolved_task_ids: set[int],
+        parent_ids: set[int],
+    ) -> bool:
+        if str(node.get("tier") or "") != "Task":
+            return False
+        if str(node.get("status") or "").lower() not in {"pending", "deferred_due_to_energy"}:
+            return False
+
+        task_id = int(node.get("id") or 0)
+        if task_id <= 0:
+            return False
+        return task_id not in unresolved_task_ids and task_id not in parent_ids
+
+    async def _select_executable_heartbeat_tasks(self) -> List[Dict[str, Any]]:
+        """Return executable Task candidates with Story/Epic context for energy scoring."""
+        candidates = await self.ledger_memory.get_energy_evaluation_candidates(
+            statuses=["pending", "deferred_due_to_energy"],
+        )
+        if not candidates:
+            return []
+
+        active_nodes = await self.ledger_memory.get_active_objective_tree()
+        unresolved_rows = await self.ledger_memory.get_tasks_with_unresolved_dependencies(
+            statuses=["pending", "deferred_due_to_energy"],
+        )
+        unresolved_task_ids = {int(row["id"]) for row in unresolved_rows}
+        parent_ids = {
+            int(node["parent_id"])
+            for node in active_nodes
+            if node.get("parent_id") is not None
+        }
+
+        executable: List[Dict[str, Any]] = []
+        for candidate in candidates:
+            task = dict(candidate.get("task") or {})
+            if self._is_executable_heartbeat_task_candidate(task, unresolved_task_ids, parent_ids):
+                executable.append(candidate)
+
+        executable.sort(
+            key=lambda candidate: (
+                int((candidate.get("task") or {}).get("priority") or 999),
+                int((candidate.get("task") or {}).get("estimated_energy") or 999999),
+                int((candidate.get("task") or {}).get("id") or 0),
+            )
+        )
+        return executable
+
+    async def _select_executable_heartbeat_task(self) -> Optional[Dict[str, Any]]:
+        """Pick the next executable Task leaf with all dependencies resolved."""
+        candidates = await self._select_executable_heartbeat_tasks()
+        if not candidates:
+            return None
+        return dict(candidates[0].get("task") or {})
+
+    async def _handle_heartbeat_task_failure(
+        self,
+        task: Dict[str, Any],
+        *,
+        reason: str,
+        result_excerpt: str,
+    ) -> None:
+        task_id = int(task["id"])
+        strike_count = await self._increment_heartbeat_failure_count(task_id)
+
+        if strike_count >= _HEARTBEAT_FAILURE_STRIKES:
+            await self.ledger_memory.update_objective_status(task_id, "blocked")
+            await self.ledger_memory.ensure_parent_chain_active(task_id)
+            await self._notify_admin(
+                "HITL REQUIRED: Task blocked after repeated heartbeat failures.\n"
+                f"  Task #{task_id}: {task['title']}\n"
+                f"  Strikes: {strike_count}\n"
+                f"  Reason: {reason}\n"
+                f"  Latest result: {result_excerpt[:220]}"
+            )
+            logger.warning(
+                "Heartbeat: Task #%s blocked after %s failures (%s)",
+                task_id,
+                strike_count,
+                reason,
+            )
+            return
+
+        await self.ledger_memory.update_objective_status(task_id, "pending")
+        logger.warning(
+            "Heartbeat: Task #%s failure strike %s/%s (%s)",
+            task_id,
+            strike_count,
+            _HEARTBEAT_FAILURE_STRIKES,
+            reason,
+        )
+
+    async def _defer_heartbeat_task_due_to_energy(
+        self,
+        *,
+        task_id: int,
+        decision: EnergyDecision,
+        evaluation_record: Dict[str, Any],
+        available_energy: int,
+        race: bool = False,
+    ) -> None:
+        await self.ledger_memory.defer_task_due_to_energy(
+            task_id,
+            evaluation_record,
+            cooldown_seconds=int(decision.defer_cooldown_seconds),
+        )
+        logger.info(
+            "Heartbeat: Deferred task #%s%s (%s). roi=%.2f cost=%s available=%s reserve_floor=%s",
+            task_id,
+            " after budget race" if race else "",
+            decision.reason,
+            decision.roi,
+            decision.predicted_cost,
+            available_energy,
+            decision.min_reserve,
+        )
+
+    async def _execute_heartbeat_task(
+        self,
+        *,
+        task: Dict[str, Any],
+        decision: EnergyDecision,
+    ) -> None:
+        task_id = int(task["id"])
+        logger.info(
+            "Heartbeat: Accepting executable task #%s: %s (roi=%.2f cost=%s budget=%s)",
+            task_id,
+            str(task.get("title") or "")[:60],
+            decision.roi,
+            decision.predicted_cost,
+            await self._get_predictive_energy_budget_remaining(),
+        )
+        await self.ledger_memory.update_objective_status(task_id, "active")
+
+        timeout_seconds = HEARTBEAT_INTERVAL * 0.9
+        prompt = self._build_heartbeat_execution_prompt(task)
+
+        try:
+            result = await asyncio.wait_for(
+                self.process_message(user_message=prompt, user_id="heartbeat"),
+                timeout=timeout_seconds,
+            )
+        except asyncio.TimeoutError:
+            await self._handle_heartbeat_task_failure(
+                task,
+                reason="timeout",
+                result_excerpt=f"Timed out after {int(timeout_seconds)}s",
+            )
+            return
+        except Exception as e:
+            await self._handle_heartbeat_task_failure(
+                task,
+                reason="exception",
+                result_excerpt=str(e),
+            )
+            return
+
+        if self._heartbeat_result_indicates_failure(result):
+            await self._handle_heartbeat_task_failure(
+                task,
+                reason="execution_failure",
+                result_excerpt=result,
+            )
+            return
+
+        await self.ledger_memory.update_objective_status(task_id, "completed")
+        await self._clear_heartbeat_failure_count(task_id)
+
+        summary = (
+            f"Heartbeat completed task #{task_id}:\n"
+            f"  Task: {task.get('title', '')}\n"
+            f"  Predicted Energy Cost: {decision.predicted_cost}\n"
+            f"  Remaining Predictive Budget: {await self._get_predictive_energy_budget_remaining()}\n"
+            f"  Result: {str(result)[:220]}"
+        )
+        await self._notify_admin(summary)
+        logger.info("Heartbeat: Task #%s completed.", task_id)
+
+    async def _run_heartbeat_cycle(self) -> None:
+        logger.info("Heartbeat: Querying objective backlog for executable Tasks...")
+        candidate_contexts = await self._select_executable_heartbeat_tasks()
+
+        if not candidate_contexts:
+            logger.info("Heartbeat: No executable dependency-resolved tasks available.")
+            return
+
+        for candidate in candidate_contexts:
+            task = dict(candidate.get("task") or {})
+            story = candidate.get("story")
+            epic = candidate.get("epic")
+
+            task_id = int(task.get("id") or 0)
+            if task_id <= 0:
+                continue
+
+            evaluation, decision, available_energy = await self._evaluate_energy_for_context(
+                task=task,
+                story=story,
+                epic=epic,
+                additional_context="heartbeat_dispatch",
+            )
+            evaluation_record = self._build_energy_evaluation_record(
+                evaluation=evaluation,
+                decision=decision,
+                available_energy=available_energy,
+                context="heartbeat",
+            )
+
+            if not decision.should_execute:
+                await self._defer_heartbeat_task_due_to_energy(
+                    task_id=task_id,
+                    decision=decision,
+                    evaluation_record=evaluation_record,
+                    available_energy=available_energy,
+                )
+                continue
+
+            reserved = await self._try_reserve_predictive_energy_budget(
+                predicted_cost=decision.predicted_cost,
+                min_reserve=decision.min_reserve,
+                reason=f"heartbeat_task:{task_id}",
+            )
+            if not reserved:
+                current_budget = await self._get_predictive_energy_budget_remaining()
+                race_decision = self.energy_roi_engine.evaluate(
+                    estimated_effort=evaluation.estimated_effort,
+                    expected_value=evaluation.expected_value,
+                    available_energy=current_budget,
+                    defer_count=decision.defer_count,
+                )
+                race_record = self._build_energy_evaluation_record(
+                    evaluation=evaluation,
+                    decision=race_decision,
+                    available_energy=current_budget,
+                    context="heartbeat",
+                )
+                await self._defer_heartbeat_task_due_to_energy(
+                    task_id=task_id,
+                    decision=race_decision,
+                    evaluation_record=race_record,
+                    available_energy=current_budget,
+                    race=True,
+                )
+                continue
+
+            await self.ledger_memory.record_task_energy_evaluation(
+                task_id,
+                evaluation_record,
+                clear_next_eligible=True,
+            )
+            await self._execute_heartbeat_task(task=task, decision=decision)
+            return
+
+        logger.info("Heartbeat: All executable tasks were deferred by energy policy.")
+
     async def _heartbeat_loop(self) -> None:
         """
-        Proactive Heartbeat: wakes every 30 min, queries the Objective Backlog
-        for the highest-priority pending Task, processes it if energy allows,
-        then notifies the admin with a summary.
+        Proactive Heartbeat: wakes every 30 min, selects executable Objective
+        leaf tasks (dependency-resolved), executes one, and applies remediation
+        logic on repeated failures.
 
         An asyncio.Lock prevents heartbeat cycles from overlapping: if the
         previous run is still in progress when the next interval fires, the
-        new cycle is skipped (ISSUE-004).  A hard timeout of 90% of the
-        heartbeat interval caps individual task execution time.
+        new cycle is skipped (ISSUE-004).
         """
         logger.info("Heartbeat loop started.")
         _heartbeat_lock = asyncio.Lock()
@@ -2018,61 +2975,7 @@ class Orchestrator:
                 continue
             async with _heartbeat_lock:
                 try:
-                    logger.info("Heartbeat: Querying objective backlog...")
-                    task = await self.ledger_memory.get_highest_priority_task()
-
-                    if not task:
-                        logger.info("Heartbeat: Backlog is empty. Nothing to do.")
-                        continue
-
-                    energy_available = int(os.getenv("INITIAL_ENERGY_BUDGET", "100"))
-                    if task["estimated_energy"] > energy_available:
-                        logger.info(
-                            f"Heartbeat: Task #{task['id']} needs {task['estimated_energy']} energy "
-                            f"but only {energy_available} available. Skipping."
-                        )
-                        continue
-
-                    logger.info(f"Heartbeat: Accepting task #{task['id']}: {task['title'][:60]}")
-                    await self.ledger_memory.update_objective_status(task["id"], "active")
-
-                    try:
-                        result = await asyncio.wait_for(
-                            self.process_message(
-                                user_message=(
-                                    f"[HEARTBEAT TASK #{task['id']}]: {task['title']}\n"
-                                    f"You MUST execute this task right now by calling the appropriate tools. "
-                                    f"Do NOT describe what you plan to do — use your tools and report the actual results. "
-                                    f"If the task requires storing data, call update_core_memory or update_ledger explicitly. "
-                                    f"If you cannot complete it, explain exactly why."
-                                ),
-                                user_id="heartbeat"
-                            ),
-                            timeout=HEARTBEAT_INTERVAL * 0.9,  # 27-minute hard cap
-                        )
-                    except asyncio.TimeoutError:
-                        logger.error(
-                            f"Heartbeat: Task #{task['id']} timed out after "
-                            f"{int(HEARTBEAT_INTERVAL * 0.9)}s. Marking pending."
-                        )
-                        await self.ledger_memory.update_objective_status(task["id"], "pending")
-                        continue
-
-                    # Only mark completed if the result isn't an error or refusal
-                    status = "completed"
-                    if any(w in result.lower() for w in ("error", "cannot", "unable", "failed", "i cannot", "i am unable")):
-                        status = "pending"
-                        logger.warning(f"Heartbeat: Task #{task['id']} may not have completed — marking pending. Result: {result[:100]}")
-                    await self.ledger_memory.update_objective_status(task["id"], status)
-
-                    summary = (
-                        f"Heartbeat completed task #{task['id']}:\n"
-                        f"  Task: {task['title']}\n"
-                        f"  Result: {result[:200]}"
-                    )
-                    await self._notify_admin(summary)
-                    logger.info(f"Heartbeat: Task #{task['id']} completed.")
-
+                    await self._run_heartbeat_cycle()
                 except Exception as e:
                     logger.error(f"Heartbeat error: {e}", exc_info=True)
 
@@ -2106,6 +3009,28 @@ class Orchestrator:
                     logger.warning("Periodic vector memory pruning failed: %s", _vp_err)
             except Exception as e:
                 logger.warning(f"Memory consolidation loop error: {e}", exc_info=True)
+
+    async def _score_nocturnal_candidates(self, messages: List[Dict[str, str]]) -> RouterResult:
+        allow_sensitive_context = self._requires_sensitive_cloud_context(
+            *(message.get("content", "") for message in messages),
+        )
+        if self.cognitive_router.get_system_2_available():
+            return await asyncio.wait_for(
+                self._route_to_system_2_redacted(
+                    messages,
+                    allowed_tools=[],
+                    purpose="nocturnal_scoring",
+                    allow_sensitive_context=allow_sensitive_context,
+                ),
+                timeout=45.0,
+            )
+
+        return await self._route_to_system_1(
+            messages,
+            allowed_tools=[],
+            deadline_seconds=90.0,
+            context="nocturnal_scoring_local",
+        )
 
     async def _save_memory_async(self, text: str) -> None:
         """Fire-and-forget memory storage gated by response length.
@@ -2181,6 +3106,55 @@ class Orchestrator:
         except Exception as e:
             logger.warning(f"_load_pending_hitl failed: {e}")
 
+    async def _restore_heartbeat_failure_counts(self) -> None:
+        """Restore heartbeat task-failure strike counts from persisted system_state."""
+        try:
+            raw_value = await self.ledger_memory.get_system_state(_HEARTBEAT_FAILURE_STATE_KEY)
+            if not raw_value:
+                self._heartbeat_failure_counts = {}
+                return
+
+            decoded = json.loads(raw_value)
+            if not isinstance(decoded, dict):
+                self._heartbeat_failure_counts = {}
+                return
+
+            restored: Dict[int, int] = {}
+            for raw_task_id, raw_count in decoded.items():
+                try:
+                    task_id = int(raw_task_id)
+                    count = int(raw_count)
+                except (TypeError, ValueError):
+                    continue
+                if task_id > 0 and count > 0:
+                    restored[task_id] = count
+            self._heartbeat_failure_counts = restored
+        except Exception as e:
+            logger.warning("Failed to restore heartbeat failure counts: %s", e)
+            self._heartbeat_failure_counts = {}
+
+    async def _persist_heartbeat_failure_counts(self) -> None:
+        payload = {
+            str(task_id): int(count)
+            for task_id, count in self._heartbeat_failure_counts.items()
+            if int(count) > 0
+        }
+        await self.ledger_memory.set_system_state(
+            _HEARTBEAT_FAILURE_STATE_KEY,
+            json.dumps(payload, sort_keys=True),
+        )
+
+    async def _increment_heartbeat_failure_count(self, task_id: int) -> int:
+        current = int(self._heartbeat_failure_counts.get(task_id, 0)) + 1
+        self._heartbeat_failure_counts[task_id] = current
+        await self._persist_heartbeat_failure_counts()
+        return current
+
+    async def _clear_heartbeat_failure_count(self, task_id: int) -> None:
+        if task_id in self._heartbeat_failure_counts:
+            self._heartbeat_failure_counts.pop(task_id, None)
+            await self._persist_heartbeat_failure_counts()
+
     def _fire_and_forget(self, coro) -> asyncio.Task:
         """Schedule a coroutine as a background task with a strong GC-safe reference (ISSUE-002).
 
@@ -2208,6 +3182,536 @@ class Orchestrator:
                 self._user_locks.pop(next(iter(self._user_locks)))
             return lock
 
+    @staticmethod
+    def _get_synthesis_self_test_timeout_seconds() -> float:
+        """Return a bounded timeout for generated-tool self-tests."""
+        raw_value = os.getenv(
+            "SYNTHESIS_SELF_TEST_TIMEOUT_SECONDS",
+            str(_SYNTHESIS_SELF_TEST_TIMEOUT_DEFAULT_SECONDS),
+        )
+        try:
+            timeout_seconds = float(raw_value)
+        except ValueError:
+            timeout_seconds = _SYNTHESIS_SELF_TEST_TIMEOUT_DEFAULT_SECONDS
+        # Keep timeout strict to avoid orchestration hangs from infinite loops.
+        return min(max(timeout_seconds, 1.0), 15.0)
+
+    @staticmethod
+    def _extract_pytest_counts(output_text: str) -> Dict[str, int]:
+        """Extract pass/fail/error counts from pytest textual output."""
+        counts = {
+            "passed": 0,
+            "failed": 0,
+            "errors": 0,
+            "skipped": 0,
+        }
+        patterns = {
+            "passed": r"(\d+)\s+passed",
+            "failed": r"(\d+)\s+failed",
+            "errors": r"(\d+)\s+error(?:s)?",
+            "skipped": r"(\d+)\s+skipped",
+        }
+        for key, pattern in patterns.items():
+            match = re.search(pattern, output_text)
+            if match:
+                counts[key] = int(match.group(1))
+        return counts
+
+    @staticmethod
+    def _write_text_file(path: str, content: str) -> None:
+        with open(path, "w", encoding="utf-8", newline="\n") as file_obj:
+            file_obj.write(content)
+
+    @staticmethod
+    def _compute_synthesis_proof_sha256(tool_code: str, pytest_code: str) -> str:
+        """Return SHA-256 digest for the exact tool+test artifact pair."""
+        normalized_tool = str(tool_code or "").replace("\r\n", "\n").replace("\r", "\n")
+        normalized_pytest = str(pytest_code or "").replace("\r\n", "\n").replace("\r", "\n")
+        proof_payload = (
+            "SYNTHESIZED_TOOL_CODE\n"
+            f"{normalized_tool}\n\n"
+            "SYNTHESIZED_PYTEST_CODE\n"
+            f"{normalized_pytest}\n"
+        )
+        return hashlib.sha256(proof_payload.encode("utf-8")).hexdigest()
+
+    @staticmethod
+    def _build_synthesis_test_summary(
+        attempt_number: int,
+        max_retries: int,
+        self_test_result: Dict[str, Any],
+    ) -> str:
+        status = str(self_test_result.get("status") or "failed").upper()
+        passed = int(self_test_result.get("passed") or 0)
+        failed = int(self_test_result.get("failed") or 0)
+        errors = int(self_test_result.get("errors") or 0)
+        duration_ms = int(self_test_result.get("duration_ms") or 0)
+        return (
+            f"{status} on attempt {attempt_number}/{max_retries} "
+            f"(passed={passed}, failed={failed}, errors={errors}, duration={duration_ms} ms)"
+        )
+
+    @staticmethod
+    def _extract_synthesis_failure_trace(self_test_result: Dict[str, Any], max_chars: int = 3000) -> str:
+        stderr_text = str(self_test_result.get("stderr") or "").strip()
+        stdout_text = str(self_test_result.get("stdout") or "").strip()
+        error_text = str(self_test_result.get("error") or "").strip()
+
+        trace_text = "\n\n".join(
+            chunk for chunk in [stderr_text, stdout_text, error_text] if chunk
+        ).strip()
+        if not trace_text:
+            return "(no traceback captured)"
+        if len(trace_text) > max_chars:
+            return trace_text[-max_chars:]
+        return trace_text
+
+    @staticmethod
+    def _build_synthesis_generation_failure_result(error_message: str) -> Dict[str, Any]:
+        return {
+            "status": "failed",
+            "timed_out": False,
+            "timeout_seconds": 0,
+            "exit_code": None,
+            "duration_ms": 0,
+            "passed": 0,
+            "failed": 0,
+            "errors": 1,
+            "skipped": 0,
+            "stdout": "",
+            "stderr": "",
+            "error": str(error_message or "Tool generation failed."),
+        }
+
+    async def _create_synthesis_run_if_supported(
+        self,
+        *,
+        user_id: str,
+        gap_description: str,
+        suggested_tool_name: str,
+        original_input: str,
+        max_retries: int,
+    ) -> Optional[int]:
+        creator = getattr(self.ledger_memory, "create_synthesis_run", None)
+        if not callable(creator):
+            return None
+        try:
+            return await creator(
+                user_id=user_id,
+                gap_description=gap_description,
+                suggested_tool_name=suggested_tool_name,
+                original_input=original_input,
+                max_retries=max_retries,
+            )
+        except Exception as e:
+            logger.warning("Could not create synthesis run record: %s", e)
+            return None
+
+    async def _append_synthesis_attempt_if_supported(
+        self,
+        *,
+        run_id: Optional[int],
+        attempt_number: int,
+        phase: str,
+        synthesis_payload: Dict[str, Any],
+        self_test_result: Dict[str, Any],
+        code_sha256: str,
+    ) -> None:
+        if run_id is None:
+            return
+        appender = getattr(self.ledger_memory, "append_synthesis_attempt", None)
+        if not callable(appender):
+            return
+        try:
+            await appender(
+                run_id=run_id,
+                attempt_number=attempt_number,
+                phase=phase,
+                synthesis_payload=synthesis_payload,
+                self_test_result=self_test_result,
+                code_sha256=code_sha256,
+            )
+        except Exception as e:
+            logger.warning("Could not append synthesis attempt %s for run %s: %s", attempt_number, run_id, e)
+
+    async def _update_synthesis_run_status_if_supported(
+        self,
+        run_id: Optional[int],
+        **kwargs: Any,
+    ) -> None:
+        if run_id is None:
+            return
+        updater = getattr(self.ledger_memory, "update_synthesis_run_status", None)
+        if not callable(updater):
+            return
+        try:
+            await updater(run_id, **kwargs)
+        except Exception as e:
+            logger.warning("Could not update synthesis run %s status: %s", run_id, e)
+
+    async def _run_synthesis_self_test(self, synthesis: Dict[str, Any]) -> Dict[str, Any]:
+        """Run generated pytest code in an isolated subprocess with a hard timeout."""
+        tool_name = synthesis["tool_name"]
+        tool_code = synthesis["code"]
+        pytest_code = synthesis["pytest_code"]
+        timeout_seconds = self._get_synthesis_self_test_timeout_seconds()
+        started = time.perf_counter()
+
+        tool_file_name = f"{tool_name}.py"
+        test_file_name = f"test_{tool_name}.py"
+
+        process = None
+        stdout_text = ""
+        stderr_text = ""
+
+        try:
+            with tempfile.TemporaryDirectory(prefix="synth_selftest_") as temp_dir:
+                tool_path = os.path.join(temp_dir, tool_file_name)
+                test_path = os.path.join(temp_dir, test_file_name)
+
+                await asyncio.to_thread(self._write_text_file, tool_path, tool_code)
+                await asyncio.to_thread(self._write_text_file, test_path, pytest_code)
+
+                process = await asyncio.create_subprocess_exec(
+                    sys.executable,
+                    "-m",
+                    "pytest",
+                    "-q",
+                    test_file_name,
+                    cwd=temp_dir,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                )
+
+                try:
+                    stdout_bytes, stderr_bytes = await asyncio.wait_for(
+                        process.communicate(), timeout=timeout_seconds
+                    )
+                    stdout_text = stdout_bytes.decode(errors="replace")
+                    stderr_text = stderr_bytes.decode(errors="replace")
+                except asyncio.TimeoutError:
+                    if process.returncode is None:
+                        process.kill()
+                    stdout_bytes, stderr_bytes = await process.communicate()
+                    stdout_text = stdout_bytes.decode(errors="replace")
+                    stderr_text = stderr_bytes.decode(errors="replace")
+                    elapsed_ms = int((time.perf_counter() - started) * 1000)
+                    counts = self._extract_pytest_counts(f"{stdout_text}\n{stderr_text}")
+                    return {
+                        "status": "timeout",
+                        "timed_out": True,
+                        "timeout_seconds": timeout_seconds,
+                        "exit_code": process.returncode,
+                        "duration_ms": elapsed_ms,
+                        "passed": counts["passed"],
+                        "failed": counts["failed"],
+                        "errors": counts["errors"],
+                        "skipped": counts["skipped"],
+                        "stdout": stdout_text,
+                        "stderr": stderr_text,
+                        "error": (
+                            f"Sandboxed self-test timed out after {timeout_seconds:.1f}s "
+                            f"(possible infinite loop or blocking operation)."
+                        ),
+                    }
+        except Exception as exc:
+            elapsed_ms = int((time.perf_counter() - started) * 1000)
+            return {
+                "status": "failed",
+                "timed_out": False,
+                "timeout_seconds": timeout_seconds,
+                "exit_code": process.returncode if process is not None else None,
+                "duration_ms": elapsed_ms,
+                "passed": 0,
+                "failed": 0,
+                "errors": 1,
+                "skipped": 0,
+                "stdout": stdout_text,
+                "stderr": stderr_text,
+                "error": f"Sandboxed self-test harness crashed: {exc}",
+            }
+
+        elapsed_ms = int((time.perf_counter() - started) * 1000)
+        counts = self._extract_pytest_counts(f"{stdout_text}\n{stderr_text}")
+        passed = process.returncode == 0
+
+        return {
+            "status": "passed" if passed else "failed",
+            "timed_out": False,
+            "timeout_seconds": timeout_seconds,
+            "exit_code": process.returncode,
+            "duration_ms": elapsed_ms,
+            "passed": counts["passed"],
+            "failed": counts["failed"],
+            "errors": counts["errors"],
+            "skipped": counts["skipped"],
+            "stdout": stdout_text,
+            "stderr": stderr_text,
+            "error": "" if passed else "Sandboxed self-test reported pytest failures.",
+        }
+
+    @staticmethod
+    def _build_synthesis_fallback_payload(
+        failed_candidate: Optional[Dict[str, Any]],
+        suggested_tool_name: str,
+    ) -> Dict[str, Any]:
+        if isinstance(failed_candidate, dict):
+            return dict(failed_candidate)
+        return {
+            "tool_name": suggested_tool_name,
+            "description": "",
+            "code": "",
+            "pytest_code": "",
+            "schema_json": "",
+            "test_manifest_json": "",
+        }
+
+    async def _request_synthesis_candidate(
+        self,
+        *,
+        attempt_number: int,
+        suggested_tool_name: str,
+        redacted_gap_description: str,
+        redacted_user_query: str,
+        failed_candidate: Optional[Dict[str, Any]],
+        last_failure_summary: str,
+        last_failure_trace: str,
+    ) -> Dict[str, Any]:
+        if attempt_number == 1:
+            return await asyncio.wait_for(
+                self.cognitive_router.synthesize_tool(
+                    gap_description=redacted_gap_description,
+                    suggested_tool_name=suggested_tool_name,
+                    user_query=redacted_user_query,
+                ),
+                timeout=60.0,
+            )
+
+        if failed_candidate is None:
+            raise RuntimeError("Repair loop missing failed candidate payload.")
+
+        redacted_failure_summary = self._redact_text_for_cloud(
+            last_failure_summary,
+            allow_sensitive_context=False,
+            max_chars=1200,
+        )
+        redacted_failure_trace = self._redact_text_for_cloud(
+            last_failure_trace,
+            allow_sensitive_context=False,
+            max_chars=2800,
+        )
+
+        return await asyncio.wait_for(
+            self.cognitive_router.repair_synthesized_tool(
+                gap_description=redacted_gap_description,
+                suggested_tool_name=suggested_tool_name,
+                user_query=redacted_user_query,
+                previous_tool_name=str(failed_candidate.get("tool_name") or suggested_tool_name),
+                previous_code=str(failed_candidate.get("code") or ""),
+                previous_pytest_code=str(failed_candidate.get("pytest_code") or ""),
+                failure_summary=redacted_failure_summary,
+                failure_trace=redacted_failure_trace,
+            ),
+            timeout=60.0,
+        )
+
+    async def _run_single_synthesis_attempt(
+        self,
+        *,
+        run_id: Optional[int],
+        attempt_number: int,
+        max_retries: int,
+        suggested_tool_name: str,
+        redacted_gap_description: str,
+        redacted_user_query: str,
+        failed_candidate: Optional[Dict[str, Any]],
+        last_failure_summary: str,
+        last_failure_trace: str,
+    ) -> Dict[str, Any]:
+        phase = "synthesis" if attempt_number == 1 else "repair"
+        try:
+            candidate = await self._request_synthesis_candidate(
+                attempt_number=attempt_number,
+                suggested_tool_name=suggested_tool_name,
+                redacted_gap_description=redacted_gap_description,
+                redacted_user_query=redacted_user_query,
+                failed_candidate=failed_candidate,
+                last_failure_summary=last_failure_summary,
+                last_failure_trace=last_failure_trace,
+            )
+        except Exception as e:
+            error_message = (
+                f"{phase.capitalize()} generation failed on attempt {attempt_number}/{max_retries}: {e}"
+            )
+            logger.warning(error_message)
+            failure_result = self._build_synthesis_generation_failure_result(error_message)
+            await self._append_synthesis_attempt_if_supported(
+                run_id=run_id,
+                attempt_number=attempt_number,
+                phase=phase,
+                synthesis_payload=self._build_synthesis_fallback_payload(
+                    failed_candidate,
+                    suggested_tool_name,
+                ),
+                self_test_result=failure_result,
+                code_sha256="",
+            )
+            return {
+                "status": "generation_failed",
+                "candidate": failed_candidate,
+                "test_result": failure_result,
+                "failure_summary": error_message,
+                "failure_trace": error_message,
+            }
+
+        test_result = await self._run_synthesis_self_test(candidate)
+        proof_sha256 = self._compute_synthesis_proof_sha256(
+            candidate.get("code", ""),
+            candidate.get("pytest_code", ""),
+        )
+        test_summary = self._build_synthesis_test_summary(
+            attempt_number,
+            max_retries,
+            test_result,
+        )
+        candidate["self_test_result"] = test_result
+        candidate["self_test_summary"] = test_summary
+        candidate["synthesis_proof_sha256"] = proof_sha256
+
+        await self._append_synthesis_attempt_if_supported(
+            run_id=run_id,
+            attempt_number=attempt_number,
+            phase=phase,
+            synthesis_payload=candidate,
+            self_test_result=test_result,
+            code_sha256=proof_sha256,
+        )
+
+        if str(test_result.get("status") or "") == "passed":
+            return {
+                "status": "passed",
+                "candidate": candidate,
+                "test_result": test_result,
+                "proof_sha256": proof_sha256,
+                "test_summary": test_summary,
+            }
+
+        return {
+            "status": "failed",
+            "candidate": candidate,
+            "test_result": test_result,
+            "failure_summary": f"{test_summary}. {str(test_result.get('error') or '').strip()}".strip(),
+            "failure_trace": self._extract_synthesis_failure_trace(test_result),
+        }
+
+    async def _build_blocked_synthesis_result(
+        self,
+        *,
+        run_id: Optional[int],
+        attempts_used: int,
+        max_retries: int,
+        failed_candidate: Optional[Dict[str, Any]],
+        last_test_result: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        trace_excerpt = self._extract_synthesis_failure_trace(last_test_result)
+        blocked_reason = (
+            f"Synthesis run blocked after {attempts_used}/{max_retries} attempts; no passing candidate produced."
+        )
+        blocked_message = (
+            "System 2 synthesis run was blocked after bounded repair attempts. "
+            "The main orchestrator remains active.\n\n"
+            f"Attempts: {attempts_used}/{max_retries}\n"
+            f"Last status: {str(last_test_result.get('status') or 'failed')}\n"
+            f"Details: {str(last_test_result.get('error') or blocked_reason)}\n\n"
+            f"Trace excerpt:\n{trace_excerpt}"
+        )
+        await self._update_synthesis_run_status_if_supported(
+            run_id,
+            status="blocked",
+            total_attempts=attempts_used,
+            blocked_reason=blocked_reason,
+            synthesis_payload=failed_candidate,
+        )
+        return {
+            "status": "blocked",
+            "run_id": run_id,
+            "attempts_used": attempts_used,
+            "max_retries": max_retries,
+            "synthesis": failed_candidate,
+            "self_test_result": last_test_result,
+            "blocked_reason": blocked_reason,
+            "blocked_message": blocked_message,
+        }
+
+    async def _execute_synthesis_repair_loop(
+        self,
+        *,
+        user_id: str,
+        gap_description: str,
+        suggested_tool_name: str,
+        user_input: str,
+    ) -> Dict[str, Any]:
+        """Run synthesis + bounded repair retries until tests pass or run is blocked."""
+        max_retries = max(1, int(_MAX_SYNTHESIS_RETRIES))
+        run_id = await self._create_synthesis_run_if_supported(
+            user_id=user_id,
+            gap_description=gap_description,
+            suggested_tool_name=suggested_tool_name,
+            original_input=user_input,
+            max_retries=max_retries,
+        )
+
+        redacted_gap_description = self._redact_text_for_cloud(gap_description)
+        redacted_user_query = self._redact_text_for_cloud(user_input)
+
+        failed_candidate: Optional[Dict[str, Any]] = None
+        last_test_result: Dict[str, Any] = {}
+        last_failure_summary = ""
+        last_failure_trace = ""
+        attempts_used = 0
+
+        for attempt_number in range(1, max_retries + 1):
+            attempts_used = attempt_number
+            attempt_result = await self._run_single_synthesis_attempt(
+                run_id=run_id,
+                attempt_number=attempt_number,
+                max_retries=max_retries,
+                suggested_tool_name=suggested_tool_name,
+                redacted_gap_description=redacted_gap_description,
+                redacted_user_query=redacted_user_query,
+                failed_candidate=failed_candidate,
+                last_failure_summary=last_failure_summary,
+                last_failure_trace=last_failure_trace,
+            )
+
+            status = str(attempt_result.get("status") or "failed")
+            if status == "passed":
+                return {
+                    "status": "passed",
+                    "run_id": run_id,
+                    "attempts_used": attempt_number,
+                    "max_retries": max_retries,
+                    "proof_sha256": str(attempt_result.get("proof_sha256") or ""),
+                    "test_summary": str(attempt_result.get("test_summary") or ""),
+                    "synthesis": dict(attempt_result.get("candidate") or {}),
+                    "self_test_result": dict(attempt_result.get("test_result") or {}),
+                }
+
+            failed_candidate = dict(attempt_result.get("candidate") or failed_candidate or {})
+            last_test_result = dict(attempt_result.get("test_result") or {})
+            last_failure_summary = str(attempt_result.get("failure_summary") or "")
+            last_failure_trace = str(attempt_result.get("failure_trace") or "")
+            if status == "generation_failed":
+                break
+
+        return await self._build_blocked_synthesis_result(
+            run_id=run_id,
+            attempts_used=attempts_used,
+            max_retries=max_retries,
+            failed_candidate=failed_candidate,
+            last_test_result=last_test_result,
+        )
+
     async def tool_synthesis_node(
         self,
         state: Dict[str, Any],
@@ -2231,23 +3735,44 @@ class Orchestrator:
                 "cannot synthesise a new tool right now. Please configure GROQ_API_KEY."
             )
 
-        try:
-            synthesis = await asyncio.wait_for(
-                self.cognitive_router.synthesize_tool(
-                    gap_description=gap_description,
-                    suggested_tool_name=suggested_tool_name,
-                    user_query=state["user_input"],
-                ),
-                timeout=60.0,
-            )
-        except Exception as e:
-            logger.error(f"Tool synthesis failed: {e}", exc_info=True)
-            return f"System 2 failed to synthesise a tool for '{gap_description}': {e}"
+        loop_result = await self._execute_synthesis_repair_loop(
+            user_id=user_id,
+            gap_description=gap_description,
+            suggested_tool_name=suggested_tool_name,
+            user_input=str(state.get("user_input") or ""),
+        )
+        if loop_result.get("status") != "passed":
+            return str(loop_result.get("blocked_message") or "Tool synthesis run blocked.")
+
+        synthesis = dict(loop_result["synthesis"])
+        proof_sha256 = str(loop_result.get("proof_sha256") or "")
+        attempts_used = int(loop_result.get("attempts_used") or 1)
+        max_retries = int(loop_result.get("max_retries") or 1)
+        test_summary = str(loop_result.get("test_summary") or "")
+        synthesis_run_id = loop_result.get("run_id")
+
+        synthesis["synthesis_run_id"] = synthesis_run_id
+        synthesis["synthesis_attempts_used"] = attempts_used
+        synthesis["synthesis_max_retries"] = max_retries
+        synthesis["synthesis_proof_sha256"] = proof_sha256
+        synthesis["self_test_summary"] = test_summary
+
+        await self._update_synthesis_run_status_if_supported(
+            synthesis_run_id,
+            status="pending_approval",
+            total_attempts=attempts_used,
+            successful_attempt=attempts_used,
+            final_tool_name=str(synthesis.get("tool_name") or ""),
+            code_sha256=proof_sha256,
+            test_summary=test_summary,
+            synthesis_payload=synthesis,
+        )
 
         # Store payload for approval resumption (in-memory + persisted to DB)
         self.pending_tool_approval[user_id] = {
             "synthesis": synthesis,
             "original_state": state,
+            "synthesis_run_id": synthesis_run_id,
             "_created_at": time.time(),
         }
         await self.ledger_memory.save_pending_approval(
@@ -2263,6 +3788,9 @@ class Orchestrator:
             f"─────────────────────────────\n"
             f"Name: {synthesis['tool_name']}\n"
             f"Description: {synthesis['description']}\n\n"
+            f"Sandboxed self-test: {test_summary}\n"
+            f"Cryptographic proof (SHA-256 tool+tests): {proof_sha256}\n"
+            f"Audit run id: {synthesis_run_id if synthesis_run_id is not None else 'n/a'}\n\n"
             f"Code:\n```python\n{synthesis['code']}\n```\n"
             f"─────────────────────────────\n"
             f"Reply YES to approve and deploy, or NO to reject."
@@ -2282,6 +3810,16 @@ class Orchestrator:
     async def supervisor_node(self, state: Dict[str, Any]) -> Dict[str, Any]:
         """Plans execution. Tries System 1 (local) first per Directive 1.3; escalates to System 2 only on failure."""
         state = normalize_state(state)
+
+        deferred = await self._try_ad_hoc_dispatch_energy_gate(
+            state,
+            dispatch_context="graph_dispatch",
+        )
+        if deferred is not None:
+            state["current_plan"] = []
+            state["final_response"] = deferred
+            return state
+
         state = self._deduct_energy(state, ENERGY_COST_SUPERVISOR, "supervisor")
         user_input = state["user_input"]
         core_mem_str = await self.core_memory.get_context_string()
@@ -2404,27 +3942,163 @@ class Orchestrator:
     @staticmethod
     def _finalize_critic_pass(state: Dict[str, Any], output_to_eval: str) -> Dict[str, Any]:
         state["critic_feedback"] = "PASS"
+        state["moral_remediation_constraints"] = []
+        state["moral_halt_required"] = False
+        state["moral_halt_summary"] = ""
         if not state.get("final_response"):
             state["final_response"] = output_to_eval
         return state
 
-    def _build_critic_messages(self, output_to_eval: str) -> List[Dict[str, str]]:
+    @staticmethod
+    def _extract_charter_tier_block(charter_text: str, tier_tag: str) -> str:
+        pattern = rf"<{re.escape(tier_tag)}[^>]*>(.*?)</{re.escape(tier_tag)}>"
+        match = re.search(pattern, str(charter_text or ""), flags=re.IGNORECASE | re.DOTALL)
+        if not match:
+            return ""
+        return re.sub(r"\n{3,}", "\n\n", match.group(1).strip())
+
+    @staticmethod
+    def _summarize_plan_for_moral_audit(state: Dict[str, Any]) -> str:
+        plan = list(state.get("current_plan", []) or [])
+        if not plan:
+            return "[NO_EXPLICIT_PLAN]"
+
+        lines: List[str] = []
+        for idx, step in enumerate(plan[:6], start=1):
+            if isinstance(step, dict):
+                agent = str(step.get("agent") or "").strip()
+                task = str(step.get("task") or "").strip()
+                reason = str(step.get("reason") or "").strip()
+                lines.append(f"{idx}. agent={agent}; task={task}; reason={reason}")
+            else:
+                lines.append(f"{idx}. {str(step).strip()}")
+        return "\n".join(lines) if lines else "[NO_EXPLICIT_PLAN]"
+
+    @staticmethod
+    def _build_moral_json_schema_example() -> Dict[str, Any]:
+        return {
+            "rubric_version": MORAL_RUBRIC_VERSION,
+            "scores": dict.fromkeys(MORAL_DIMENSIONS, 1),
+            "reasoning": "concise rationale that cites the strongest risk/constraint",
+            "is_approved": False,
+            "decision_mode": "system2_audit",
+            "bypass_reason": "",
+            "remediation_constraints": [
+                "constraint to satisfy before retry"
+            ],
+            "violated_tiers": ["tier_2"],
+            "security_conflict": False,
+        }
+
+    def _build_critic_messages(self, state: Dict[str, Any], output_to_eval: str) -> List[Dict[str, str]]:
+        tier_1 = self._extract_charter_tier_block(self.charter_text, "Tier_1_Axioms")
+        tier_2 = self._extract_charter_tier_block(self.charter_text, "Tier_2_Strategic")
+        tier_3 = self._extract_charter_tier_block(self.charter_text, "Tier_3_Operational")
+
+        redacted_user_input = self._redact_text_for_cloud(
+            str(state.get("user_input") or ""),
+            allow_sensitive_context=False,
+            max_chars=1600,
+        )
+        redacted_plan = self._redact_text_for_cloud(
+            self._summarize_plan_for_moral_audit(state),
+            allow_sensitive_context=False,
+            max_chars=1200,
+        )
+        redacted_output = self._redact_text_for_cloud(
+            str(output_to_eval or ""),
+            allow_sensitive_context=False,
+            max_chars=2200,
+        )
+        redacted_critic_instructions = self._redact_text_for_cloud(
+            str(state.get("critic_instructions") or ""),
+            allow_sensitive_context=False,
+            max_chars=600,
+        )
+
+        schema_example = json.dumps(self._build_moral_json_schema_example(), indent=2)
+        system_prompt = (
+            "You are the Hierarchical Moral Evaluator for the Critic. "
+            "Evaluate the candidate action/output against the charter with explicit tier grounding.\n\n"
+            "Tier mapping requirements:\n"
+            "- Tier 1 (absolute axioms): harm_reduction, data_privacy, admin_authority_security, data_sovereignty_local_priority\n"
+            "- Tier 2 (strategic objectives): epistemic_humility, transparency_logging, alignment_with_user_intent\n"
+            "- Tier 3 (operational preferences): output_cleanliness\n"
+            "If Tier 1 conflicts with Tier 2/3, Tier 1 takes precedence.\n\n"
+            "Return ONLY strict JSON, no markdown, no prose, no extra keys.\n"
+            "The JSON must match this exact schema shape and key names:\n"
+            f"{schema_example}\n\n"
+            "Scoring rules:\n"
+            "- Every score must be an integer from 1 to 5.\n"
+            "- Set rubric_version exactly to moral_ledger_v1.\n"
+            "- Set decision_mode exactly to system2_audit and bypass_reason to an empty string.\n"
+            "- is_approved must be false if any Tier 1 directive is materially violated.\n"
+            "- If is_approved is false and remediation is possible, include remediation_constraints as concise actionable constraints.\n"
+            "- If this is a Tier 1/security violation, include violated_tiers with tier_1 and set security_conflict=true when applicable.\n"
+            "- reasoning must cite the most important charter-grounded reason.\n\n"
+            "Charter grounding excerpts:\n"
+            f"<Tier_1_Axioms>\n{tier_1 or '[MISSING_TIER_1]'}\n</Tier_1_Axioms>\n"
+            f"<Tier_2_Strategic>\n{tier_2 or '[MISSING_TIER_2]'}\n</Tier_2_Strategic>\n"
+            f"<Tier_3_Operational>\n{tier_3 or '[MISSING_TIER_3]'}\n</Tier_3_Operational>"
+        )
+
+        user_payload = {
+            "user_request_redacted": redacted_user_input,
+            "proposed_plan_redacted": redacted_plan,
+            "candidate_output_redacted": redacted_output,
+            "critic_instructions_redacted": redacted_critic_instructions,
+            "iteration_count": int(state.get("iteration_count") or 0),
+        }
+
         return [
             {
                 "role": "system",
-                "content": (
-                    "Evaluate the output. Output PASS if it follows the charter, or FAIL with a reason.\n"
-                    f"Charter: {self.charter_text}"
-                ),
+                "content": system_prompt,
             },
-            {"role": "user", "content": output_to_eval[:1000]},
+            {"role": "user", "content": json.dumps(user_payload, indent=2)},
         ]
+
+    async def _persist_moral_audit_log(self, state: Dict[str, Any], output_to_eval: str) -> None:
+        ledger = getattr(self, "ledger_memory", None)
+        append_fn = getattr(ledger, "append_moral_audit_log", None)
+        if not callable(append_fn):
+            return
+
+        decision = dict(state.get("moral_decision", {}) or {})
+        if not decision:
+            return
+
+        try:
+            await append_fn(
+                user_id=str(state.get("user_id") or ""),
+                audit_mode=str(state.get("moral_audit_mode") or decision.get("decision_mode") or ""),
+                audit_trace=str(state.get("moral_audit_trace") or decision.get("reasoning") or ""),
+                critic_feedback=str(state.get("critic_feedback") or ""),
+                moral_decision=decision,
+                request_redacted=self._redact_text_for_cloud(
+                    str(state.get("user_input") or ""),
+                    allow_sensitive_context=False,
+                    max_chars=1600,
+                ),
+                output_redacted=self._redact_text_for_cloud(
+                    str(output_to_eval or ""),
+                    allow_sensitive_context=False,
+                    max_chars=2200,
+                ),
+            )
+        except Exception as e:
+            logger.warning("Failed to persist moral audit log entry: %s", e)
 
     async def _route_critic_request(self, messages: List[Dict[str, str]]) -> RouterResult:
         if self.cognitive_router.get_system_2_available():
             logger.info("Routing Critic through System 2 (Gemini)")
             return await asyncio.wait_for(
-                self.cognitive_router.route_to_system_2(messages, allowed_tools=[]),
+                self._route_to_system_2_redacted(
+                    messages,
+                    allowed_tools=[],
+                    purpose="critic_review",
+                    allow_sensitive_context=False,
+                ),
                 timeout=30.0,
             )
         return await self._route_to_system_1(
@@ -2435,16 +4109,128 @@ class Orchestrator:
         )
 
     @staticmethod
+    def _contains_security_conflict_language(text: str) -> bool:
+        lowered = str(text or "").lower()
+        indicators = (
+            "security conflict",
+            "tier 1 violation",
+            "admin authority conflict",
+            "unauthorized write",
+            "unauthorized modify",
+            "unauthorized delete",
+            "mfa required",
+            "data exfiltration",
+        )
+        return any(indicator in lowered for indicator in indicators)
+
+    @staticmethod
+    def _decision_has_tier_1_violation(decision: MoralDecision) -> bool:
+        normalized_tiers = {
+            str(tier).strip().lower().replace("-", "_")
+            for tier in tuple(decision.violated_tiers or ())
+        }
+        if "tier_1" in normalized_tiers or "tier1" in normalized_tiers:
+            return True
+
+        for dimension in MORAL_TIER_1_DIMENSIONS:
+            try:
+                score = int(decision.scores.get(dimension, 5))
+            except Exception:
+                score = 5
+            if score <= 2:
+                return True
+        return False
+
+    def _classify_moral_rejection(self, decision: MoralDecision) -> tuple[str, str]:
+        if (
+            bool(decision.security_conflict)
+            or self._decision_has_tier_1_violation(decision)
+            or self._contains_security_conflict_language(decision.reasoning)
+        ):
+            return "severe", f"Tier 1/security conflict: {decision.reasoning}".strip()
+
+        if tuple(decision.remediation_constraints or ()):
+            return "moderate", str(decision.reasoning or "Moderate moral risk; retry with constraints.").strip()
+
+        return "standard", str(decision.reasoning or "Moral review rejected output.").strip()
+
+    @staticmethod
+    def _extract_heartbeat_task_id(user_input: str) -> Optional[int]:
+        match = re.search(r"\[HEARTBEAT TASK #(\d+)\]", str(user_input or ""))
+        if not match:
+            return None
+        try:
+            task_id = int(match.group(1))
+        except (TypeError, ValueError):
+            return None
+        return task_id if task_id > 0 else None
+
+    async def _suspend_task_for_moral_halt(self, state: Dict[str, Any]) -> Optional[int]:
+        task_id = self._extract_heartbeat_task_id(str(state.get("user_input") or ""))
+        if task_id is None:
+            return None
+
+        ledger = getattr(self, "ledger_memory", None)
+        if ledger is None:
+            return None
+
+        try:
+            await ledger.update_objective_status(task_id, "suspended")
+            return task_id
+        except Exception as e:
+            logger.warning("Could not suspend heartbeat task %s after moral halt: %s", task_id, e)
+            return None
+
     def _apply_critic_response(
+        self,
         state: Dict[str, Any],
         output_to_eval: str,
         response: str,
     ) -> Dict[str, Any]:
-        if "FAIL" in response.upper():
+        decision = parse_moral_decision_response(response)
+        if decision.decision_mode == "validation_failure":
+            response_text = str(response or "")
+            if "FAIL" in response_text.upper():
+                decision = build_legacy_binary_decision(
+                    is_approved=False,
+                    reasoning=response_text.strip() or "Legacy critic rejected output.",
+                )
+            elif "PASS" in response_text.upper():
+                decision = build_legacy_binary_decision(
+                    is_approved=True,
+                    reasoning="Legacy critic approved output.",
+                )
+
+        self._store_moral_decision_trace(state, decision)
+        state["moral_halt_required"] = False
+        state["moral_halt_summary"] = ""
+        state["moral_remediation_constraints"] = []
+
+        if not decision.is_approved:
             state["iteration_count"] += 1
-            state["critic_feedback"] = response
+            severity, summary = self._classify_moral_rejection(decision)
+            if severity == "severe":
+                state["moral_halt_required"] = True
+                state["moral_halt_summary"] = summary
+                state["critic_feedback"] = f"FAIL: {summary}"
+                return state
+
+            remediation_constraints = [
+                str(item).strip()
+                for item in tuple(decision.remediation_constraints or ())
+                if str(item).strip()
+            ]
+            if remediation_constraints:
+                state["moral_remediation_constraints"] = remediation_constraints
+                constraints_text = " | ".join(remediation_constraints[:6])
+                state["critic_feedback"] = (
+                    f"FAIL: {summary} Remediation constraints: {constraints_text}"
+                )
+                return state
+
+            state["critic_feedback"] = f"FAIL: {summary}"
             return state
-        return Orchestrator._finalize_critic_pass(state, output_to_eval)
+        return self._finalize_critic_pass(state, output_to_eval)
 
     async def critic_node(self, state: Dict[str, Any]) -> Dict[str, Any]:
         """Checks worker output against the charter. Skipped for direct supervisor responses."""
@@ -2452,14 +4238,32 @@ class Orchestrator:
         output_to_eval = self._get_output_to_evaluate(state)
 
         if not output_to_eval:
+            self._store_moral_decision_trace(
+                state,
+                build_local_skip_decision("empty_output"),
+            )
             state["critic_feedback"] = "PASS"
+            await self._persist_moral_audit_log(state, output_to_eval)
+            return state
+
+        bypass_decision = self._try_triviality_bypass_decision(state, output_to_eval)
+        if bypass_decision is not None:
+            self._store_moral_decision_trace(state, bypass_decision)
+            state = self._finalize_critic_pass(state, output_to_eval)
+            await self._persist_moral_audit_log(state, output_to_eval)
             return state
 
         if not self._should_run_critic_review(state, output_to_eval):
-            return self._finalize_critic_pass(state, output_to_eval)
+            self._store_moral_decision_trace(
+                state,
+                build_local_skip_decision("short_or_no_review_needed"),
+            )
+            state = self._finalize_critic_pass(state, output_to_eval)
+            await self._persist_moral_audit_log(state, output_to_eval)
+            return state
 
         state = self._deduct_energy(state, ENERGY_COST_CRITIC, "critic")
-        messages = self._build_critic_messages(output_to_eval)
+        messages = self._build_critic_messages(state, output_to_eval)
 
         try:
             router_result = await self._route_critic_request(messages)
@@ -2471,10 +4275,30 @@ class Orchestrator:
                 return state
             else:
                 state = self._apply_critic_response(state, output_to_eval, router_result.content)
+            await self._persist_moral_audit_log(state, output_to_eval)
         except Exception as e:
             logger.warning(f"Critic node failed/timed out: {e}. Defaulting to PASS.", exc_info=True)
             state = self._refund_energy(state, ENERGY_COST_CRITIC, "critic_error")
+            self._store_moral_decision_trace(
+                state,
+                build_local_skip_decision("critic_error_fallback"),
+            )
             state = self._finalize_critic_pass(state, output_to_eval)
+            await self._persist_moral_audit_log(state, output_to_eval)
+
+        if state.get("moral_halt_required"):
+            halt_summary = str(state.get("moral_halt_summary") or "Severe moral violation detected.").strip()
+            suspended_task_id = await self._suspend_task_for_moral_halt(state)
+            hitl_message = f"HITL REQUIRED: Moral governor halt. {halt_summary[:280]}"
+            if suspended_task_id is not None:
+                hitl_message += f" Task #{suspended_task_id} suspended."
+
+            try:
+                await self._notify_admin(hitl_message)
+            except Exception as e:
+                logger.warning("Failed to notify admin for moral halt: %s", e)
+
+            raise RequiresHITLError(hitl_message)
 
         if state["iteration_count"] >= 3 and state["critic_feedback"] != "PASS":
             await self._spawn_debug_task(state)
@@ -2486,37 +4310,61 @@ class Orchestrator:
         return state
 
     async def _consolidate_memory(self, user_id: str) -> None:
-        """
-        Memory Consolidation Skill: summarise the last 10 chat turns for
-        *user_id* into a single paragraph, update core_memory under
-        ``conversation_summary``, and trim the stored raw turns to the most
-        recent 5.  Runs fire-and-forget; errors are swallowed.
-        """
+        """Run deep nocturnal consolidation pipeline (extract -> filter -> score -> write-back)."""
         try:
-            turns = await self.ledger_memory.get_chat_history(user_id, limit=10)
-            if len(turns) < 10:
-                return  # Not enough turns to warrant consolidation
+            turns = await self.ledger_memory.get_chat_history(user_id, limit=20)
+            if len(turns) < 6:
+                return
 
-            convo_text = "\n".join(f"{t['role'].capitalize()}: {t['content']}" for t in turns)
-            messages = [
-                {"role": "system", "content": "You are a memory consolidation engine. Summarise the conversation concisely in 2–3 sentences."},
-                {"role": "user", "content": convo_text},
+            recent_logs = await self.ledger_memory.get_logs(limit=20)
+            critic_logs = [
+                entry for entry in recent_logs
+                if "critic" in str(entry.get("message", "")).lower()
+                or str(entry.get("context", "")).lower().find("critic") != -1
             ]
-            result = await self._route_to_system_1(
-                messages,
-                allowed_tools=[],
-                deadline_seconds=90.0,
-                context="memory_consolidation",
-            )
-            if result.status == "ok" and result.content:
-                summary = result.content.strip()
-                await self.core_memory.update("conversation_summary", summary)
-                await self.ledger_memory.trim_chat_history(user_id, keep_last=5)
-                await self.vector_memory.add_memory_async(
-                    text=f"Conversation summary ({user_id}): {summary}",
-                    metadata={"type": "conversation_summary", "user_id": user_id, "timestamp": datetime.now().isoformat()}
+            try:
+                blueprint_entries = await self.vector_memory.query_memory_async(
+                    "System 2 Reasoning Blueprint",
+                    n_results=5,
                 )
-                logger.info(f"Memory consolidation complete for user {user_id}")
+            except Exception:
+                blueprint_entries = []
+
+            filtered_candidates = await self.nocturnal_consolidation.extract_and_filter_candidates(
+                user_id=user_id,
+                chat_history=turns,
+                worker_outputs={},
+                critic_feedback="",
+                blueprint_entries=blueprint_entries,
+                ledger_logs=critic_logs,
+                vector_memory=self.vector_memory,
+            )
+
+            if not filtered_candidates:
+                await self.ledger_memory.trim_chat_history(user_id, keep_last=5)
+                return
+
+            scored_candidates = await self.nocturnal_consolidation.score_candidates_with_system2(
+                filtered_candidates,
+                route_to_system_2=self._score_nocturnal_candidates,
+                redactor=self._redact_text_for_cloud,
+                threshold=float(os.getenv("NOCTURNAL_Q_THRESHOLD", "3.0")),
+            )
+            write_result = await self.nocturnal_consolidation.write_back_scored_candidates(
+                scored_candidates,
+                core_memory=self.core_memory,
+                vector_memory=self.vector_memory,
+                ledger_memory=self.ledger_memory,
+                threshold=float(os.getenv("NOCTURNAL_Q_THRESHOLD", "3.0")),
+            )
+
+            await self.ledger_memory.trim_chat_history(user_id, keep_last=5)
+            if write_result.get("stored_total", 0) > 0:
+                logger.info(
+                    "Nocturnal consolidation stored memories for %s: %s",
+                    user_id,
+                    write_result,
+                )
         except asyncio.TimeoutError:
             logger.warning("Memory consolidation skipped: LLM did not respond within 90s")
         except Exception as e:
@@ -2544,8 +4392,7 @@ class Orchestrator:
             return exec_result.content
         return self._handle_blocked_result(exec_result, pending_tool.get("user_id", user_id), {})
 
-    async def _try_resume_tool_approval(self, user_id: str, user_message: str) -> Optional[str]:
-        """Handle YES/NO tool synthesis approval. Returns a reply string, or None if not pending."""
+    async def _pop_pending_tool_approval_payload(self, user_id: str) -> Optional[Dict[str, Any]]:
         if user_id not in self.pending_tool_approval:
             return None
         payload = self.pending_tool_approval[user_id]
@@ -2555,30 +4402,170 @@ class Orchestrator:
             await self.ledger_memory.clear_pending_approval(user_id)
             logger.info("Expired stale pending_tool_approval for %s (age %.0fs).", user_id, age)
             return None
-        self.pending_tool_approval.pop(user_id)
+        self.pending_tool_approval.pop(user_id, None)
         await self.ledger_memory.clear_pending_approval(user_id)
+        return payload
+
+    async def _reject_synthesized_tool(
+        self,
+        *,
+        user_id: str,
+        synthesis_run_id: Optional[int],
+        attempts_used: int,
+        synthesis: Dict[str, Any],
+    ) -> str:
+        logger.info("Admin rejected tool synthesis for user %s", user_id)
+        await self._update_synthesis_run_status_if_supported(
+            synthesis_run_id,
+            status="rejected",
+            total_attempts=attempts_used if attempts_used > 0 else None,
+            final_tool_name=str(synthesis.get("tool_name") or ""),
+            code_sha256=str(synthesis.get("synthesis_proof_sha256") or ""),
+            test_summary=str(synthesis.get("self_test_summary") or ""),
+            blocked_reason="Rejected by admin during HITL approval.",
+            synthesis_payload=synthesis,
+        )
+        return f"Tool proposal rejected. The capability gap remains: {synthesis['description']}"
+
+    async def _verify_synthesis_payload_digest(
+        self,
+        *,
+        synthesis: Dict[str, Any],
+        synthesis_run_id: Optional[int],
+        attempts_used: int,
+        tool_name: str,
+    ) -> Optional[str]:
+        expected_digest = str(synthesis.get("synthesis_proof_sha256") or "").strip()
+        if not expected_digest:
+            return None
+
+        actual_digest = self._compute_synthesis_proof_sha256(
+            str(synthesis.get("code") or ""),
+            str(synthesis.get("pytest_code") or ""),
+        )
+        if actual_digest == expected_digest:
+            return None
+
+        mismatch_reason = (
+            "Tool approval blocked: synthesis proof digest mismatch between sandbox-passed "
+            "artifact and pending deployment payload."
+        )
+        await self._update_synthesis_run_status_if_supported(
+            synthesis_run_id,
+            status="blocked",
+            total_attempts=attempts_used if attempts_used > 0 else None,
+            final_tool_name=str(tool_name),
+            code_sha256=actual_digest,
+            test_summary=str(synthesis.get("self_test_summary") or ""),
+            blocked_reason=mismatch_reason,
+            synthesis_payload=synthesis,
+        )
+        logger.error(mismatch_reason)
+        return mismatch_reason
+
+    async def _deploy_approved_synthesized_tool(
+        self,
+        *,
+        user_id: str,
+        tool_name: str,
+        synthesis: Dict[str, Any],
+        synthesis_run_id: Optional[int],
+        attempts_used: int,
+        original_state: Dict[str, Any],
+    ) -> str:
+        self.cognitive_router.register_dynamic_tool(tool_name, synthesis["code"], synthesis["schema_json"])
+        await self.ledger_memory.register_tool(
+            name=tool_name,
+            description=synthesis["description"],
+            code=synthesis["code"],
+            schema_json=synthesis["schema_json"],
+        )
+        await self.ledger_memory.approve_tool(tool_name)
+        await self._update_synthesis_run_status_if_supported(
+            synthesis_run_id,
+            status="approved",
+            total_attempts=attempts_used if attempts_used > 0 else None,
+            successful_attempt=attempts_used if attempts_used > 0 else None,
+            final_tool_name=str(tool_name),
+            code_sha256=str(synthesis.get("synthesis_proof_sha256") or ""),
+            test_summary=str(synthesis.get("self_test_summary") or ""),
+            synthesis_payload=synthesis,
+        )
+        core = await self.core_memory.get_all()
+        caps = core.get("known_capabilities", "")
+        await self.core_memory.update("known_capabilities", f"{caps}, {tool_name}".lstrip(", "))
+        logger.info("Tool '%s' approved, registered, and logged to core memory", tool_name)
+        retry = await self.process_message(original_state["user_input"], user_id)
+        return f"✅ Tool '{tool_name}' deployed.\n\n{retry}"
+
+    async def _handle_synthesized_tool_deploy_failure(
+        self,
+        *,
+        tool_name: str,
+        synthesis: Dict[str, Any],
+        synthesis_run_id: Optional[int],
+        attempts_used: int,
+        error: Exception,
+    ) -> str:
+        await self._update_synthesis_run_status_if_supported(
+            synthesis_run_id,
+            status="blocked",
+            total_attempts=attempts_used if attempts_used > 0 else None,
+            final_tool_name=str(tool_name),
+            code_sha256=str(synthesis.get("synthesis_proof_sha256") or ""),
+            test_summary=str(synthesis.get("self_test_summary") or ""),
+            blocked_reason=f"Deployment failed after approval: {error}",
+            synthesis_payload=synthesis,
+        )
+        logger.error("Tool registration failed: %s", error, exc_info=True)
+        return f"Error deploying tool '{tool_name}': {error}"
+
+    async def _try_resume_tool_approval(self, user_id: str, user_message: str) -> Optional[str]:
+        """Handle YES/NO tool synthesis approval. Returns a reply string, or None if not pending."""
+        payload = await self._pop_pending_tool_approval_payload(user_id)
+        if payload is None:
+            return None
+
         synthesis = payload["synthesis"]
         original_state = payload["original_state"]
+        synthesis_run_id = payload.get("synthesis_run_id") or synthesis.get("synthesis_run_id")
+        attempts_used = int(synthesis.get("synthesis_attempts_used") or 0)
+        tool_name = str(synthesis.get("tool_name") or "")
+
         if not user_message.strip().upper().startswith("YES"):
-            logger.info(f"Admin rejected tool synthesis for user {user_id}")
-            return f"Tool proposal rejected. The capability gap remains: {synthesis['description']}"
-        tool_name = synthesis["tool_name"]
-        try:
-            self.cognitive_router.register_dynamic_tool(tool_name, synthesis["code"], synthesis["schema_json"])
-            await self.ledger_memory.register_tool(
-                name=tool_name, description=synthesis["description"],
-                code=synthesis["code"], schema_json=synthesis["schema_json"],
+            return await self._reject_synthesized_tool(
+                user_id=user_id,
+                synthesis_run_id=synthesis_run_id,
+                attempts_used=attempts_used,
+                synthesis=synthesis,
             )
-            await self.ledger_memory.approve_tool(tool_name)
-            core = await self.core_memory.get_all()
-            caps = core.get("known_capabilities", "")
-            await self.core_memory.update("known_capabilities", f"{caps}, {tool_name}".lstrip(", "))
-            logger.info(f"Tool '{tool_name}' approved, registered, and logged to core memory")
-            retry = await self.process_message(original_state["user_input"], user_id)
-            return f"✅ Tool '{tool_name}' deployed.\n\n{retry}"
+
+        mismatch = await self._verify_synthesis_payload_digest(
+            synthesis=synthesis,
+            synthesis_run_id=synthesis_run_id,
+            attempts_used=attempts_used,
+            tool_name=tool_name,
+        )
+        if mismatch:
+            return mismatch
+
+        try:
+            return await self._deploy_approved_synthesized_tool(
+                user_id=user_id,
+                tool_name=tool_name,
+                synthesis=synthesis,
+                synthesis_run_id=synthesis_run_id,
+                attempts_used=attempts_used,
+                original_state=original_state,
+            )
         except Exception as e:
-            logger.error(f"Tool registration failed: {e}", exc_info=True)
-            return f"Error deploying tool '{tool_name}': {e}"
+            return await self._handle_synthesized_tool_deploy_failure(
+                tool_name=tool_name,
+                synthesis=synthesis,
+                synthesis_run_id=synthesis_run_id,
+                attempts_used=attempts_used,
+                error=e,
+            )
 
     async def _load_state(self, user_id: str, user_message: str) -> Dict[str, Any]:
         """Return a state dict: resumes a HITL conversation if pending, else creates fresh."""
@@ -2646,8 +4633,16 @@ class Orchestrator:
     @staticmethod
     def _apply_critic_retry_instructions(state: Dict[str, Any]) -> None:
         if state["iteration_count"] > 0:
+            constraints = [
+                str(item).strip()
+                for item in (state.get("moral_remediation_constraints", []) or [])
+                if str(item).strip()
+            ]
+            constraint_clause = ""
+            if constraints:
+                constraint_clause = " Remediation constraints: " + " | ".join(constraints[:6]) + "."
             state["critic_instructions"] = (
-                f"[CRITIC FEEDBACK: {state['critic_feedback']}. Fix your output.]"
+                f"[CRITIC FEEDBACK: {state['critic_feedback']}.{constraint_clause} Fix your output.]"
             )
 
     async def _run_manual_graph_pass(
@@ -2677,6 +4672,8 @@ class Orchestrator:
         state["final_response"] = ""
         state["worker_outputs"] = {}
         state["current_plan"] = []
+        state["moral_halt_required"] = False
+        state["moral_halt_summary"] = ""
 
     @staticmethod
     def _ensure_final_response(state: Dict[str, Any], max_iterations: int) -> None:
@@ -2766,6 +4763,10 @@ class Orchestrator:
             await self._remember_user_profile(user_id, user_message)
             await self._remember_assistant_identity(user_message)
 
+            reply = await self._try_goal_planning_response(state)
+            if reply is not None:
+                return await self._finalize_user_response(user_id, user_message, reply)
+
             reply = await self._try_fast_path_response(state)
             if reply is not None:
                 return await self._finalize_user_response(user_id, user_message, reply)
@@ -2834,10 +4835,24 @@ class Orchestrator:
         Extracts the solution and blueprint, saves blueprint to memory async,
         and returns the solution string.
         """
+        allow_sensitive_context = self._requires_sensitive_cloud_context(
+            router_result.escalation_problem,
+            router_result.escalation_context,
+            state.get("user_input", ""),
+        )
+        escalation_problem = self._redact_text_for_cloud(
+            router_result.escalation_problem,
+            allow_sensitive_context=allow_sensitive_context,
+        )
+        escalation_context = self._redact_text_for_cloud(
+            router_result.escalation_context,
+            allow_sensitive_context=allow_sensitive_context,
+        )
+
         prompt = (
             "You are System 2. System 1 has escalated a complex problem to you.\n\n"
-            f"Problem Description: {router_result.escalation_problem}\n\n"
-            f"Context Scratchpad: {router_result.escalation_context}\n\n"
+            f"Problem Description: {escalation_problem}\n\n"
+            f"Context Scratchpad: {escalation_context}\n\n"
             "Please provide a direct solution to the user's problem. "
             "Additionally, generate a brief 'Reasoning Blueprint' on how to solve this class of problem. "
             "You MUST format your output strictly using XML tags:\n"
@@ -2846,7 +4861,11 @@ class Orchestrator:
         )
 
         messages = [{"role": "user", "content": prompt}]
-        sys2_result = await self.cognitive_router.route_to_system_2(messages)
+        sys2_result = await self._route_to_system_2_redacted(
+            messages,
+            purpose="cognitive_escalation",
+            allow_sensitive_context=allow_sensitive_context,
+        )
 
         content = sys2_result.content if sys2_result.status == "ok" else "[System 2 - Error]: Escalation failed."
 

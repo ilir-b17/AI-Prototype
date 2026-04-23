@@ -283,8 +283,44 @@ async def addgoal(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             await update.message.reply_text("System error: Ledger not available.")
             return
         obj_id = await ledger.add_objective(tier=tier, title=title, estimated_energy=energy, origin="Admin")
+        decomposition_note = ""
+        if tier == "Epic":
+            orchestrator_inst = context.bot_data.get("orchestrator")
+            if (
+                orchestrator_inst is not None
+                and getattr(orchestrator_inst, "cognitive_router", None) is not None
+                and orchestrator_inst.cognitive_router.get_system_2_available()
+            ):
+                async def _route(messages):
+                    return await orchestrator_inst._route_to_system_2_redacted(
+                        messages,
+                        allowed_tools=[],
+                        purpose="goal_planner_epic",
+                        allow_sensitive_context=False,
+                    )
+
+                try:
+                    plan_result = await orchestrator_inst.goal_planner.plan_goal(
+                        title,
+                        context="Admin-defined Epic from /addgoal.",
+                        route_to_system_2=_route,
+                        ledger_memory=ledger,
+                        redactor=orchestrator_inst._redact_text_for_cloud,
+                        origin="Admin",
+                        parent_epic_id=obj_id,
+                    )
+                    decomposition_note = (
+                        f"\nPlanned decomposition only: {plan_result.story_count} Stories, "
+                        f"{plan_result.task_count} Tasks."
+                    )
+                except Exception as plan_err:
+                    logger.warning(f"GoalPlanner failed for Epic #{obj_id}: {plan_err}")
+                    decomposition_note = "\nEpic added, but automatic decomposition failed."
+            else:
+                decomposition_note = "\nEpic added, but System 2 is unavailable so decomposition was skipped."
+
         await update.message.reply_text(
-            f"Added to backlog:\n  #{obj_id} [{tier}] {title}\n  Estimated Energy: {energy}"
+            f"Added to backlog:\n  #{obj_id} [{tier}] {title}\n  Estimated Energy: {energy}{decomposition_note}"
         )
         sanitized_title = sanitize_for_logging(title)
         logger.info(f"Admin added objective #{obj_id}: [{tier}] {sanitized_title}")
@@ -400,6 +436,7 @@ async def _async_run(application: Application, orchestrator_inst: "Orchestrator"
         # command handlers (/goals, /addgoal) can re-use it instead of opening
         # a second parallel connection to the same DB (ISSUE-003).
         application.bot_data["ledger"] = orchestrator_inst.ledger_memory
+        application.bot_data["orchestrator"] = orchestrator_inst
 
         # Re-send any HITL reminders that were queued before the outbound pipe
         # existed (i.e. restored during async_init).  Now that the queue is live

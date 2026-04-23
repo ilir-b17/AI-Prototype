@@ -54,6 +54,18 @@ def test_agent_registry_falls_back_to_builtin_agents(tmp_path: Path):
     assert registry.get("synthesis_agent") is not None
 
 
+def test_builtin_research_and_coder_agents_allow_semantic_escalation(tmp_path: Path):
+    registry = AgentRegistry(agents_dir=tmp_path / "agents")
+
+    research = registry.get("research_agent")
+    coder = registry.get("coder_agent")
+
+    assert research is not None
+    assert coder is not None
+    assert "escalate_to_system_2" in research.allowed_tools
+    assert "escalate_to_system_2" in coder.allowed_tools
+
+
 def test_build_supervisor_prompt_includes_registered_agents():
     prompt = build_supervisor_prompt(
         charter_text="Charter",

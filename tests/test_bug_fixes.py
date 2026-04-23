@@ -531,6 +531,83 @@ class TestSystem2AvailabilityDetection:
         assert CognitiveRouter.get_system_2_available(router) is False
 
 
+class TestCloudPayloadRedaction:
+    def test_redact_text_for_cloud_strips_private_context_and_pii(self):
+        raw_payload = (
+            "<context_and_memory>secret memory about user profile</context_and_memory>\n"
+            "[Machine Context - OS: Windows 11 | CPU: 6% | CWD: C:\\Users\\iboci\\Live-Trading-bot\\AI_Prototype]\n"
+            "My name is Ilir Boci and my email is ilir@example.com.\n"
+            "Task: Explain why the worker failed."
+        )
+
+        redacted = Orchestrator._redact_text_for_cloud(raw_payload)
+
+        assert "secret memory" not in redacted
+        assert "Ilir Boci" not in redacted
+        assert "ilir@example.com" not in redacted
+        assert "C:\\Users\\iboci" not in redacted
+        assert "Task: Explain why the worker failed." in redacted
+
+    def test_redact_messages_for_cloud_drops_raw_chat_history_by_default(self):
+        orchestrator = Orchestrator.__new__(Orchestrator)
+        messages = [
+            {
+                "role": "system",
+                "content": "Plan this task. <Core_Working_Memory>name=Alice, location=Vienna</Core_Working_Memory>",
+            },
+            {"role": "user", "content": "Older user turn with details: passport 12345"},
+            {"role": "assistant", "content": "Older assistant turn."},
+            {"role": "user", "content": "My name is Alice Stone. Please debug this stack trace."},
+        ]
+
+        minimized = Orchestrator._redact_messages_for_cloud(orchestrator, messages)
+
+        assert [item["role"] for item in minimized] == ["system", "user"]
+        combined = "\n".join(item["content"] for item in minimized)
+        assert "Older user turn" not in combined
+        assert "passport 12345" not in combined
+        assert "Alice Stone" not in combined
+
+    @pytest.mark.asyncio
+    async def test_route_to_system_2_redacted_forwards_only_sanitized_payload(self):
+        orchestrator = Orchestrator.__new__(Orchestrator)
+        orchestrator.cognitive_router = MagicMock()
+        orchestrator.cognitive_router.route_to_system_2 = AsyncMock(
+            return_value=RouterResult(status="ok", content="done")
+        )
+
+        messages = [
+            {
+                "role": "system",
+                "content": "Supervisor context <Core_Working_Memory>core secret</Core_Working_Memory>",
+            },
+            {"role": "user", "content": "Previous user turn with bob@example.com"},
+            {"role": "assistant", "content": "Prior assistant response"},
+            {"role": "user", "content": "Please resolve this worker deadlock."},
+        ]
+
+        result = await Orchestrator._route_to_system_2_redacted(
+            orchestrator,
+            messages,
+            allowed_tools=["web_search"],
+            purpose="test_redaction",
+        )
+
+        assert result.status == "ok"
+        assert result.content == "done"
+
+        args, kwargs = orchestrator.cognitive_router.route_to_system_2.await_args
+        forwarded_messages = args[0]
+        forwarded_text = "\n".join(message["content"] for message in forwarded_messages)
+
+        assert len(forwarded_messages) == 2
+        assert "core secret" not in forwarded_text
+        assert "bob@example.com" not in forwarded_text
+        assert "Previous user turn" not in forwarded_text
+        assert "Please resolve this worker deadlock." in forwarded_text
+        assert kwargs["allowed_tools"] == ["web_search"]
+
+
 class TestCriticSkipForDirectSupervisorReplies:
     @pytest.mark.asyncio
     async def test_critic_skips_when_no_worker_outputs_exist(self):

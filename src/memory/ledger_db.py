@@ -9,6 +9,7 @@ async-safe and concurrency-safe through a shared ``asyncio.Lock``.
 import os
 import asyncio
 import logging
+import json
 from datetime import datetime
 from typing import List, Dict, Any, Optional
 from enum import Enum
@@ -39,6 +40,8 @@ class TaskStatus(Enum):
 # Pre-calculate status values for performance optimization
 VALID_TASK_STATUSES = {s.value for s in TaskStatus}
 VALID_TASK_STATUSES_LIST = [s.value for s in TaskStatus]
+_SQL_TEXT_DEFAULT_EMPTY = "TEXT NOT NULL DEFAULT ''"
+_SQL_INT_DEFAULT_ZERO = "INTEGER NOT NULL DEFAULT 0"
 
 
 class LedgerMemory:
@@ -59,9 +62,7 @@ class LedgerMemory:
         self._lock = asyncio.Lock()
         os.makedirs(os.path.dirname(db_path), exist_ok=True)
 
-    # ─────────────────────────────────────────────────────────────
     # Lifecycle
-    # ─────────────────────────────────────────────────────────────
 
     async def initialize(self) -> None:
         """Open the async connection and create all tables.  Call once at startup."""
@@ -113,16 +114,52 @@ class LedgerMemory:
                     estimated_energy INTEGER NOT NULL DEFAULT 10,
                     origin TEXT NOT NULL DEFAULT 'Admin',
                     parent_id INTEGER,
+                    depends_on_ids TEXT NOT NULL DEFAULT '[]',
+                    acceptance_criteria TEXT NOT NULL DEFAULT '',
+                    defer_count INTEGER NOT NULL DEFAULT 0,
+                    last_energy_eval_at TIMESTAMP,
+                    next_eligible_at TIMESTAMP,
+                    last_energy_eval_json TEXT NOT NULL DEFAULT '',
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                     FOREIGN KEY (parent_id) REFERENCES objective_backlog(id)
                 )
             """)
+            await self._ensure_objective_backlog_column(
+                "depends_on_ids",
+                "TEXT NOT NULL DEFAULT '[]'",
+            )
+            await self._ensure_objective_backlog_column(
+                "acceptance_criteria",
+                _SQL_TEXT_DEFAULT_EMPTY,
+            )
+            await self._ensure_objective_backlog_column(
+                "defer_count",
+                _SQL_INT_DEFAULT_ZERO,
+            )
+            await self._ensure_objective_backlog_column(
+                "last_energy_eval_at",
+                "TIMESTAMP",
+            )
+            await self._ensure_objective_backlog_column(
+                "next_eligible_at",
+                "TIMESTAMP",
+            )
+            await self._ensure_objective_backlog_column(
+                "last_energy_eval_json",
+                _SQL_TEXT_DEFAULT_EMPTY,
+            )
             await self._db.execute("""
                 CREATE INDEX IF NOT EXISTS idx_objective_status ON objective_backlog(status)
             """)
             await self._db.execute("""
                 CREATE INDEX IF NOT EXISTS idx_objective_tier ON objective_backlog(tier)
+            """)
+            await self._db.execute("""
+                CREATE INDEX IF NOT EXISTS idx_objective_parent ON objective_backlog(parent_id)
+            """)
+            await self._db.execute("""
+                CREATE INDEX IF NOT EXISTS idx_objective_next_eligible ON objective_backlog(next_eligible_at)
             """)
             await self._db.execute("""
                 CREATE TABLE IF NOT EXISTS chat_history (
@@ -178,8 +215,464 @@ class LedgerMemory:
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 )
             """)
+            await self._db.execute("""
+                CREATE TABLE IF NOT EXISTS moral_audit_log (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    user_id TEXT NOT NULL,
+                    audit_mode TEXT NOT NULL,
+                    audit_trace TEXT NOT NULL,
+                    critic_feedback TEXT NOT NULL,
+                    moral_decision_json TEXT NOT NULL,
+                    request_redacted TEXT NOT NULL,
+                    output_redacted TEXT NOT NULL,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            """)
+            await self._db.execute("""
+                CREATE INDEX IF NOT EXISTS idx_moral_audit_user_id_created_at
+                ON moral_audit_log(user_id, created_at DESC)
+            """)
+            await self._db.execute("""
+                CREATE INDEX IF NOT EXISTS idx_moral_audit_created_at
+                ON moral_audit_log(created_at DESC)
+            """)
+            await self._db.execute("""
+                CREATE TRIGGER IF NOT EXISTS trg_moral_audit_log_no_update
+                BEFORE UPDATE ON moral_audit_log
+                BEGIN
+                    SELECT RAISE(ABORT, 'Update not allowed on moral_audit_log');
+                END;
+            """)
+            await self._db.execute("""
+                CREATE TRIGGER IF NOT EXISTS trg_moral_audit_log_no_delete
+                BEFORE DELETE ON moral_audit_log
+                BEGIN
+                    SELECT RAISE(ABORT, 'Delete not allowed on moral_audit_log');
+                END;
+            """)
+            await self._db.execute("""
+                CREATE TABLE IF NOT EXISTS synthesis_runs (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    user_id TEXT NOT NULL,
+                    gap_description TEXT NOT NULL,
+                    suggested_tool_name TEXT NOT NULL,
+                    original_input TEXT NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'in_progress',
+                    final_tool_name TEXT NOT NULL DEFAULT '',
+                    total_attempts INTEGER NOT NULL DEFAULT 0,
+                    successful_attempt INTEGER,
+                    max_retries INTEGER NOT NULL DEFAULT 3,
+                    code_sha256 TEXT NOT NULL DEFAULT '',
+                    test_summary TEXT NOT NULL DEFAULT '',
+                    blocked_reason TEXT NOT NULL DEFAULT '',
+                    synthesis_json TEXT NOT NULL DEFAULT '',
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            """)
+            await self._ensure_table_column(
+                "synthesis_runs",
+                "status",
+                "TEXT NOT NULL DEFAULT 'in_progress'",
+            )
+            await self._ensure_table_column(
+                "synthesis_runs",
+                "final_tool_name",
+                _SQL_TEXT_DEFAULT_EMPTY,
+            )
+            await self._ensure_table_column(
+                "synthesis_runs",
+                "total_attempts",
+                _SQL_INT_DEFAULT_ZERO,
+            )
+            await self._ensure_table_column(
+                "synthesis_runs",
+                "successful_attempt",
+                "INTEGER",
+            )
+            await self._ensure_table_column(
+                "synthesis_runs",
+                "max_retries",
+                "INTEGER NOT NULL DEFAULT 3",
+            )
+            await self._ensure_table_column(
+                "synthesis_runs",
+                "code_sha256",
+                _SQL_TEXT_DEFAULT_EMPTY,
+            )
+            await self._ensure_table_column(
+                "synthesis_runs",
+                "test_summary",
+                _SQL_TEXT_DEFAULT_EMPTY,
+            )
+            await self._ensure_table_column(
+                "synthesis_runs",
+                "blocked_reason",
+                _SQL_TEXT_DEFAULT_EMPTY,
+            )
+            await self._ensure_table_column(
+                "synthesis_runs",
+                "synthesis_json",
+                _SQL_TEXT_DEFAULT_EMPTY,
+            )
+            await self._db.execute("""
+                CREATE INDEX IF NOT EXISTS idx_synthesis_runs_user_created
+                ON synthesis_runs(user_id, created_at DESC)
+            """)
+            await self._db.execute("""
+                CREATE INDEX IF NOT EXISTS idx_synthesis_runs_status_created
+                ON synthesis_runs(status, created_at DESC)
+            """)
+            await self._db.execute("""
+                CREATE TABLE IF NOT EXISTS synthesis_attempts (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    run_id INTEGER NOT NULL,
+                    attempt_number INTEGER NOT NULL,
+                    phase TEXT NOT NULL,
+                    tool_name TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    timed_out INTEGER NOT NULL DEFAULT 0,
+                    exit_code INTEGER,
+                    duration_ms INTEGER NOT NULL DEFAULT 0,
+                    passed_count INTEGER NOT NULL DEFAULT 0,
+                    failed_count INTEGER NOT NULL DEFAULT 0,
+                    error_count INTEGER NOT NULL DEFAULT 0,
+                    skipped_count INTEGER NOT NULL DEFAULT 0,
+                    error_message TEXT NOT NULL DEFAULT '',
+                    stdout_text TEXT NOT NULL DEFAULT '',
+                    stderr_text TEXT NOT NULL DEFAULT '',
+                    code_sha256 TEXT NOT NULL DEFAULT '',
+                    synthesis_json TEXT NOT NULL DEFAULT '',
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    FOREIGN KEY (run_id) REFERENCES synthesis_runs(id),
+                    UNIQUE(run_id, attempt_number)
+                )
+            """)
+            await self._ensure_table_column(
+                "synthesis_attempts",
+                "phase",
+                "TEXT NOT NULL DEFAULT 'synthesis'",
+            )
+            await self._ensure_table_column(
+                "synthesis_attempts",
+                "tool_name",
+                _SQL_TEXT_DEFAULT_EMPTY,
+            )
+            await self._ensure_table_column(
+                "synthesis_attempts",
+                "status",
+                "TEXT NOT NULL DEFAULT 'failed'",
+            )
+            await self._ensure_table_column(
+                "synthesis_attempts",
+                "timed_out",
+                _SQL_INT_DEFAULT_ZERO,
+            )
+            await self._ensure_table_column(
+                "synthesis_attempts",
+                "exit_code",
+                "INTEGER",
+            )
+            await self._ensure_table_column(
+                "synthesis_attempts",
+                "duration_ms",
+                _SQL_INT_DEFAULT_ZERO,
+            )
+            await self._ensure_table_column(
+                "synthesis_attempts",
+                "passed_count",
+                _SQL_INT_DEFAULT_ZERO,
+            )
+            await self._ensure_table_column(
+                "synthesis_attempts",
+                "failed_count",
+                _SQL_INT_DEFAULT_ZERO,
+            )
+            await self._ensure_table_column(
+                "synthesis_attempts",
+                "error_count",
+                _SQL_INT_DEFAULT_ZERO,
+            )
+            await self._ensure_table_column(
+                "synthesis_attempts",
+                "skipped_count",
+                _SQL_INT_DEFAULT_ZERO,
+            )
+            await self._ensure_table_column(
+                "synthesis_attempts",
+                "error_message",
+                _SQL_TEXT_DEFAULT_EMPTY,
+            )
+            await self._ensure_table_column(
+                "synthesis_attempts",
+                "stdout_text",
+                _SQL_TEXT_DEFAULT_EMPTY,
+            )
+            await self._ensure_table_column(
+                "synthesis_attempts",
+                "stderr_text",
+                _SQL_TEXT_DEFAULT_EMPTY,
+            )
+            await self._ensure_table_column(
+                "synthesis_attempts",
+                "code_sha256",
+                _SQL_TEXT_DEFAULT_EMPTY,
+            )
+            await self._ensure_table_column(
+                "synthesis_attempts",
+                "synthesis_json",
+                _SQL_TEXT_DEFAULT_EMPTY,
+            )
+            await self._db.execute("""
+                CREATE INDEX IF NOT EXISTS idx_synthesis_attempts_run_attempt
+                ON synthesis_attempts(run_id, attempt_number ASC)
+            """)
+            await self._db.execute("""
+                CREATE INDEX IF NOT EXISTS idx_synthesis_attempts_status_created
+                ON synthesis_attempts(status, created_at DESC)
+            """)
             await self._db.commit()
         logger.debug("Database tables initialized")
+
+    async def _ensure_table_column(self, table_name: str, column_name: str, column_sql: str) -> None:
+        """Idempotent schema migration helper for adding a missing table column."""
+        cursor = await self._db.execute(f"PRAGMA table_info({table_name})")
+        rows = await cursor.fetchall()
+        existing = {row["name"] for row in rows}
+        if column_name in existing:
+            return
+
+        await self._db.execute(
+            f"ALTER TABLE {table_name} ADD COLUMN {column_name} {column_sql}"
+        )
+        logger.info("Migrated %s: added column '%s'", table_name, column_name)
+
+    async def _ensure_objective_backlog_column(self, column_name: str, column_sql: str) -> None:
+        """Idempotent schema migration helper for objective_backlog columns."""
+        await self._ensure_table_column("objective_backlog", column_name, column_sql)
+
+    @staticmethod
+    def _serialize_depends_on_ids(depends_on_ids: Optional[List[int]]) -> str:
+        if not depends_on_ids:
+            return "[]"
+
+        normalized: List[int] = []
+        for raw_id in depends_on_ids:
+            try:
+                dep_id = int(raw_id)
+            except (TypeError, ValueError):
+                continue
+            if dep_id > 0 and dep_id not in normalized:
+                normalized.append(dep_id)
+        return json.dumps(normalized)
+
+    @staticmethod
+    def _deserialize_depends_on_ids(raw_value: Any) -> List[int]:
+        if raw_value is None:
+            return []
+        if isinstance(raw_value, list):
+            result: List[int] = []
+            for item in raw_value:
+                try:
+                    dep_id = int(item)
+                except (TypeError, ValueError):
+                    continue
+                if dep_id > 0 and dep_id not in result:
+                    result.append(dep_id)
+            return result
+
+        raw_text = str(raw_value).strip()
+        if not raw_text:
+            return []
+
+        try:
+            decoded = json.loads(raw_text)
+            if isinstance(decoded, list):
+                return LedgerMemory._deserialize_depends_on_ids(decoded)
+        except (TypeError, ValueError):
+            pass
+
+        # Fallback for legacy comma-separated values.
+        parts = [part.strip() for part in raw_text.split(",") if part.strip()]
+        return LedgerMemory._deserialize_depends_on_ids(parts)
+
+    @classmethod
+    def _normalize_objective_row(cls, row: aiosqlite.Row) -> Dict[str, Any]:
+        result = dict(row)
+        result["depends_on_ids"] = cls._deserialize_depends_on_ids(result.get("depends_on_ids"))
+        result["acceptance_criteria"] = str(result.get("acceptance_criteria") or "")
+        result["defer_count"] = int(result.get("defer_count") or 0)
+        result["last_energy_eval_at"] = result.get("last_energy_eval_at")
+        result["next_eligible_at"] = result.get("next_eligible_at")
+        result["last_energy_eval_json"] = str(result.get("last_energy_eval_json") or "")
+        return result
+
+    @classmethod
+    def _normalize_energy_context_row(cls, row: aiosqlite.Row) -> Dict[str, Any]:
+        task_row = {
+            "id": row["task_id"],
+            "tier": "Task",
+            "title": row["task_title"],
+            "status": row["task_status"],
+            "priority": row["task_priority"],
+            "estimated_energy": row["task_estimated_energy"],
+            "origin": row["task_origin"],
+            "parent_id": row["task_parent_id"],
+            "depends_on_ids": row["task_depends_on_ids"],
+            "acceptance_criteria": row["task_acceptance_criteria"],
+            "defer_count": row["task_defer_count"],
+            "last_energy_eval_at": row["task_last_energy_eval_at"],
+            "next_eligible_at": row["task_next_eligible_at"],
+            "last_energy_eval_json": row["task_last_energy_eval_json"],
+            "created_at": row["task_created_at"],
+            "updated_at": row["task_updated_at"],
+        }
+        normalized_task = cls._normalize_objective_row(task_row)
+        normalized_task["id"] = int(normalized_task["id"])
+        normalized_task["priority"] = int(normalized_task.get("priority") or 0)
+        normalized_task["estimated_energy"] = int(normalized_task.get("estimated_energy") or 0)
+
+        story = None
+        if row["story_id"] is not None:
+            story = {
+                "id": int(row["story_id"]),
+                "title": str(row["story_title"] or ""),
+                "status": str(row["story_status"] or ""),
+                "acceptance_criteria": str(row["story_acceptance_criteria"] or ""),
+            }
+
+        epic = None
+        if row["epic_id"] is not None:
+            epic = {
+                "id": int(row["epic_id"]),
+                "title": str(row["epic_title"] or ""),
+                "status": str(row["epic_status"] or ""),
+                "acceptance_criteria": str(row["epic_acceptance_criteria"] or ""),
+            }
+
+        return {
+            "task": normalized_task,
+            "story": story,
+            "epic": epic,
+        }
+
+    @staticmethod
+    def _objective_energy_context_query(where_clause: str) -> str:
+        return (
+            "SELECT "
+            "task.id AS task_id, task.title AS task_title, task.status AS task_status, "
+            "task.priority AS task_priority, task.estimated_energy AS task_estimated_energy, "
+            "task.origin AS task_origin, task.parent_id AS task_parent_id, "
+            "task.depends_on_ids AS task_depends_on_ids, "
+            "task.acceptance_criteria AS task_acceptance_criteria, "
+            "task.defer_count AS task_defer_count, "
+            "task.last_energy_eval_at AS task_last_energy_eval_at, "
+            "task.next_eligible_at AS task_next_eligible_at, "
+            "task.last_energy_eval_json AS task_last_energy_eval_json, "
+            "task.created_at AS task_created_at, task.updated_at AS task_updated_at, "
+            "story.id AS story_id, story.title AS story_title, story.status AS story_status, "
+            "story.acceptance_criteria AS story_acceptance_criteria, "
+            "epic.id AS epic_id, epic.title AS epic_title, epic.status AS epic_status, "
+            "epic.acceptance_criteria AS epic_acceptance_criteria "
+            "FROM objective_backlog task "
+            "LEFT JOIN objective_backlog story ON task.parent_id = story.id AND story.tier = 'Story' "
+            "LEFT JOIN objective_backlog epic ON story.parent_id = epic.id AND epic.tier = 'Epic' "
+            "WHERE " + where_clause
+        )
+
+    @staticmethod
+    def _build_children_index(nodes: Dict[int, Dict[str, Any]]) -> Dict[int, List[int]]:
+        children: Dict[int, List[int]] = {}
+        for node_id, node in nodes.items():
+            parent_id = node.get("parent_id")
+            if parent_id is None:
+                continue
+            children.setdefault(int(parent_id), []).append(node_id)
+        return children
+
+    @classmethod
+    def _aggregate_task_totals(
+        cls,
+        node_id: int,
+        nodes: Dict[int, Dict[str, Any]],
+        children: Dict[int, List[int]],
+        memo: Dict[int, Dict[str, int]],
+        visiting: Optional[set] = None,
+    ) -> Dict[str, int]:
+        if node_id in memo:
+            return memo[node_id]
+
+        visiting = visiting or set()
+        if node_id in visiting:
+            return cls._empty_task_totals()
+        visiting.add(node_id)
+
+        node = nodes[node_id]
+        tier = str(node.get("tier") or "")
+        status = str(node.get("status") or "")
+        if tier == "Task":
+            totals = cls._task_leaf_totals(status)
+        else:
+            totals = cls._sum_child_task_totals(node_id, nodes, children, memo, visiting)
+
+        memo[node_id] = totals
+        visiting.remove(node_id)
+        return totals
+
+    @staticmethod
+    def _empty_task_totals() -> Dict[str, int]:
+        return {"total": 0, "completed": 0, "pending": 0, "active": 0, "suspended": 0}
+
+    @classmethod
+    def _task_leaf_totals(cls, status: str) -> Dict[str, int]:
+        totals = cls._empty_task_totals()
+        totals["total"] = 1
+        if status == "completed":
+            totals["completed"] = 1
+        elif status == "pending":
+            totals["pending"] = 1
+        elif status == "active":
+            totals["active"] = 1
+        elif status == "suspended":
+            totals["suspended"] = 1
+        return totals
+
+    @classmethod
+    def _sum_child_task_totals(
+        cls,
+        node_id: int,
+        nodes: Dict[int, Dict[str, Any]],
+        children: Dict[int, List[int]],
+        memo: Dict[int, Dict[str, int]],
+        visiting: set,
+    ) -> Dict[str, int]:
+        totals = cls._empty_task_totals()
+        for child_id in children.get(node_id, []):
+            child_totals = cls._aggregate_task_totals(child_id, nodes, children, memo, visiting)
+            for key in totals:
+                totals[key] += child_totals[key]
+        return totals
+
+    @staticmethod
+    def _derive_rollup_status(
+        fallback_status: str,
+        total_tasks: int,
+        completed_tasks: int,
+        pending_tasks: int,
+        active_tasks: int,
+        suspended_tasks: int,
+    ) -> str:
+        if total_tasks == 0:
+            return fallback_status or "pending"
+        if completed_tasks == total_tasks:
+            return "completed"
+        if active_tasks > 0:
+            return "active"
+        if pending_tasks > 0:
+            return "pending"
+        if suspended_tasks == total_tasks:
+            return "suspended"
+        return fallback_status or "pending"
 
     async def close(self) -> None:
         """Close the aiosqlite connection."""
@@ -314,6 +807,73 @@ class LedgerMemory:
         logger.info(f"Retrieved {len(logs)} log entries")
         return logs
 
+    async def append_moral_audit_log(
+        self,
+        *,
+        user_id: str,
+        audit_mode: str,
+        audit_trace: str,
+        critic_feedback: str,
+        moral_decision: Dict[str, Any],
+        request_redacted: str,
+        output_redacted: str,
+    ) -> int:
+        """Append one immutable moral audit record and return its ID."""
+        decision_json = json.dumps(dict(moral_decision or {}), sort_keys=True)
+        async with self._lock:
+            cursor = await self._db.execute(
+                "INSERT INTO moral_audit_log "
+                "(user_id, audit_mode, audit_trace, critic_feedback, moral_decision_json, request_redacted, output_redacted) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (
+                    str(user_id or ""),
+                    str(audit_mode or ""),
+                    str(audit_trace or ""),
+                    str(critic_feedback or ""),
+                    decision_json,
+                    str(request_redacted or ""),
+                    str(output_redacted or ""),
+                ),
+            )
+            await self._db.commit()
+            return int(cursor.lastrowid)
+
+    async def get_moral_audit_logs(
+        self,
+        *,
+        user_id: Optional[str] = None,
+        limit: int = 100,
+    ) -> List[Dict[str, Any]]:
+        """Read immutable moral audit records, most recent first."""
+        async with self._lock:
+            if user_id is not None:
+                cursor = await self._db.execute(
+                    "SELECT id, user_id, audit_mode, audit_trace, critic_feedback, moral_decision_json, "
+                    "request_redacted, output_redacted, created_at "
+                    "FROM moral_audit_log WHERE user_id = ? "
+                    "ORDER BY created_at DESC, id DESC LIMIT ?",
+                    (str(user_id), int(limit)),
+                )
+            else:
+                cursor = await self._db.execute(
+                    "SELECT id, user_id, audit_mode, audit_trace, critic_feedback, moral_decision_json, "
+                    "request_redacted, output_redacted, created_at "
+                    "FROM moral_audit_log "
+                    "ORDER BY created_at DESC, id DESC LIMIT ?",
+                    (int(limit),),
+                )
+            rows = await cursor.fetchall()
+
+        logs: List[Dict[str, Any]] = []
+        for row in rows:
+            item = dict(row)
+            try:
+                item["moral_decision"] = json.loads(str(item.get("moral_decision_json") or "{}"))
+            except Exception:
+                item["moral_decision"] = {}
+            logs.append(item)
+        return logs
+
     # ─────────────────────────────────────────────────────────────
     # Objective Backlog  (3-tier: Epic > Story > Task)
     # ─────────────────────────────────────────────────────────────
@@ -326,16 +886,29 @@ class LedgerMemory:
         origin: str = "Admin",
         priority: int = 5,
         parent_id: Optional[int] = None,
+        depends_on_ids: Optional[List[int]] = None,
+        acceptance_criteria: str = "",
     ) -> int:
         """Insert a new Epic/Story/Task into the objective_backlog."""
         if tier not in ("Epic", "Story", "Task"):
             raise ValueError("tier must be Epic, Story, or Task")
+        depends_blob = self._serialize_depends_on_ids(depends_on_ids)
+        acceptance_text = str(acceptance_criteria or "").strip()
         async with self._lock:
             cursor = await self._db.execute(
                 "INSERT INTO objective_backlog "
-                "(tier, title, status, priority, estimated_energy, origin, parent_id) "
-                "VALUES (?, ?, 'pending', ?, ?, ?, ?)",
-                (tier, title, priority, estimated_energy, origin, parent_id),
+                "(tier, title, status, priority, estimated_energy, origin, parent_id, depends_on_ids, acceptance_criteria) "
+                "VALUES (?, ?, 'pending', ?, ?, ?, ?, ?, ?)",
+                (
+                    tier,
+                    title,
+                    priority,
+                    estimated_energy,
+                    origin,
+                    parent_id,
+                    depends_blob,
+                    acceptance_text,
+                ),
             )
             await self._db.commit()
             obj_id = cursor.lastrowid
@@ -343,23 +916,48 @@ class LedgerMemory:
         return obj_id
 
     async def get_highest_priority_task(self) -> Optional[dict]:
-        """Return the single highest-priority pending Task, or None."""
+        """Return the single highest-priority currently eligible pending Task, or None."""
         async with self._lock:
             cursor = await self._db.execute(
                 "SELECT id, tier, title, status, priority, estimated_energy, "
-                "origin, parent_id, created_at FROM objective_backlog "
+                "origin, parent_id, depends_on_ids, acceptance_criteria, "
+                "defer_count, last_energy_eval_at, next_eligible_at, last_energy_eval_json, "
+                "created_at, updated_at "
+                "FROM objective_backlog "
                 "WHERE tier = 'Task' AND status = 'pending' "
+                "AND (next_eligible_at IS NULL OR datetime(next_eligible_at) <= CURRENT_TIMESTAMP) "
                 "ORDER BY priority ASC, estimated_energy ASC LIMIT 1"
             )
             row = await cursor.fetchone()
-        return dict(row) if row else None
+        return self._normalize_objective_row(row) if row else None
 
     async def update_objective_status(self, obj_id: int, new_status: str) -> None:
-        """Update status of an objective. Valid: pending, active, completed, suspended."""
-        valid = {"pending", "active", "completed", "suspended"}
+        """Update status of an objective.
+
+        Valid states: pending, active, completed, suspended, blocked,
+        deferred_due_to_energy.
+        """
+        valid = {
+            "pending",
+            "active",
+            "completed",
+            "suspended",
+            "blocked",
+            "deferred_due_to_energy",
+        }
         if new_status not in valid:
             raise ValueError(f"status must be one of {valid}")
+
+        tier = ""
         async with self._lock:
+            row_cursor = await self._db.execute(
+                "SELECT tier FROM objective_backlog WHERE id = ?",
+                (obj_id,),
+            )
+            row = await row_cursor.fetchone()
+            if row is not None:
+                tier = str(row["tier"] or "")
+
             await self._db.execute(
                 "UPDATE objective_backlog SET status = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
                 (new_status, obj_id),
@@ -367,16 +965,404 @@ class LedgerMemory:
             await self._db.commit()
         logger.info(f"Objective {obj_id} status -> {new_status}")
 
+        # GoalStateReducer: when a Task completes, evaluate Story/Epic completion bottom-up.
+        if tier == "Task" and new_status == "completed":
+            await self.reduce_goal_state_from_task_completion(obj_id)
+
+    async def record_task_energy_evaluation(
+        self,
+        task_id: int,
+        evaluation_payload: Dict[str, Any],
+        *,
+        clear_next_eligible: bool = False,
+    ) -> None:
+        """Persist latest energy evaluation metadata for a Task."""
+        payload_json = json.dumps(dict(evaluation_payload or {}), sort_keys=True)
+        async with self._lock:
+            if clear_next_eligible:
+                await self._db.execute(
+                    "UPDATE objective_backlog "
+                    "SET last_energy_eval_at = CURRENT_TIMESTAMP, "
+                    "last_energy_eval_json = ?, "
+                    "next_eligible_at = NULL, "
+                    "updated_at = CURRENT_TIMESTAMP "
+                    "WHERE id = ? AND tier = 'Task'",
+                    (payload_json, task_id),
+                )
+            else:
+                await self._db.execute(
+                    "UPDATE objective_backlog "
+                    "SET last_energy_eval_at = CURRENT_TIMESTAMP, "
+                    "last_energy_eval_json = ?, "
+                    "updated_at = CURRENT_TIMESTAMP "
+                    "WHERE id = ? AND tier = 'Task'",
+                    (payload_json, task_id),
+                )
+            await self._db.commit()
+
+    async def defer_task_due_to_energy(
+        self,
+        task_id: int,
+        evaluation_payload: Dict[str, Any],
+        *,
+        cooldown_seconds: int,
+    ) -> None:
+        """Mark Task as deferred_due_to_energy and schedule next eligibility."""
+        payload_json = json.dumps(dict(evaluation_payload or {}), sort_keys=True)
+        cooldown = max(0, int(cooldown_seconds))
+        cooldown_sql = f"+{cooldown} seconds"
+
+        async with self._lock:
+            await self._db.execute(
+                "UPDATE objective_backlog "
+                "SET status = 'deferred_due_to_energy', "
+                "defer_count = COALESCE(defer_count, 0) + 1, "
+                "last_energy_eval_at = CURRENT_TIMESTAMP, "
+                "next_eligible_at = datetime(CURRENT_TIMESTAMP, ?), "
+                "last_energy_eval_json = ?, "
+                "updated_at = CURRENT_TIMESTAMP "
+                "WHERE id = ? AND tier = 'Task'",
+                (cooldown_sql, payload_json, task_id),
+            )
+            await self._db.commit()
+
+    async def reduce_goal_state_from_task_completion(self, task_id: int) -> None:
+        """Bottom-up reducer: Task completion may complete parent Story and parent Epic."""
+        async with self._lock:
+            cursor = await self._db.execute(
+                "SELECT parent_id FROM objective_backlog WHERE id = ? AND tier = 'Task'",
+                (task_id,),
+            )
+            task_row = await cursor.fetchone()
+            if task_row is None:
+                return
+
+            story_id = task_row["parent_id"]
+            if story_id is None:
+                return
+
+            child_task_cursor = await self._db.execute(
+                "SELECT status FROM objective_backlog WHERE tier='Task' AND parent_id = ?",
+                (story_id,),
+            )
+            child_task_rows = await child_task_cursor.fetchall()
+            if not child_task_rows:
+                return
+
+            story_complete = all(str(row["status"]) == "completed" for row in child_task_rows)
+            if not story_complete:
+                return
+
+            await self._db.execute(
+                "UPDATE objective_backlog "
+                "SET status = 'completed', updated_at = CURRENT_TIMESTAMP "
+                "WHERE id = ?",
+                (story_id,),
+            )
+
+            story_cursor = await self._db.execute(
+                "SELECT parent_id FROM objective_backlog WHERE id = ? AND tier = 'Story'",
+                (story_id,),
+            )
+            story_row = await story_cursor.fetchone()
+            epic_id = story_row["parent_id"] if story_row else None
+
+            if epic_id is not None:
+                child_story_cursor = await self._db.execute(
+                    "SELECT status FROM objective_backlog WHERE tier='Story' AND parent_id = ?",
+                    (epic_id,),
+                )
+                child_story_rows = await child_story_cursor.fetchall()
+                epic_complete = bool(child_story_rows) and all(
+                    str(row["status"]) == "completed" for row in child_story_rows
+                )
+                if epic_complete:
+                    await self._db.execute(
+                        "UPDATE objective_backlog "
+                        "SET status = 'completed', updated_at = CURRENT_TIMESTAMP "
+                        "WHERE id = ?",
+                        (epic_id,),
+                    )
+
+            await self._db.commit()
+
+    async def ensure_parent_chain_active(self, task_id: int) -> None:
+        """Ensure parent Story/Epic stay active while a blocked Task awaits remediation."""
+        async with self._lock:
+            cursor = await self._db.execute(
+                "SELECT parent_id FROM objective_backlog WHERE id = ? AND tier = 'Task'",
+                (task_id,),
+            )
+            task_row = await cursor.fetchone()
+            if task_row is None:
+                return
+
+            story_id = task_row["parent_id"]
+            if story_id is None:
+                return
+
+            story_cursor = await self._db.execute(
+                "SELECT parent_id FROM objective_backlog WHERE id = ? AND tier = 'Story'",
+                (story_id,),
+            )
+            story_row = await story_cursor.fetchone()
+            epic_id = story_row["parent_id"] if story_row else None
+
+            await self._db.execute(
+                "UPDATE objective_backlog "
+                "SET status = 'active', updated_at = CURRENT_TIMESTAMP "
+                "WHERE id = ? AND status != 'suspended'",
+                (story_id,),
+            )
+            if epic_id is not None:
+                await self._db.execute(
+                    "UPDATE objective_backlog "
+                    "SET status = 'active', updated_at = CURRENT_TIMESTAMP "
+                    "WHERE id = ? AND status != 'suspended'",
+                    (epic_id,),
+                )
+
+            await self._db.commit()
+
     async def get_all_active_goals(self) -> List[dict]:
         """Return all non-completed, non-suspended objectives grouped by tier."""
         async with self._lock:
             cursor = await self._db.execute(
-                "SELECT id, tier, title, status, priority, estimated_energy, origin, parent_id, created_at "
+                "SELECT id, tier, title, status, priority, estimated_energy, origin, parent_id, "
+                "depends_on_ids, acceptance_criteria, defer_count, last_energy_eval_at, "
+                "next_eligible_at, last_energy_eval_json, created_at, updated_at "
                 "FROM objective_backlog WHERE status NOT IN ('completed', 'suspended') "
                 "ORDER BY CASE tier WHEN 'Epic' THEN 1 WHEN 'Story' THEN 2 WHEN 'Task' THEN 3 END, priority ASC"
             )
             rows = await cursor.fetchall()
-        return [dict(r) for r in rows]
+        return [self._normalize_objective_row(r) for r in rows]
+
+    async def get_active_objective_tree(self, epic_id: Optional[int] = None) -> List[dict]:
+        """Return active Epic/Story/Task nodes, optionally scoped to one Epic subtree."""
+        select_fields = (
+            "id, tier, title, status, priority, estimated_energy, origin, parent_id, "
+            "depends_on_ids, acceptance_criteria, defer_count, last_energy_eval_at, "
+            "next_eligible_at, last_energy_eval_json, created_at, updated_at"
+        )
+        prefixed_child_fields = ", ".join(
+            f"child.{field.strip()}" for field in select_fields.split(",")
+        )
+        async with self._lock:
+            if epic_id is None:
+                cursor = await self._db.execute(
+                    "SELECT " + select_fields + " FROM objective_backlog "
+                    "WHERE status NOT IN ('completed', 'suspended') "
+                    "ORDER BY CASE tier WHEN 'Epic' THEN 1 WHEN 'Story' THEN 2 WHEN 'Task' THEN 3 END, "
+                    "priority ASC, id ASC"
+                )
+            else:
+                cursor = await self._db.execute(
+                    "WITH RECURSIVE objective_tree AS ("
+                    "  SELECT " + select_fields + " FROM objective_backlog WHERE id = ? "
+                    "  UNION ALL "
+                    "  SELECT " + prefixed_child_fields + " "
+                    "  FROM objective_backlog child "
+                    "  JOIN objective_tree parent ON child.parent_id = parent.id"
+                    ") "
+                    "SELECT " + select_fields + " FROM objective_tree "
+                    "WHERE status NOT IN ('completed', 'suspended') "
+                    "ORDER BY CASE tier WHEN 'Epic' THEN 1 WHEN 'Story' THEN 2 WHEN 'Task' THEN 3 END, "
+                    "priority ASC, id ASC",
+                    (epic_id,),
+                )
+            rows = await cursor.fetchall()
+        return [self._normalize_objective_row(row) for row in rows]
+
+    async def get_unresolved_depends_on_ids(self, task_id: int) -> List[int]:
+        """Return dependency IDs that are not yet completed for a Task."""
+        async with self._lock:
+            cursor = await self._db.execute(
+                "SELECT id, tier, depends_on_ids FROM objective_backlog WHERE id = ?",
+                (task_id,),
+            )
+            row = await cursor.fetchone()
+            if row is None:
+                return []
+
+            if str(row["tier"]) != "Task":
+                return []
+
+            depends_on_ids = self._deserialize_depends_on_ids(row["depends_on_ids"])
+            if not depends_on_ids:
+                return []
+
+            placeholders = ",".join("?" for _ in depends_on_ids)
+            dep_cursor = await self._db.execute(
+                "SELECT id, status FROM objective_backlog WHERE id IN (" + placeholders + ")",
+                tuple(depends_on_ids),
+            )
+            dep_rows = await dep_cursor.fetchall()
+
+        status_by_id = {int(dep_row["id"]): str(dep_row["status"]) for dep_row in dep_rows}
+        unresolved = [
+            dep_id
+            for dep_id in depends_on_ids
+            if status_by_id.get(dep_id) != "completed"
+        ]
+        return unresolved
+
+    async def get_tasks_with_unresolved_dependencies(
+        self,
+        statuses: Optional[List[str]] = None,
+    ) -> List[dict]:
+        """Return Task rows that still have unresolved depends_on_ids."""
+        statuses = statuses or ["pending", "active"]
+        if not statuses:
+            return []
+
+        placeholders = ",".join("?" for _ in statuses)
+        async with self._lock:
+            cursor = await self._db.execute(
+                "SELECT id, tier, title, status, parent_id, depends_on_ids, acceptance_criteria "
+                "FROM objective_backlog WHERE tier='Task' AND status IN (" + placeholders + ")",
+                tuple(statuses),
+            )
+            task_rows = await cursor.fetchall()
+
+            status_cursor = await self._db.execute(
+                "SELECT id, status FROM objective_backlog"
+            )
+            all_status_rows = await status_cursor.fetchall()
+
+        status_by_id = {int(item["id"]): str(item["status"]) for item in all_status_rows}
+        unresolved_tasks: List[dict] = []
+        for row in task_rows:
+            normalized = self._normalize_objective_row(row)
+            unresolved = [
+                dep_id
+                for dep_id in normalized["depends_on_ids"]
+                if status_by_id.get(dep_id) != "completed"
+            ]
+            if unresolved:
+                normalized["unresolved_depends_on_ids"] = unresolved
+                unresolved_tasks.append(normalized)
+
+        return unresolved_tasks
+
+    async def get_task_with_parent_context(self, task_id: int) -> Optional[dict]:
+        """Return one Task with its parent Story and Epic context for energy evaluation."""
+        query = self._objective_energy_context_query("task.tier = 'Task' AND task.id = ?")
+        async with self._lock:
+            cursor = await self._db.execute(query, (task_id,))
+            row = await cursor.fetchone()
+        if row is None:
+            return None
+        return self._normalize_energy_context_row(row)
+
+    async def get_energy_evaluation_candidates(
+        self,
+        statuses: Optional[List[str]] = None,
+    ) -> List[dict]:
+        """Return energy-eligible Task candidates with parent Story/Epic context."""
+        statuses = statuses or ["pending", "deferred_due_to_energy"]
+        if not statuses:
+            return []
+
+        placeholders = ",".join("?" for _ in statuses)
+        where_clause = (
+            "task.tier = 'Task' AND task.status IN (" + placeholders + ") "
+            "AND (task.next_eligible_at IS NULL OR datetime(task.next_eligible_at) <= CURRENT_TIMESTAMP)"
+        )
+        query = self._objective_energy_context_query(where_clause)
+        query += " ORDER BY task.priority ASC, task.estimated_energy ASC, task.id ASC"
+
+        async with self._lock:
+            cursor = await self._db.execute(query, tuple(statuses))
+            rows = await cursor.fetchall()
+
+        return [self._normalize_energy_context_row(row) for row in rows]
+
+    async def get_objective_hierarchy_rollup(self, epic_id: Optional[int] = None) -> List[dict]:
+        """Return roll-up completion/status summaries for Epic and Story tiers."""
+        select_fields = (
+            "id, tier, title, status, priority, parent_id, depends_on_ids, acceptance_criteria"
+        )
+        prefixed_child_fields = ", ".join(
+            f"child.{field.strip()}" for field in select_fields.split(",")
+        )
+        async with self._lock:
+            if epic_id is None:
+                cursor = await self._db.execute(
+                    "SELECT " + select_fields + " FROM objective_backlog"
+                )
+            else:
+                cursor = await self._db.execute(
+                    "WITH RECURSIVE objective_tree AS ("
+                    "  SELECT " + select_fields + " FROM objective_backlog WHERE id = ? "
+                    "  UNION ALL "
+                    "  SELECT " + prefixed_child_fields + " "
+                    "  FROM objective_backlog child "
+                    "  JOIN objective_tree parent ON child.parent_id = parent.id"
+                    ") "
+                    "SELECT " + select_fields + " FROM objective_tree",
+                    (epic_id,),
+                )
+            rows = await cursor.fetchall()
+
+        if not rows:
+            return []
+
+        nodes = {int(row["id"]): self._normalize_objective_row(row) for row in rows}
+        children = self._build_children_index(nodes)
+        memo: Dict[int, Dict[str, int]] = {}
+
+        rollups: List[dict] = []
+        for node_id, node in nodes.items():
+            tier = str(node.get("tier") or "")
+            if tier not in {"Epic", "Story"}:
+                continue
+
+            totals = self._aggregate_task_totals(node_id, nodes, children, memo)
+            total_tasks = totals["total"]
+            completed_tasks = totals["completed"]
+            pending_tasks = totals["pending"]
+            active_tasks = totals["active"]
+            suspended_tasks = totals["suspended"]
+
+            completion_ratio = (
+                float(completed_tasks) / float(total_tasks)
+                if total_tasks > 0 else 0.0
+            )
+            rolled_up_status = self._derive_rollup_status(
+                fallback_status=str(node.get("status") or "pending"),
+                total_tasks=total_tasks,
+                completed_tasks=completed_tasks,
+                pending_tasks=pending_tasks,
+                active_tasks=active_tasks,
+                suspended_tasks=suspended_tasks,
+            )
+
+            rollups.append(
+                {
+                    "id": node_id,
+                    "tier": tier,
+                    "title": str(node.get("title") or ""),
+                    "status": str(node.get("status") or ""),
+                    "rolled_up_status": rolled_up_status,
+                    "completion_ratio": completion_ratio,
+                    "total_tasks": total_tasks,
+                    "completed_tasks": completed_tasks,
+                    "pending_tasks": pending_tasks,
+                    "active_tasks": active_tasks,
+                    "suspended_tasks": suspended_tasks,
+                    "priority": int(node.get("priority") or 0),
+                    "parent_id": node.get("parent_id"),
+                }
+            )
+
+        return sorted(
+            rollups,
+            key=lambda item: (
+                0 if item["tier"] == "Epic" else 1,
+                item["priority"],
+                item["id"],
+            ),
+        )
 
     async def seed_initial_goals(self) -> None:
         """Populate the backlog with initial Tasks if it is currently empty."""
@@ -562,6 +1548,251 @@ class LedgerMemory:
                 "DELETE FROM pending_tool_approvals WHERE user_id=?", (user_id,)
             )
             await self._db.commit()
+
+    # ─────────────────────────────────────────────────────────────
+    # Synthesis Run Audit (Phase 7)
+    # ─────────────────────────────────────────────────────────────
+
+    async def create_synthesis_run(
+        self,
+        *,
+        user_id: str,
+        gap_description: str,
+        suggested_tool_name: str,
+        original_input: str,
+        max_retries: int,
+    ) -> int:
+        """Create a new synthesis run record and return run_id."""
+        async with self._lock:
+            cursor = await self._db.execute(
+                "INSERT INTO synthesis_runs "
+                "(user_id, gap_description, suggested_tool_name, original_input, status, max_retries) "
+                "VALUES (?, ?, ?, ?, 'in_progress', ?)",
+                (
+                    str(user_id or ""),
+                    str(gap_description or ""),
+                    str(suggested_tool_name or ""),
+                    str(original_input or ""),
+                    max(1, int(max_retries or 1)),
+                ),
+            )
+            await self._db.commit()
+            return int(cursor.lastrowid)
+
+    @staticmethod
+    def _coerce_text(value: Any, default: str = "") -> str:
+        if value is None:
+            return default
+        text = str(value)
+        return text if text else default
+
+    @staticmethod
+    def _coerce_int(value: Any, default: int = 0) -> int:
+        try:
+            if value is None or value == "":
+                return default
+            return int(value)
+        except (TypeError, ValueError):
+            return default
+
+    @staticmethod
+    def _build_synthesis_attempt_insert_values(
+        *,
+        run_id: int,
+        attempt_number: int,
+        phase: str,
+        synthesis_payload: Dict[str, Any],
+        self_test_result: Dict[str, Any],
+        code_sha256: str,
+    ) -> tuple[Any, ...]:
+        payload = dict(synthesis_payload or {})
+        result = dict(self_test_result or {})
+        synthesis_json = json.dumps(payload, sort_keys=True)
+        phase_name = LedgerMemory._coerce_text(phase, "synthesis")
+        tool_name = LedgerMemory._coerce_text(payload.get("tool_name"))
+        status = LedgerMemory._coerce_text(result.get("status"), "failed")
+        duration_ms = LedgerMemory._coerce_int(result.get("duration_ms"))
+        passed_count = LedgerMemory._coerce_int(result.get("passed"))
+        failed_count = LedgerMemory._coerce_int(result.get("failed"))
+        error_count = LedgerMemory._coerce_int(result.get("errors"))
+        skipped_count = LedgerMemory._coerce_int(result.get("skipped"))
+        error_message = LedgerMemory._coerce_text(result.get("error"))
+        stdout_text = LedgerMemory._coerce_text(result.get("stdout"))
+        stderr_text = LedgerMemory._coerce_text(result.get("stderr"))
+        digest = LedgerMemory._coerce_text(code_sha256)
+        return (
+            int(run_id),
+            max(1, int(attempt_number)),
+            phase_name,
+            tool_name,
+            status,
+            1 if bool(result.get("timed_out")) else 0,
+            result.get("exit_code"),
+            duration_ms,
+            passed_count,
+            failed_count,
+            error_count,
+            skipped_count,
+            error_message,
+            stdout_text,
+            stderr_text,
+            digest,
+            synthesis_json,
+        )
+
+    async def _resolve_synthesis_attempt_id(self, run_id: int, attempt_number: int) -> int:
+        lookup = await self._db.execute(
+            "SELECT id FROM synthesis_attempts WHERE run_id = ? AND attempt_number = ?",
+            (int(run_id), max(1, int(attempt_number))),
+        )
+        row = await lookup.fetchone()
+        return int(row["id"]) if row is not None else 0
+
+    async def append_synthesis_attempt(
+        self,
+        *,
+        run_id: int,
+        attempt_number: int,
+        phase: str,
+        synthesis_payload: Dict[str, Any],
+        self_test_result: Dict[str, Any],
+        code_sha256: str,
+    ) -> int:
+        """Insert or update one synthesis attempt row for a run."""
+        values = self._build_synthesis_attempt_insert_values(
+            run_id=run_id,
+            attempt_number=attempt_number,
+            phase=phase,
+            synthesis_payload=synthesis_payload,
+            self_test_result=self_test_result,
+            code_sha256=code_sha256,
+        )
+
+        async with self._lock:
+            cursor = await self._db.execute(
+                "INSERT INTO synthesis_attempts "
+                "(run_id, attempt_number, phase, tool_name, status, timed_out, exit_code, duration_ms, "
+                "passed_count, failed_count, error_count, skipped_count, error_message, stdout_text, stderr_text, "
+                "code_sha256, synthesis_json) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
+                "ON CONFLICT(run_id, attempt_number) DO UPDATE SET "
+                "phase=excluded.phase, tool_name=excluded.tool_name, status=excluded.status, "
+                "timed_out=excluded.timed_out, exit_code=excluded.exit_code, duration_ms=excluded.duration_ms, "
+                "passed_count=excluded.passed_count, failed_count=excluded.failed_count, "
+                "error_count=excluded.error_count, skipped_count=excluded.skipped_count, "
+                "error_message=excluded.error_message, stdout_text=excluded.stdout_text, "
+                "stderr_text=excluded.stderr_text, code_sha256=excluded.code_sha256, "
+                "synthesis_json=excluded.synthesis_json, created_at=CURRENT_TIMESTAMP",
+                values,
+            )
+            await self._db.commit()
+
+            if cursor.lastrowid:
+                return int(cursor.lastrowid)
+            return await self._resolve_synthesis_attempt_id(run_id, attempt_number)
+
+    async def update_synthesis_run_status(
+        self,
+        run_id: int,
+        *,
+        status: str,
+        total_attempts: Optional[int] = None,
+        successful_attempt: Optional[int] = None,
+        final_tool_name: Optional[str] = None,
+        code_sha256: Optional[str] = None,
+        test_summary: Optional[str] = None,
+        blocked_reason: Optional[str] = None,
+        synthesis_payload: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        """Update synthesis run state and optional final metadata."""
+        set_clauses = ["status = ?", "updated_at = CURRENT_TIMESTAMP"]
+        params: List[Any] = [str(status or "in_progress")]
+
+        if total_attempts is not None:
+            set_clauses.append("total_attempts = ?")
+            params.append(max(0, int(total_attempts)))
+        if successful_attempt is not None:
+            set_clauses.append("successful_attempt = ?")
+            params.append(int(successful_attempt))
+        if final_tool_name is not None:
+            set_clauses.append("final_tool_name = ?")
+            params.append(str(final_tool_name or ""))
+        if code_sha256 is not None:
+            set_clauses.append("code_sha256 = ?")
+            params.append(str(code_sha256 or ""))
+        if test_summary is not None:
+            set_clauses.append("test_summary = ?")
+            params.append(str(test_summary or ""))
+        if blocked_reason is not None:
+            set_clauses.append("blocked_reason = ?")
+            params.append(str(blocked_reason or ""))
+        if synthesis_payload is not None:
+            set_clauses.append("synthesis_json = ?")
+            params.append(json.dumps(dict(synthesis_payload or {}), sort_keys=True))
+
+        params.append(int(run_id))
+        async with self._lock:
+            await self._db.execute(
+                f"UPDATE synthesis_runs SET {', '.join(set_clauses)} WHERE id = ?",
+                tuple(params),
+            )
+            await self._db.commit()
+
+    async def get_synthesis_run(self, run_id: int) -> Optional[Dict[str, Any]]:
+        """Return one synthesis run by ID, including decoded synthesis payload."""
+        async with self._lock:
+            cursor = await self._db.execute(
+                "SELECT id, user_id, gap_description, suggested_tool_name, original_input, status, "
+                "final_tool_name, total_attempts, successful_attempt, max_retries, code_sha256, "
+                "test_summary, blocked_reason, synthesis_json, created_at, updated_at "
+                "FROM synthesis_runs WHERE id = ?",
+                (int(run_id),),
+            )
+            row = await cursor.fetchone()
+        if row is None:
+            return None
+
+        result = dict(row)
+        try:
+            result["synthesis"] = json.loads(str(result.get("synthesis_json") or "{}"))
+        except Exception:
+            result["synthesis"] = {}
+        return result
+
+    async def get_synthesis_attempts(self, run_id: int) -> List[Dict[str, Any]]:
+        """Return all synthesis attempts for a run ordered by attempt number."""
+        async with self._lock:
+            cursor = await self._db.execute(
+                "SELECT id, run_id, attempt_number, phase, tool_name, status, timed_out, exit_code, "
+                "duration_ms, passed_count, failed_count, error_count, skipped_count, error_message, "
+                "stdout_text, stderr_text, code_sha256, synthesis_json, created_at "
+                "FROM synthesis_attempts WHERE run_id = ? ORDER BY attempt_number ASC",
+                (int(run_id),),
+            )
+            rows = await cursor.fetchall()
+
+        attempts: List[Dict[str, Any]] = []
+        for row in rows:
+            item = dict(row)
+            item["timed_out"] = bool(item.get("timed_out"))
+            try:
+                item["synthesis"] = json.loads(str(item.get("synthesis_json") or "{}"))
+            except Exception:
+                item["synthesis"] = {}
+            attempts.append(item)
+        return attempts
+
+    async def get_latest_synthesis_run_for_user(self, user_id: str) -> Optional[Dict[str, Any]]:
+        """Return the most recent synthesis run for a user."""
+        async with self._lock:
+            cursor = await self._db.execute(
+                "SELECT id FROM synthesis_runs WHERE user_id = ? ORDER BY created_at DESC, id DESC LIMIT 1",
+                (str(user_id or ""),),
+            )
+            row = await cursor.fetchone()
+        if row is None:
+            return None
+        return await self.get_synthesis_run(int(row["id"]))
 
     # ─────────────────────────────────────────────────────────────
     # HITL State Persistence  (survive bot restarts)

@@ -103,6 +103,20 @@ _BLOCKED_TOP_LEVEL_MODULES = {
     "ast",          # can parse/compile/reconstruct blocked expressions at runtime
 }
 
+# Generated pytest scripts are intentionally constrained to a tight import
+# allowlist. They may import the generated module itself, pytest, and unittest.mock.
+_ALLOWED_PYTEST_TOP_LEVEL_MODULES = {
+    "pytest",
+    "unittest",
+    "asyncio",
+    "json",
+    "re",
+    "math",
+    "typing",
+    "collections",
+    "dataclasses",
+}
+
 _BLOCKED_DUNDER_ATTRIBUTES = {
     "__import__", "__loader__", "__builtins__", "__code__",
     "__globals__", "__subclasses__", "__mro__", "__dict__",
@@ -1363,7 +1377,8 @@ class CognitiveRouter:
         """
         Ask System 2 to draft a new Python tool for a capability gap.
 
-        Returns a dict with keys: tool_name, description, code, schema_json.
+        Returns a dict with keys: tool_name, description, code, schema_json,
+        pytest_code, test_manifest_json.
         Raises RuntimeError if System 2 is unavailable or parsing fails.
         """
         logger.info(f"Synthesising tool for gap: {gap_description!r}")
@@ -1404,6 +1419,29 @@ TOOL_SCHEMA:
   }}
 }}
 ```
+PYTEST_CODE:
+```python
+import pytest
+from unittest.mock import AsyncMock, patch
+from {suggested_tool_name} import {suggested_tool_name}
+
+
+@pytest.mark.asyncio
+async def test_{suggested_tool_name}_basic():
+        result = await {suggested_tool_name}()
+        assert isinstance(result, str)
+```
+TEST_MANIFEST:
+```json
+{{
+    "version": "synthesis_contract_v2",
+    "test_targets": ["{suggested_tool_name}"],
+    "cases": [
+        "happy_path"
+    ],
+    "notes": "Generated tests must be deterministic and side-effect free."
+}}
+```
 
 Rules:
 - Only use Python standard library (no pip installs).
@@ -1411,6 +1449,8 @@ Rules:
 - Must return a plain string.
 - No file writes, no network calls to external services unless the gap explicitly requires it.
 - Parameters dict may have properties if the tool needs arguments; otherwise keep empty.
+- Tests must be deterministic and must not perform file writes, shell execution, or network access.
+- Test imports are restricted to pytest, unittest.mock, and the generated tool module.
 """
 
         messages = [
@@ -1419,14 +1459,155 @@ Rules:
         ]
 
         raw_result = await self.route_to_system_2(messages)
-        return self._parse_synthesis_output(raw_result.content, suggested_tool_name)
+        parsed = self._parse_synthesis_output(raw_result.content, suggested_tool_name)
+        # Fail closed: both tool and generated pytest code must pass AST checks.
+        self._validate_tool_code_ast(parsed["code"], parsed["tool_name"])
+        self._validate_pytest_code_ast(parsed["pytest_code"], parsed["tool_name"])
+        return parsed
+
+    async def repair_synthesized_tool(
+        self,
+        *,
+        gap_description: str,
+        suggested_tool_name: str,
+        user_query: str,
+        previous_tool_name: str,
+        previous_code: str,
+        previous_pytest_code: str,
+        failure_summary: str,
+        failure_trace: str,
+    ) -> Dict[str, str]:
+        """Ask System 2 to repair a synthesized tool that failed sandbox tests."""
+        logger.info(
+            "Repairing synthesized tool '%s' for gap: %r",
+            previous_tool_name,
+            gap_description,
+        )
+
+        repair_prompt = f"""You are the Tool Repair Engine for a local autonomous AI agent.
+
+The previous synthesized candidate failed sandboxed pytest execution and must be repaired.
+
+Capability context:
+  Gap: {gap_description}
+  Suggested tool name: {suggested_tool_name}
+  Original user query: {user_query}
+
+Failed candidate:
+  Tool name: {previous_tool_name}
+
+BROKEN_TOOL_CODE:
+```python
+{previous_code}
+```
+
+BROKEN_PYTEST_CODE:
+```python
+{previous_pytest_code}
+```
+
+Failure summary:
+{failure_summary}
+
+Failure trace:
+```text
+{failure_trace}
+```
+
+Return a corrected candidate using STRICT OUTPUT FORMAT (exact delimiters, no extra text):
+
+TOOL_NAME: {suggested_tool_name}
+DESCRIPTION: <one-sentence description>
+PYTHON_CODE:
+```python
+import asyncio
+async def {suggested_tool_name}() -> str:
+    \"\"\"Docstring here.\"\"\"
+    try:
+        return "result string"
+    except Exception as e:
+        return f"Error: {{e}}"
+```
+TOOL_SCHEMA:
+```json
+{{
+  "name": "{suggested_tool_name}",
+  "description": "<same one-sentence description>",
+  "parameters": {{
+    "type": "object",
+    "properties": {{}},
+    "required": []
+  }}
+}}
+```
+PYTEST_CODE:
+```python
+import pytest
+from unittest.mock import AsyncMock, patch
+from {suggested_tool_name} import {suggested_tool_name}
+
+
+@pytest.mark.asyncio
+async def test_{suggested_tool_name}_basic():
+    result = await {suggested_tool_name}()
+    assert isinstance(result, str)
+```
+TEST_MANIFEST:
+```json
+{{
+  "version": "synthesis_contract_v2",
+  "test_targets": ["{suggested_tool_name}"],
+  "cases": [
+    "happy_path"
+  ],
+  "notes": "Repaired candidate after sandbox failure."
+}}
+```
+
+Rules:
+- Only use Python standard library (no pip installs).
+- Function must be async and return plain string.
+- No file writes, no shell execution, no external network calls unless gap explicitly requires it.
+- Tests must be deterministic and side-effect free.
+- Test imports are restricted to pytest, unittest.mock, and the generated tool module.
+"""
+
+        messages = [
+            {
+                "role": "system",
+                "content": "You are a strict code-repair engine. Follow the output format exactly.",
+            },
+            {"role": "user", "content": repair_prompt},
+        ]
+
+        raw_result = await self.route_to_system_2(messages)
+        parsed = self._parse_synthesis_output(raw_result.content, suggested_tool_name)
+        self._validate_tool_code_ast(parsed["code"], parsed["tool_name"])
+        self._validate_pytest_code_ast(parsed["pytest_code"], parsed["tool_name"])
+        return parsed
 
     @staticmethod
     def _parse_synthesis_output(raw: str, fallback_name: str) -> Dict[str, str]:
-        """Extract tool_name, description, code, and schema_json from synthesis output."""
+        """Extract v2 synthesis artifacts from the model output.
+
+        Required fields:
+          - tool_name
+          - description
+          - code
+          - schema_json
+          - pytest_code
+          - test_manifest_json
+        """
         import json as _json
 
-        result = {"tool_name": fallback_name, "description": "", "code": "", "schema_json": ""}
+        result = {
+            "tool_name": fallback_name,
+            "description": "",
+            "code": "",
+            "schema_json": "",
+            "pytest_code": "",
+            "test_manifest_json": "",
+        }
 
         # tool_name
         m = re.search(r'TOOL_NAME:\s*(\S+)', raw)
@@ -1448,18 +1629,40 @@ Rules:
         if m:
             schema_str = m.group(1).strip()
             try:
-                _json.loads(schema_str)  # validate
+                schema_obj = _json.loads(schema_str)
+                if not isinstance(schema_obj, dict):
+                    raise _json.JSONDecodeError("schema must be a JSON object", schema_str, 0)
                 result["schema_json"] = schema_str
             except _json.JSONDecodeError:
-                logger.warning("Synthesis: schema JSON invalid — using minimal fallback")
-                result["schema_json"] = _json.dumps({
-                    "name": result["tool_name"],
-                    "description": result["description"],
-                    "parameters": {"type": "object", "properties": {}, "required": []}
-                })
+                raise RuntimeError("Tool synthesis failed: TOOL_SCHEMA must be valid JSON object.")
 
+        # pytest code block
+        m = re.search(r'PYTEST_CODE:\s*```python\s*(.*?)```', raw, re.DOTALL)
+        if m:
+            result["pytest_code"] = m.group(1).strip()
+
+        # test manifest block
+        m = re.search(r'TEST_MANIFEST:\s*```json\s*(.*?)```', raw, re.DOTALL)
+        if m:
+            manifest_str = m.group(1).strip()
+            try:
+                manifest_obj = _json.loads(manifest_str)
+            except _json.JSONDecodeError as exc:
+                raise RuntimeError("Tool synthesis failed: TEST_MANIFEST must be valid JSON object.") from exc
+            if not isinstance(manifest_obj, dict):
+                raise RuntimeError("Tool synthesis failed: TEST_MANIFEST must be a JSON object.")
+            result["test_manifest_json"] = manifest_str
+
+        if not result["description"]:
+            raise RuntimeError("Tool synthesis failed: DESCRIPTION field missing.")
         if not result["code"]:
             raise RuntimeError(f"Tool synthesis failed: no Python code block found in output.\nRaw:\n{raw[:500]}")
+        if not result["schema_json"]:
+            raise RuntimeError("Tool synthesis failed: TOOL_SCHEMA block missing.")
+        if not result["pytest_code"]:
+            raise RuntimeError("Tool synthesis failed: PYTEST_CODE block missing.")
+        if not result["test_manifest_json"]:
+            raise RuntimeError("Tool synthesis failed: TEST_MANIFEST block missing.")
 
         return result
 
@@ -1482,6 +1685,47 @@ Rules:
         if isinstance(node, ast.ImportFrom) and node.module:
             CognitiveRouter._check_blocked_import(node.module, tool_name)
             return True
+        return False
+
+    @staticmethod
+    def _check_pytest_import(module_name: str, tool_name: str) -> None:
+        """Validate generated pytest imports with an explicit allowlist."""
+        base = module_name.split(".")[0]
+        if base in _BLOCKED_TOP_LEVEL_MODULES:
+            raise ValueError(
+                f"Synthesised pytest for '{tool_name}' imports blocked module '{module_name}'. "
+                f"Blocked modules: {sorted(_BLOCKED_TOP_LEVEL_MODULES)}"
+            )
+
+        if base == tool_name:
+            return
+
+        if module_name == "unittest.mock":
+            return
+
+        if base not in _ALLOWED_PYTEST_TOP_LEVEL_MODULES:
+            raise ValueError(
+                f"Synthesised pytest for '{tool_name}' imports non-allowlisted module '{module_name}'. "
+                f"Allowed modules: pytest, unittest.mock, {tool_name}"
+            )
+
+    @staticmethod
+    def _validate_pytest_import_node(node: ast.AST, tool_name: str) -> bool:
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                CognitiveRouter._check_pytest_import(alias.name, tool_name)
+            return True
+
+        if isinstance(node, ast.ImportFrom):
+            if node.module:
+                CognitiveRouter._check_pytest_import(node.module, tool_name)
+            for alias in node.names:
+                if alias.name == "*":
+                    raise ValueError(
+                        f"Synthesised pytest for '{tool_name}' uses wildcard import, which is not allowed."
+                    )
+            return True
+
         return False
 
     @staticmethod
@@ -1522,6 +1766,21 @@ Rules:
 
         for node in ast.walk(tree):
             if CognitiveRouter._validate_ast_import_node(node, tool_name):
+                continue
+            if CognitiveRouter._validate_ast_attribute_node(node, tool_name):
+                continue
+            CognitiveRouter._validate_ast_call_node(node, tool_name)
+
+    @staticmethod
+    def _validate_pytest_code_ast(pytest_code: str, tool_name: str) -> None:
+        """Parse and validate generated pytest code using strict sandbox checks."""
+        try:
+            tree = ast.parse(pytest_code)
+        except SyntaxError as exc:
+            raise ValueError(f"Synthesised pytest for '{tool_name}' has a syntax error: {exc}") from exc
+
+        for node in ast.walk(tree):
+            if CognitiveRouter._validate_pytest_import_node(node, tool_name):
                 continue
             if CognitiveRouter._validate_ast_attribute_node(node, tool_name):
                 continue

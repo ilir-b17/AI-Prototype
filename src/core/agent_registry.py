@@ -19,9 +19,11 @@ _FALLBACK_AGENT_DEFINITIONS = (
         ),
         system_prompt=(
             "You are the Research Agent. Search archival memory for relevant "
-            "context and provide findings."
+            "context and provide findings. If uncertainty is high or the task "
+            "needs deeper reasoning, call escalate_to_system_2 with a concise "
+            "problem description and scratchpad."
         ),
-        allowed_tools=["search_archival_memory"],
+        allowed_tools=["search_archival_memory", "escalate_to_system_2"],
         preferred_model="system_1",
         max_tool_calls=4,
         energy_cost=15,
@@ -33,7 +35,9 @@ _FALLBACK_AGENT_DEFINITIONS = (
             "memory updates, or structured execution after research is complete."
         ),
         system_prompt=(
-            "You are the Coder Agent. Execute coding tasks and update memory as needed."
+            "You are the Coder Agent. Execute coding tasks and update memory as needed. "
+            "Escalate early via escalate_to_system_2 when local reasoning is "
+            "insufficient for correctness."
         ),
         allowed_tools=[
             "update_ledger",
@@ -43,6 +47,7 @@ _FALLBACK_AGENT_DEFINITIONS = (
             "update_objective_status",
             "extract_pdf_text",
             "search_archival_memory",
+            "escalate_to_system_2",
         ],
         preferred_model="system_1",
         max_tool_calls=5,
