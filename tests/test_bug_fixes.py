@@ -10,6 +10,7 @@ Telegram, or SQLite instance.
 import asyncio
 import pytest
 import tempfile
+import time
 
 from unittest.mock import AsyncMock, MagicMock
 from src.core.llm_router import CognitiveRouter, RouterResult
@@ -510,6 +511,26 @@ class TestSystem1ConcurrencyGuard:
         assert metrics["waiting_requests"] == 0
 
 
+class TestSystem2AvailabilityDetection:
+    def test_ollama_cloud_provider_counts_as_available(self):
+        router = CognitiveRouter.__new__(CognitiveRouter)
+        router._system2_cooldown_until = 0.0
+        router.ollama_cloud_client = object()
+        router.groq_client = None
+        router.gemini_client = None
+
+        assert CognitiveRouter.get_system_2_available(router) is True
+
+    def test_cooldown_still_blocks_availability_even_when_provider_exists(self):
+        router = CognitiveRouter.__new__(CognitiveRouter)
+        router._system2_cooldown_until = time.time() + 30
+        router.ollama_cloud_client = object()
+        router.groq_client = None
+        router.gemini_client = None
+
+        assert CognitiveRouter.get_system_2_available(router) is False
+
+
 class TestCriticSkipForDirectSupervisorReplies:
     @pytest.mark.asyncio
     async def test_critic_skips_when_no_worker_outputs_exist(self):
@@ -642,6 +663,28 @@ class TestRequestAssessment:
         assessment = Orchestrator._assess_request_route(
             orchestrator,
             "Please analyze this PDF, summarize it, and then tell me what actions I should take next.",
+        )
+
+        assert assessment["mode"] == "graph"
+
+    def test_non_trivial_high_score_web_query_falls_back_to_graph(self):
+        orchestrator = Orchestrator.__new__(Orchestrator)
+        orchestrator.cognitive_router = MagicMock()
+        orchestrator.cognitive_router.registry.get_schemas.return_value = [
+            {
+                "name": "web_search",
+                "description": "Search the web for current information, weather, and news.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"query": {"type": "string"}, "max_results": {"type": "integer"}},
+                    "required": ["query"],
+                },
+            }
+        ]
+
+        assessment = Orchestrator._assess_request_route(
+            orchestrator,
+            "Can you search the latest weather trends in Vienna and then compare those with the past week?",
         )
 
         assert assessment["mode"] == "graph"

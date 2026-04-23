@@ -81,7 +81,8 @@ def build_supervisor_prompt(
         - If you can handle the request directly in chat: WORKERS: []
         - If you need to delegate to specialized agents, output JSON task packets using only agent names listed in <available_agents>.
         - Format delegated work as: WORKERS: [{{"agent": "agent_name", "task": "short concrete task", "reason": "why this agent is needed", "depends_on": ["upstream_agent"]}}]
-        - Each task must be specific to that agent. Do not output bare agent names unless you are falling back to the older format.
+        - Each task must be specific to that agent. Do not output bare agent names.
+        - WORKERS payload must be strict JSON with no trailing commentary after the closing bracket.
         - If multiple independent agents are needed but the user expects one polished final answer, add a final synthesis_agent task whose depends_on list names the upstream agents it must combine.
         </output_formatting>
     """)

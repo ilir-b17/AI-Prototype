@@ -175,6 +175,40 @@ def test_parse_supervisor_response_normalizes_task_packets():
     assert result["worker_outputs"]["supervisor_context"] == "Delegating now."
 
 
+def test_parse_supervisor_response_rejects_legacy_bare_worker_names():
+    orchestrator = Orchestrator.__new__(Orchestrator)
+    state = AgentState.new("user-1", "investigate this").to_dict()
+
+    result = Orchestrator._parse_supervisor_response(
+        orchestrator,
+        'Delegating now.\nWORKERS: ["research_agent"]',
+        state,
+    )
+
+    assert result["current_plan"] == []
+    assert result["final_response"] == "Delegating now."
+
+
+def test_parse_supervisor_response_handles_multiline_structured_payload():
+    orchestrator = Orchestrator.__new__(Orchestrator)
+    state = AgentState.new("user-1", "investigate this").to_dict()
+
+    response = (
+        "Delegating now.\n"
+        "WORKERS: [\n"
+        "  {\"agent\": \"research_agent\", \"task\": \"Find the root cause\", \"reason\": \"Need evidence first\"},\n"
+        "  {\"agent\": \"synthesis_agent\", \"task\": \"Combine findings\", \"reason\": \"Need one answer\", \"depends_on\": [\"research_agent\"]}\n"
+        "]"
+    )
+
+    result = Orchestrator._parse_supervisor_response(orchestrator, response, state)
+
+    assert result["current_plan"] == [
+        {"agent": "research_agent", "task": "Find the root cause", "reason": "Need evidence first", "depends_on": [], "preferred_model": ""},
+        {"agent": "synthesis_agent", "task": "Combine findings", "reason": "Need one answer", "depends_on": ["research_agent"], "preferred_model": ""},
+    ]
+
+
 def test_build_execution_plan_respects_task_packet_dependencies():
     orchestrator = Orchestrator.__new__(Orchestrator)
     orchestrator.agent_registry = AgentRegistry(agents_dir=Path("does-not-matter"))

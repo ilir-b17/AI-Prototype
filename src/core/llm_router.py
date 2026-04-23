@@ -1579,10 +1579,14 @@ Rules:
         return True
 
     def get_system_2_available(self) -> bool:
-        """True if any System 2 provider (Groq or Gemini) is configured."""
+        """True if any System 2 provider (Ollama Cloud, Groq, or Gemini) is configured."""
         if self._system2_cooldown_until and time.time() < self._system2_cooldown_until:
             return False
-        return self.groq_client is not None or self.gemini_client is not None
+        return (
+            self.ollama_cloud_client is not None
+            or self.groq_client is not None
+            or self.gemini_client is not None
+        )
 
     async def route_to_system_2(
         self,

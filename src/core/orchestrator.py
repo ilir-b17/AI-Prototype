@@ -79,6 +79,9 @@ _DIRECT_ROUTE_MAX_COMPLEXITY = 0
 _SINGLE_TOOL_MAX_COMPLEXITY = 2
 _SINGLE_TOOL_MIN_SCORE = 1.5
 _SINGLE_TOOL_MIN_MARGIN = 0.75
+_FAST_PATH_DIRECT_MAX_TOKENS = 12
+_FAST_PATH_SINGLE_TOOL_MAX_TOKENS = 14
+_FAST_PATH_SINGLE_TOOL_ALLOWLIST = frozenset({"get_system_info", "get_stock_price", "web_search"})
 _RECENT_CHAT_HISTORY_LIMIT = 12
 _CRITIC_SHORT_OUTPUT_THRESHOLD = 220
 _SYSTEM_2_ERROR_PREFIX = "[System 2 - Error]"
@@ -418,6 +421,48 @@ class Orchestrator:
             score += 0.25
         return score
 
+    @staticmethod
+    def _is_trivial_direct_intent(user_message: str) -> bool:
+        lowered = (user_message or "").strip().lower()
+        if not lowered:
+            return False
+
+        if re.fullmatch(
+            r"(?:hi|hello|hey)(?:\s+[a-z0-9]{1,20})?[!.? ]*|(?:thanks|thank you|ok|okay|good morning|good evening|good night)[!.? ]*",
+            lowered,
+        ):
+            return True
+
+        token_count = len(re.findall(_ROUTING_TOKEN_RE, lowered))
+        if token_count > _FAST_PATH_DIRECT_MAX_TOKENS:
+            return False
+
+        return bool(re.search(r"\b(what is|what's|who is|define|meaning of)\b", lowered))
+
+    @staticmethod
+    def _is_trivial_single_tool_intent(tool_name: str, user_message: str, complexity: int) -> bool:
+        if tool_name not in _FAST_PATH_SINGLE_TOOL_ALLOWLIST:
+            return False
+        if complexity > _SINGLE_TOOL_MAX_COMPLEXITY:
+            return False
+
+        lowered = (user_message or "").lower()
+        token_count = len(re.findall(_ROUTING_TOKEN_RE, lowered))
+        if token_count > _FAST_PATH_SINGLE_TOOL_MAX_TOKENS:
+            return False
+
+        if re.search(r"\b(and then|then|after|before|also|plus|compare|step|steps|plan)\b", lowered):
+            return False
+
+        if tool_name == "get_system_info":
+            return bool(re.search(r"\b(time|date|timezone|system info|system information|platform|cpu|memory|os)\b", lowered))
+        if tool_name == "get_stock_price":
+            return bool(re.search(r"\b(stock|price|quote|ticker|market)\b", lowered))
+        if tool_name == "web_search":
+            return bool(re.search(r"\b(weather|news|latest|current|today|now|headline|score)\b", lowered))
+
+        return False
+
     def _assess_request_route(
         self,
         user_message: str,
@@ -456,12 +501,14 @@ class Orchestrator:
         candidates.sort(key=lambda item: item["score"], reverse=True)
         top = candidates[0] if candidates else None
         next_score = candidates[1]["score"] if len(candidates) > 1 else 0.0
+        trivial_direct = self._is_trivial_direct_intent(routing_message)
 
         if (
             top
             and complexity <= _SINGLE_TOOL_MAX_COMPLEXITY
             and top["score"] >= _SINGLE_TOOL_MIN_SCORE
             and (top["score"] - next_score) >= _SINGLE_TOOL_MIN_MARGIN
+            and self._is_trivial_single_tool_intent(top["tool_name"], routing_message, complexity)
         ):
             return {
                 "mode": "single_tool",
@@ -470,7 +517,11 @@ class Orchestrator:
                 "arguments": top["arguments"],
             }
 
-        if complexity <= _DIRECT_ROUTE_MAX_COMPLEXITY and (not top or top["score"] < _SINGLE_TOOL_MIN_SCORE):
+        if (
+            trivial_direct
+            and complexity <= _DIRECT_ROUTE_MAX_COMPLEXITY
+            and (not top or top["score"] < _SINGLE_TOOL_MIN_SCORE)
+        ):
             return {"mode": "direct", "complexity": complexity}
 
         return {"mode": "graph", "complexity": complexity}
@@ -1500,34 +1551,75 @@ class Orchestrator:
             logger.error(f"System 2 raised an exception in supervisor: {s2_err!r}.", exc_info=True)
         return None
 
+    @staticmethod
+    def _extract_workers_payload(response: str) -> tuple[str, Optional[str]]:
+        marker = "WORKERS:"
+        if marker not in response:
+            return response.strip(), None
+
+        marker_index = response.rfind(marker)
+        answer = response[:marker_index].strip()
+        payload = response[marker_index + len(marker):].strip()
+        if payload.startswith("```"):
+            payload = re.sub(r"^```(?:json)?\s*", "", payload, flags=re.IGNORECASE)
+            payload = re.sub(r"\s*```$", "", payload).strip()
+        return answer, payload or None
+
+    @staticmethod
+    def _decode_workers_payload(workers_payload: str) -> Optional[Any]:
+        if not workers_payload:
+            return None
+        try:
+            decoded, end_index = json.JSONDecoder().raw_decode(workers_payload)
+        except ValueError:
+            return None
+
+        # If extra non-whitespace text appears after the JSON payload, reject it.
+        if workers_payload[end_index:].strip():
+            return None
+        return decoded
+
+    @staticmethod
+    def _is_structured_plan_packet(step: Any) -> bool:
+        if not isinstance(step, dict):
+            return False
+
+        agent_name = str(step.get("agent") or step.get("name") or "").strip()
+        if not agent_name:
+            return False
+
+        task = str(step.get("task") or step.get("instructions") or step.get("objective") or "").strip()
+        reason = str(step.get("reason") or step.get("why") or "").strip()
+        return bool(task or reason)
+
+    def _is_structured_plan_payload(self, payload: Any) -> bool:
+        if not isinstance(payload, list):
+            return False
+        return all(self._is_structured_plan_packet(step) for step in payload)
+
     def _parse_supervisor_response(self, response: str, state: Dict[str, Any]) -> Dict[str, Any]:
         """Parse the WORKERS tag from *response* and update *state* in-place."""
-        lines = response.strip().split("\n")
-        workers_payload = None
-        for line in reversed(lines[-3:]):
-            if "WORKERS:" in line:
-                workers_payload = line.split("WORKERS:", 1)[1].strip()
-                break
+        answer, workers_payload = self._extract_workers_payload(response.strip())
 
-        if not workers_payload:
+        if workers_payload is None:
             state["current_plan"] = []
-            state["final_response"] = response.strip()
+            state["final_response"] = answer or response.strip()
             return state
 
-        try:
-            plan = json.loads(workers_payload)
-            answer = "\n".join(ln for ln in lines if not re.search(r"WORKERS:\s*\[", ln)).strip()
-            normalized_plan = self._normalize_current_plan(plan if isinstance(plan, list) else [])
-            if normalized_plan:
-                state["current_plan"] = normalized_plan
-                if answer:
-                    state["worker_outputs"]["supervisor_context"] = answer
-            else:
-                state["current_plan"] = []
-                state["final_response"] = answer or response.strip()
-        except ValueError:
+        decoded_payload = self._decode_workers_payload(workers_payload)
+        if not self._is_structured_plan_payload(decoded_payload):
+            logger.warning("Supervisor produced invalid or non-structured WORKERS payload: %r", workers_payload)
             state["current_plan"] = []
-            answer = "\n".join(ln for ln in lines if not re.search(r"WORKERS:\s*\[", ln)).strip()
+            state["final_response"] = answer or response.strip()
+            return state
+
+        normalized_plan = self._normalize_current_plan(decoded_payload)
+        if normalized_plan:
+            state["current_plan"] = normalized_plan
+            if answer:
+                state["worker_outputs"]["supervisor_context"] = answer
+        else:
+            state["current_plan"] = []
             state["final_response"] = answer or response.strip()
         return state
 
