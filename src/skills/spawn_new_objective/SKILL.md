@@ -9,7 +9,7 @@ potentially executed autonomously by the heartbeat loop.
 ```json
 {
   "name": "spawn_new_objective",
-  "description": "Adds a new Epic, Story, or Task to the Objective Backlog. Use when you identify a sub-task needed to complete a broader goal.",
+  "description": "Adds a new goal, objective, Epic, Story, or Task to the Objective Backlog. Use when the Admin asks to add, create, define, or track a goal/objective, or when the system identifies new work that should be tracked.",
   "parameters": {
     "type": "object",
     "properties": {

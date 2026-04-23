@@ -32,7 +32,7 @@ async def execute_python_sandbox(code_string: str) -> str:
         timeout_seconds = 10.0
 
     tmp_dir_obj = tempfile.TemporaryDirectory()
-    process: asyncio.subprocess.Process = None
+    process = None
     try:
         temp_dir = tmp_dir_obj.name
         script_path = os.path.join(temp_dir, "sandbox_script.py")

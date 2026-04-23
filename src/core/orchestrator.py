@@ -57,6 +57,12 @@ _ROUTING_STOPWORDS = {
     "hello", "hey", "hi", "i", "in", "is", "it", "me", "my", "now", "of",
     "on", "or", "please", "right", "tell", "the", "this", "to", "today", "what",
     "would", "you", "your",
+    # Generic action verbs — too common to discriminate between tools
+    "get", "give", "find", "show", "fetch", "list", "like", "have", "has",
+    "want", "need", "also", "just", "did", "how",
+    # Common discourse words that appear in tool descriptions but carry no routing signal
+    "that", "which", "where", "when", "there", "then", "them", "they",
+    "these", "those", "with", "been", "will", "from", "use", "not",
 }
 _NON_UTILITY_TOOL_PREFIXES = ("update_", "request_", "spawn_", "run_", "execute_")
 _NON_UTILITY_TOOL_NAMES = {
@@ -64,7 +70,11 @@ _NON_UTILITY_TOOL_NAMES = {
     "consolidate_memory",
     "manage_file_system",
     "query_highest_priority_task",
+    # Archival memory search requires supervisor-level reasoning about WHEN to use it;
+    # auto-selecting it in fast-path on any message with 'memory' or 'information' is wrong.
+    "search_archival_memory",
 }
+_ROUTING_TOKEN_RE = r"[a-z0-9]+"
 _DIRECT_ROUTE_MAX_COMPLEXITY = 0
 _SINGLE_TOOL_MAX_COMPLEXITY = 2
 _SINGLE_TOOL_MIN_SCORE = 1.5
@@ -170,6 +180,11 @@ class Orchestrator:
         await self._load_pending_approvals()
         await self._load_pending_mfa()
         await self._load_pending_hitl()
+        if getattr(self.cognitive_router, "_preload_system_1_on_startup", False):
+            try:
+                await self.cognitive_router.preload_system_1()
+            except Exception as _preload_err:
+                logger.warning("System 1 preload skipped: %s", _preload_err)
         self._compiled_graph = build_orchestrator_graph(self)
         set_runtime_context(self.ledger_memory, self.core_memory)
         # Record the host OS now that we're in an async context
@@ -231,13 +246,13 @@ class Orchestrator:
     @staticmethod
     def _routing_keywords(text: str) -> set:
         return {
-            token for token in re.findall(r"[a-z0-9]+", (text or "").lower())
+            token for token in re.findall(_ROUTING_TOKEN_RE, (text or "").lower())
             if len(token) > 2 and token not in _ROUTING_STOPWORDS
         }
 
     def _estimate_request_complexity(self, text: str) -> int:
         lowered = (text or "").lower()
-        tokens = re.findall(r"[a-z0-9]+", lowered)
+        tokens = re.findall(_ROUTING_TOKEN_RE, lowered)
         score = 0
 
         if len(tokens) > 12:
@@ -269,7 +284,8 @@ class Orchestrator:
             return False
         if not required:
             return True
-        return required[0] in {"query", "url"}
+        # "ticker" is also handled by _prepare_utility_tool_arguments
+        return required[0] in {"query", "url", "ticker"}
 
     @staticmethod
     def _tool_schema_keywords(schema: Dict[str, Any]) -> Dict[str, set]:
@@ -286,10 +302,35 @@ class Orchestrator:
             "parameters": param_tokens,
         }
 
+    # Uppercase tokens that are common words, not ticker symbols.
+    _TICKER_STOPWORDS: frozenset = frozenset({
+        "A", "I", "AN", "AT", "BE", "BY", "DO", "GO", "IF", "IN", "IS", "IT",
+        "ME", "MY", "NO", "OF", "OK", "ON", "OR", "SO", "TO", "UP", "WE",
+        "AND", "ARE", "BUT", "CAN", "FOR", "GET", "HAS", "HIM", "HIS", "HOW",
+        "ITS", "MAY", "NOT", "NOW", "OFF", "OLD", "OUR", "OUT", "OWN", "THE",
+        "TOO", "TWO", "USE", "WAS", "WHO", "WHY", "YES", "YET", "YOU",
+        "ALSO", "BEEN", "BOTH", "DOES", "DONE", "EACH", "FROM", "GIVE",
+        "GOOD", "HAVE", "HERE", "HIGH", "JUST", "KNOW", "LAST", "LIKE", "LIVE",
+        "LONG", "LOOK", "MAKE", "MANY", "MORE", "MOST", "MUCH", "NEED", "NEXT",
+        "ONCE", "ONLY", "OPEN", "OVER", "PAST", "REAL", "SAME", "SEND", "SHOW",
+        "SOME", "SUCH", "SURE", "TAKE", "TELL", "THAN", "THAT", "THEM", "THEN",
+        "THEY", "THIS", "TIME", "TOLD", "VERY", "WANT", "WELL", "WERE", "WHAT",
+        "WHEN", "WITH", "WORK", "YEAR", "YOUR",
+    })
+
+    @staticmethod
+    def _extract_multiple_tickers(user_message: str) -> List[str]:
+        """Return all valid uppercase ticker symbols found in the message (2+ expected for multi-ticker path)."""
+        return [
+            tok for tok in re.findall(r'\b([A-Z]{1,5})\b', user_message)
+            if tok not in Orchestrator._TICKER_STOPWORDS
+        ]
+
     def _prepare_utility_tool_arguments(
         self,
         schema: Dict[str, Any],
         user_message: str,
+        chat_history: Optional[List[Dict[str, str]]] = None,
     ) -> Optional[Dict[str, Any]]:
         params = schema.get("parameters", {}) or {}
         properties = params.get("properties", {}) or {}
@@ -309,8 +350,26 @@ class Orchestrator:
                 user_message.strip(),
                 flags=re.IGNORECASE,
             ).strip(" ?!.,")
+            # Strip residual "you [action-verb] [for/about]?" prefix left after removing
+            # polite openers. e.g. "Can you search for X" → "you search for X" → "X"
+            cleaned = re.sub(
+                r"^you\s+(?:search|look|find|browse|check|tell|get|show|fetch|look up|search for)\s+(?:for\s+|about\s+|up\s+)?",
+                "",
+                cleaned,
+                flags=re.IGNORECASE,
+            ).strip(" ?!.,")
             if not cleaned:
                 cleaned = user_message.strip()
+            # If reduced to a bare action verb (e.g. "Please search" → "search"),
+            # look back at the last substantive user turn for the real topic.
+            _bare_verbs = {"search", "find", "look", "do", "go", "try", "run", "proceed", "continue"}
+            if cleaned.lower() in _bare_verbs and chat_history:
+                for turn in reversed(chat_history):
+                    if turn.get("role") == "user":
+                        prev = turn.get("content", "").strip()
+                        if len(prev) > 15:
+                            cleaned = prev
+                            break
             args = {"query": cleaned}
             if "max_results" in properties:
                 args["max_results"] = 3
@@ -321,6 +380,17 @@ class Orchestrator:
             if not url_match:
                 return None
             return {"url": url_match.group(0)}
+
+        if field_name == "ticker":
+            # Extract uppercase ticker symbols (1–5 chars), excluding common words.
+            candidates = [
+                tok for tok in re.findall(r'\b([A-Z]{1,5})\b', user_message)
+                if tok not in Orchestrator._TICKER_STOPWORDS
+            ]
+            if len(candidates) == 1:
+                return {"ticker": candidates[0]}
+            # Zero or multiple tickers: let the supervisor handle it.
+            return None
 
         return None
 
@@ -337,14 +407,29 @@ class Orchestrator:
             score += 0.25
         return score
 
-    def _assess_request_route(self, user_message: str) -> Dict[str, Any]:
+    def _assess_request_route(
+        self,
+        user_message: str,
+        chat_history: Optional[List[Dict[str, str]]] = None,
+    ) -> Dict[str, Any]:
         complexity = self._estimate_request_complexity(user_message)
+
+        # Multi-ticker: two or more valid stock symbols → sequential get_stock_price calls.
+        # Checked before general scoring so the supervisor never sees this pattern.
+        tickers = self._extract_multiple_tickers(user_message)
+        if len(tickers) >= 2:
+            return {
+                "mode": "multi_ticker",
+                "tickers": tickers,
+                "complexity": complexity,
+            }
+
         candidates = []
 
         for schema in self.cognitive_router.registry.get_schemas():
             if not self._is_utility_tool_schema(schema):
                 continue
-            arguments = self._prepare_utility_tool_arguments(schema, user_message)
+            arguments = self._prepare_utility_tool_arguments(schema, user_message, chat_history)
             if arguments is None:
                 continue
             score = self._score_tool_for_request(user_message, schema)
@@ -413,6 +498,16 @@ class Orchestrator:
             if raw_name:
                 updates["name"] = raw_name
 
+        identity_match = re.search(
+            r"(?:^|[.!?,]\s*)([a-z][a-z' -]{0,60})\s+is me\b(?=,|\.|!|\?|$)",
+            text,
+            flags=re.IGNORECASE,
+        )
+        if identity_match and "name" not in updates:
+            raw_name = Orchestrator._normalize_display_name(identity_match.group(1))
+            if raw_name:
+                updates["name"] = raw_name
+
         age_match = re.search(r"\b(\d{1,3})\s*years?\s*old\b", lowered)
         if age_match:
             updates["age"] = int(age_match.group(1))
@@ -425,14 +520,29 @@ class Orchestrator:
     @staticmethod
     def _extract_assistant_identity_update(user_message: str) -> Optional[str]:
         text = (user_message or "").strip()
-        if not text or "?" in text:
+        if not text:
             return None
 
-        patterns = (
+        # Polite request patterns that may include "?" — must be checked before the "?" guard.
+        # e.g. "Can I call you Aiden?", "I'll call you Aiden", "Let's call you Aiden"
+        call_patterns = (
+            r"\b(?:can i|may i|i(?:'ll| will| want to)|let(?:'s| us)) call you\s+([a-z][a-z' -]{0,40})(?:\?|,|\.|!|$)",
+            r"\bi(?:'ll| will) refer to you as\s+([a-z][a-z' -]{0,40})(?:\?|,|\.|!|$)",
+        )
+        for pattern in call_patterns:
+            match = re.search(pattern, text, flags=re.IGNORECASE)
+            if match:
+                return Orchestrator._normalize_display_name(match.group(1))
+
+        # Statement patterns must not be questions to avoid false positives like "Is your name X?"
+        if "?" in text:
+            return None
+
+        statement_patterns = (
             r"\b(?:just for your information,\s*)?your name is\s+([a-z][a-z' -]{0,40})(?=,|\.|!|$)",
             r"\bi am informing you(?: that)? your name is\s+([a-z][a-z' -]{0,40})(?=,|\.|!|$)",
         )
-        for pattern in patterns:
+        for pattern in statement_patterns:
             match = re.search(pattern, text, flags=re.IGNORECASE)
             if match:
                 return Orchestrator._normalize_display_name(match.group(1))
@@ -513,10 +623,35 @@ class Orchestrator:
         return []
 
     @staticmethod
+    def _looks_like_task_request(lowered: str) -> bool:
+        task_markers = (
+            "what is", "what's", "who is", "who's", "meaning of", "define", "explain",
+            "tell me", "summarize", "summarise", "check", "find", "search", "look up",
+            "get", "show", "read", "open", "list", "store", "remember", "record",
+            "add", "create",
+        )
+        if not any(marker in lowered for marker in task_markers):
+            return False
+
+        meta_tokens = {
+            "tool", "tools", "skill", "skills", "capability", "capabilities",
+            "internet", "browse", "web", "repository", "access", "search",
+            "check", "current", "live", "information", "data", "must", "need",
+            "needed", "available", "have", "use",
+        }
+        informative_tokens = {
+            token for token in re.findall(_ROUTING_TOKEN_RE, lowered)
+            if len(token) > 3 and token not in _ROUTING_STOPWORDS and token not in meta_tokens
+        }
+        return bool(informative_tokens)
+
+    @staticmethod
     def _is_capability_question(user_message: str) -> bool:
         lowered = (user_message or "").lower()
         capability_markers = ("tool", "tools", "skill", "skills", "capabil", "internet", "browse", "web", "repository")
-        return any(marker in lowered for marker in capability_markers) and any(
+        if not any(marker in lowered for marker in capability_markers):
+            return False
+        if not any(
             phrase in lowered
             for phrase in (
                 "can you",
@@ -526,7 +661,16 @@ class Orchestrator:
                 "access the internet",
                 "browse the internet",
             )
-        )
+        ):
+            return False
+        # Exclude action requests: "can you search the web FOR X" is a task, not a capability query.
+        # Require at least 12 chars of content after "for/about" to distinguish a specific topic
+        # from a short pronoun like "that" or "it" in a genuine capability question.
+        if re.search(r'\b(?:search|browse|web|internet)\b.*\b(?:for|about)\b.{12,}', lowered):
+            return False
+        if Orchestrator._looks_like_task_request(lowered):
+            return False
+        return True
 
     def _build_capability_response(self, user_message: str) -> Optional[str]:
         if not self._is_capability_question(user_message):
@@ -602,6 +746,19 @@ class Orchestrator:
             )
         )
 
+    # Matches short confirmatory questions about the previous turn, e.g.
+    # "Did you search online for it?", "Have you found it?", "Was that correct?"
+    _CONFIRMATORY_FOLLOWUP_RE = re.compile(
+        r"^\s*(did you|have you|were you|has it|was that|was it|did it|is that right|is that correct)\b",
+        re.IGNORECASE,
+    )
+
+    @staticmethod
+    def _is_confirmatory_followup(user_message: str) -> bool:
+        return bool(
+            Orchestrator._CONFIRMATORY_FOLLOWUP_RE.match(user_message or "")
+        )
+
     @staticmethod
     def _recall_last_assistant_message(chat_history: List[Dict[str, str]]) -> Optional[str]:
         for turn in reversed(chat_history):
@@ -635,10 +792,15 @@ class Orchestrator:
 
     @staticmethod
     def _is_profile_memory_request(lowered: str) -> bool:
-        return (
-            "store" in lowered and "memory" in lowered and "name" in lowered
-        ) or (
-            "remember" in lowered and "later" in lowered and "name" in lowered
+        write_verbs = (
+            "store", "save", "record", "remember", "write", "note",
+            "add", "keep", "log", "put", "jot",
+        )
+        memory_markers = ("memory", "long-term", "long term", "remember for later")
+        has_write_intent = any(v in lowered for v in write_verbs)
+        has_memory_ref = any(m in lowered for m in memory_markers)
+        return (has_write_intent and has_memory_ref) or (
+            "remember" in lowered and "later" in lowered
         )
 
     @staticmethod
@@ -657,6 +819,18 @@ class Orchestrator:
                 "how old am i",
             )
         )
+
+    @staticmethod
+    def _format_profile_update_ack(updates: Dict[str, Any]) -> str:
+        parts = []
+        if "name" in updates:
+            parts.append(f"your name as {updates['name']}")
+        if "age" in updates:
+            parts.append(f"your age as {updates['age']}")
+        if "relationship" in updates:
+            parts.append(f"your role as {updates['relationship']}")
+        detail = " and ".join(parts) if parts else "that information"
+        return f"Noted. I've recorded {detail} in my memory."
 
     @staticmethod
     def _format_user_profile_response(lowered: str, profile: Dict[str, Any]) -> str:
@@ -678,6 +852,7 @@ class Orchestrator:
         user_message = (state.get("user_input") or "").strip()
         lowered = user_message.lower()
         chat_history = list(state.get("chat_history", []) or [])
+        profile_updates = self._extract_user_profile_updates(user_message)
 
         assistant_name = self._extract_assistant_identity_update(user_message)
         if assistant_name:
@@ -686,9 +861,12 @@ class Orchestrator:
         if self._is_assistant_name_question(lowered, chat_history):
             return f"My name is {await self._get_assistant_name()}."
 
+        if profile_updates:
+            return self._format_profile_update_ack(profile_updates)
+
         if self._is_profile_memory_request(lowered):
             return (
-                "Yes. If you share details like your name, I can store them in memory and use them in later replies."
+                "Understood. Share details like your name or role and I will store them for future reference."
             )
 
         if not self._is_user_profile_lookup_question(lowered):
@@ -711,6 +889,13 @@ class Orchestrator:
 
         if self._is_last_reply_question(user_message):
             return self._recall_last_assistant_message(chat_history)
+
+        # Confirmatory follow-ups like "Did you search for it?" / "Have you found it?"
+        # should acknowledge the previous action, not re-trigger a tool.
+        if self._is_confirmatory_followup(user_message):
+            last = self._recall_last_assistant_message(chat_history)
+            if last:
+                return last
 
         if self._is_summary_request(user_message):
             return self._summarize_chat_history(chat_history)
@@ -737,7 +922,7 @@ class Orchestrator:
         if meta_response:
             return meta_response
 
-        assessment = self._assess_request_route(user_message)
+        assessment = self._assess_request_route(user_message, state.get("chat_history", []))
         core_mem_str = ""
         if hasattr(self, "core_memory"):
             core_mem_str = await self.core_memory.get_context_string()
@@ -749,6 +934,9 @@ class Orchestrator:
         ]
 
         if assessment["mode"] == "direct":
+            archival_ctx = ""
+            if hasattr(self, "vector_memory"):
+                archival_ctx = await self._get_archival_context(user_message)
             messages = [
                 {
                     "role": "system",
@@ -756,8 +944,11 @@ class Orchestrator:
                         "You are AIDEN. This request is low complexity. Reply directly in 1-2 concise sentences. "
                         "Use the recent chat history and core memory when they are relevant. "
                         "Answer capability questions based on the provided capabilities instead of claiming you have none. "
+                        "IMPORTANT: Do not fabricate time-sensitive data (weather, live prices, current news, live scores). "
+                        "If a request needs real-time data you cannot provide, say so clearly. "
                         "Do not call tools and do not mention internal routing.\n\n"
                         f"{core_mem_str}\n\n{capabilities_str}"
+                        + (f"\n\n{archival_ctx}" if archival_ctx else "")
                     ),
                 },
                 *history_msgs,
@@ -775,6 +966,45 @@ class Orchestrator:
             ):
                 return result.content.strip()
             return None
+
+        if assessment["mode"] == "multi_ticker":
+            tickers = assessment["tickers"]
+            ticker_results = []
+            for ticker in tickers:
+                tr = await self.cognitive_router._execute_tool(
+                    "get_stock_price", {"ticker": ticker}
+                )
+                if tr.status == "ok":
+                    ticker_results.append(f"[{ticker}]\n{tr.content}")
+            if not ticker_results:
+                return None
+            combined = "\n\n".join(ticker_results)
+            messages = [
+                {
+                    "role": "system",
+                    "content": (
+                        "You are AIDEN. Multiple stock prices have been fetched. "
+                        "Present each result clearly, one per line, in a human-readable format. "
+                        "Do not call further tools.\n\n"
+                        f"{core_mem_str}"
+                    ),
+                },
+                {
+                    "role": "user",
+                    "content": (
+                        f"User request: {user_message}\n\n"
+                        f"Tool results:\n{combined}"
+                    ),
+                },
+            ]
+            result = await self._route_to_system_1(
+                messages,
+                allowed_tools=[],
+                context="fast_path_multi_ticker",
+            )
+            if result.status == "ok" and result.content and not result.content.startswith(_SYSTEM_1_ERROR_PREFIX):
+                return result.content.strip()
+            return combined
 
         if assessment["mode"] != "single_tool":
             return None

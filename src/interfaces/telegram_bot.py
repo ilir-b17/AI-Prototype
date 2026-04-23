@@ -14,6 +14,12 @@ import asyncio
 import sys
 import socket
 from dotenv import load_dotenv
+
+# Load .env BEFORE importing any project modules so that module-level os.getenv()
+# calls in llm_router, orchestrator, etc. see the correct values.  override=True
+# ensures the file always wins over stale process-level env vars.
+load_dotenv(override=True)
+
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 from telegram.error import Conflict
@@ -24,9 +30,6 @@ if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8")
 if hasattr(sys.stderr, "reconfigure"):
     sys.stderr.reconfigure(encoding="utf-8")
-
-# Load environment variables
-load_dotenv()
 
 # Configure logging
 logging.basicConfig(
@@ -425,9 +428,6 @@ async def _async_run(application: Application, orchestrator_inst: "Orchestrator"
         await application.updater.start_polling(
             allowed_updates=["message", "callback_query"],
             drop_pending_updates=True,
-            read_timeout=15,
-            write_timeout=15,
-            connect_timeout=10,
             poll_interval=1.0,
         )
         await application.start()
@@ -517,7 +517,14 @@ def main() -> None:
             return
 
         # Create the Application and expose it at module level for shutdown/restart
-        application = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
+        application = (
+            Application.builder()
+            .token(TELEGRAM_BOT_TOKEN)
+            .get_updates_read_timeout(15)
+            .get_updates_write_timeout(15)
+            .get_updates_connect_timeout(10)
+            .build()
+        )
         _application = application
 
         # Register handlers

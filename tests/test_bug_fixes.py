@@ -735,6 +735,10 @@ class TestFastPathResponses:
 
 
 class TestTranscriptRegressionFixes:
+    def test_optional_web_fallback_clause_is_not_treated_as_capability_question(self):
+        prompt = "Can you tell me what is the meaning of paradox? Please search the web if you must"
+        assert Orchestrator._is_capability_question(prompt) is False
+
     @pytest.mark.asyncio
     async def test_capability_question_is_answered_without_running_web_search(self):
         orchestrator = Orchestrator.__new__(Orchestrator)
@@ -848,6 +852,84 @@ class TestTranscriptRegressionFixes:
         assert stored is True
         assert "Ilir" in name_result
         assert "37" in age_result
+
+    @pytest.mark.asyncio
+    async def test_identity_statement_is_me_is_stored_and_acknowledged_without_web_search(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            orchestrator = Orchestrator.__new__(Orchestrator)
+            orchestrator.core_memory = CoreMemory(f"{tmp_dir}/core_memory.json")
+            orchestrator.cognitive_router = MagicMock()
+            orchestrator.cognitive_router.registry.get_skill_names.return_value = ["web_search"]
+            orchestrator.cognitive_router.registry.get_schemas.return_value = [
+                {
+                    "name": "web_search",
+                    "description": "Search the web for current information, weather, and news.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "query": {"type": "string"},
+                            "max_results": {"type": "integer"},
+                        },
+                        "required": ["query"],
+                    },
+                }
+            ]
+            orchestrator.cognitive_router.route_to_system_1 = AsyncMock()
+            orchestrator.cognitive_router._execute_tool = AsyncMock()
+
+            message = "Ilir Boci is me, please store that information so you will have contextual awareness when we interact together"
+            stored = await Orchestrator._remember_user_profile(
+                orchestrator,
+                "test_user",
+                message,
+            )
+            result = await Orchestrator._try_fast_path_response(
+                orchestrator,
+                {
+                    "user_id": "test_user",
+                    "user_input": message,
+                    "chat_history": [],
+                },
+            )
+            profile = await Orchestrator._get_user_profile(orchestrator, "test_user")
+
+        assert stored is True
+        assert "Ilir Boci" in result
+        assert profile["name"] == "Ilir Boci"
+        orchestrator.cognitive_router._execute_tool.assert_not_awaited()
+        orchestrator.cognitive_router.route_to_system_1.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_request_capability_uses_existing_objective_tool_when_matched(self):
+        router = CognitiveRouter.__new__(CognitiveRouter)
+        router.registry = MagicMock()
+        router.registry.get_schemas.return_value = [
+            {
+                "name": "spawn_new_objective",
+                "description": "Adds a new goal, objective, Epic, Story, or Task to the Objective Backlog. Use when the Admin asks to add, create, define, or track a goal/objective.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "tier": {"type": "string", "description": "Hierarchy level for the objective."},
+                        "title": {"type": "string", "description": "Title of the goal or objective."},
+                        "estimated_energy": {"type": "integer", "description": "Estimated effort."},
+                    },
+                    "required": ["tier", "title", "estimated_energy"],
+                },
+            }
+        ]
+
+        result = await CognitiveRouter._execute_tool(
+            router,
+            "request_capability",
+            {
+                "gap_description": "A function to add goals and objectives to the Objective Backlog for the Admin.",
+                "suggested_tool_name": "add_goal_function",
+            },
+        )
+
+        assert result.status == "ok"
+        assert "spawn_new_objective" in result.content
 
     @pytest.mark.asyncio
     async def test_process_message_loads_state_before_fast_path(self):

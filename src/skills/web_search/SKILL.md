@@ -7,7 +7,7 @@ Performs a web search utilizing DuckDuckGo to return relevant internet results.
 ```json
 {
   "name": "web_search",
-  "description": "Performs an internet search to retrieve the most up-to-date information, news, or general web context. Returns a structured JSON list of results containing the title, URL, and a brief text snippet. Use this whenever you need to find information that is not in your training data or current knowledge base.",
+  "description": "Performs an internet search to retrieve the most up-to-date information including current news, weather forecasts, local business listings, events, prices, and general web context. Returns a structured JSON list of results containing the title, URL, and a brief text snippet. Use this whenever you need real-time or location-specific data that is not available in training knowledge.",
   "parameters": {
     "type": "object",
     "properties": {

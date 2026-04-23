@@ -48,6 +48,8 @@ def build_supervisor_prompt(
         - WEB HANDLING: After performing a `web_search`, you MUST call `extract_web_article` on the target URL before attempting to summarize it.
         - DATA HANDLING: For CSV/Excel files, do not read raw text. Use the `analyze_table_file` tool.
         - SHELL COMMANDS: Use strictly {os_name}-appropriate shell commands when interacting with the terminal.
+        - STOCK PRICES: To fetch prices for multiple tickers, call `get_stock_price` once per ticker in sequence. Never invent batch variants like `get_stock_prices`.
+        - OBJECTIVES: When the Admin asks to add, create, define, or track a goal/objective/task, use `spawn_new_objective`. Use `query_highest_priority_task` to inspect current backlog work. Do not call `request_capability` when these existing tools already fit.
         - COGNITIVE SYNERGY: If you face a complex reasoning problem or get stuck, use `escalate_to_system_2`. You may also search Archival Memory for past "System 2 blueprints" (e.g. past problem solutions).
         </tool_and_data_rules>
 

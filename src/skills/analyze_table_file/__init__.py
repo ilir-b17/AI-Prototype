@@ -1,5 +1,6 @@
 import logging
 import os
+import json
 
 import pandas as pd
 
@@ -29,7 +30,6 @@ def _resolve_data_path(file_path: str) -> str:
     return os.path.join(_DOWNLOADS_DIR, normalized)
 
 
-import json
 
 async def analyze_table_file(
     file_path: str,
@@ -102,7 +102,6 @@ async def analyze_table_file(
             is_truncated = True
 
         logger.info(f"analyze_table_file: analyzed '{resolved}' ({shape[0]}x{shape[1]})")
-        import json
         return json.dumps({
             "status": "success",
             "file": os.path.basename(resolved),
@@ -111,7 +110,6 @@ async def analyze_table_file(
         }, indent=2)
     except Exception as exc:
         logger.error(f"analyze_table_file failed: {exc}", exc_info=True)
-        import json
         return json.dumps({
             "status": "error",
             "message": "Data analysis failed",

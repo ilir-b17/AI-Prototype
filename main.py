@@ -9,7 +9,7 @@ import sys
 from dotenv import load_dotenv
 
 # Load environment variables BEFORE importing any modules
-load_dotenv()
+load_dotenv(override=True)
 
 from src.interfaces.telegram_bot import main
 

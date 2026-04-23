@@ -3,8 +3,9 @@ LLM Router Module - Routes decisions to System 1 (Local) or System 2 (Cloud).
 
 System 1: Local Ollama model (Gemma 4) — fast, private, always available.
 System 2: Cloud LLM for complex reasoning. Provider priority:
-  1. Groq (free, fast) — set GROQ_API_KEY
-  2. Gemini (Google AI Studio free tier) — set GEMINI_API_KEY + USE_GEMINI=True
+  1. Ollama Cloud — set OLLAMA_CLOUD_API_KEY + optionally SYSTEM_2_MODEL (default: deepseek-v3.2)
+  2. Groq (free, fast) — set GROQ_API_KEY
+  3. Gemini (Google AI Studio free tier) — set GEMINI_API_KEY + USE_GEMINI=True
 """
 
 import ast
@@ -116,15 +117,80 @@ logger = logging.getLogger(__name__)
 GEMINI_API_KEY = os.getenv('GEMINI_API_KEY')
 GROQ_API_KEY = os.getenv('GROQ_API_KEY')
 USE_GEMINI = os.getenv('USE_GEMINI', 'False').strip().lower() == 'true'
+OLLAMA_CLOUD_API_KEY = os.getenv('OLLAMA_CLOUD_API_KEY', '').strip()
+OLLAMA_CLOUD_HOST = os.getenv('OLLAMA_CLOUD_HOST', 'https://api.ollama.com').strip()
+SYSTEM_2_MODEL = os.getenv('SYSTEM_2_MODEL', 'deepseek-v3.2').strip()
 TOOL_EXEC_TIMEOUT_SECONDS = float(os.getenv("TOOL_EXEC_TIMEOUT_SECONDS", "30"))
+_CAPABILITY_MATCH_STOPWORDS = {
+    "a", "an", "and", "the", "to", "for", "of", "in", "on", "or", "is", "are",
+    "be", "can", "could", "would", "should", "have", "has", "with", "new", "needed",
+    "need", "admin", "user", "function", "tool", "tools", "skill", "skills",
+    "capability", "capabilities", "allow", "easily", "provide", "more", "than",
+    "just", "calling", "underlying", "use", "using", "this", "that", "from",
+}
+_CAPABILITY_META_TOOL_NAMES = {
+    "request_capability",
+    "request_core_update",
+    "ask_admin_for_guidance",
+    "escalate_to_system_2",
+}
 
 
 class CognitiveRouter:
     """
     Routes prompts to appropriate LLM systems.
     System 1: Local Ollama (fast, private)
-    System 2: Groq (preferred if key set) or Gemini (fallback)
+    System 2: Ollama Cloud (preferred when OLLAMA_CLOUD_API_KEY set) → Groq → Gemini
     """
+
+    @staticmethod
+    def _capability_match_tokens(text: str) -> set[str]:
+        return {
+            token for token in re.findall(r"[a-z0-9]+", (text or "").lower())
+            if len(token) > 2 and token not in _CAPABILITY_MATCH_STOPWORDS
+        }
+
+    @staticmethod
+    def _schema_match_tokens(schema: Dict[str, Any]) -> Dict[str, set[str]]:
+        params = (schema.get("parameters") or {}).get("properties", {}) or {}
+        name_tokens = CognitiveRouter._capability_match_tokens(schema.get("name", "").replace("_", " "))
+        desc_tokens = CognitiveRouter._capability_match_tokens(schema.get("description", ""))
+        param_tokens: set[str] = set()
+        for param_name, param_schema in params.items():
+            param_tokens |= CognitiveRouter._capability_match_tokens(param_name.replace("_", " "))
+            param_tokens |= CognitiveRouter._capability_match_tokens(param_schema.get("description", ""))
+        return {
+            "name": name_tokens,
+            "description": desc_tokens,
+            "parameters": param_tokens,
+        }
+
+    def _find_existing_capability_match(
+        self,
+        gap_description: str,
+        suggested_tool_name: str,
+    ) -> Optional[Dict[str, Any]]:
+        query_tokens = self._capability_match_tokens(gap_description)
+        query_tokens |= self._capability_match_tokens((suggested_tool_name or "").replace("_", " "))
+        if not query_tokens:
+            return None
+
+        best_schema: Optional[Dict[str, Any]] = None
+        best_score = 0.0
+        for schema in self.registry.get_schemas():
+            name = schema.get("name", "")
+            if not name or name in _CAPABILITY_META_TOOL_NAMES:
+                continue
+            schema_tokens = self._schema_match_tokens(schema)
+            score = 0.0
+            score += 3.0 * len(query_tokens & schema_tokens["name"])
+            score += 1.5 * len(query_tokens & schema_tokens["description"])
+            score += 0.75 * len(query_tokens & schema_tokens["parameters"])
+            if score > best_score:
+                best_schema = schema
+                best_score = score
+
+        return best_schema if best_score >= 2.5 else None
 
     async def _execute_tool(self, tool_name: str, arguments: dict) -> RouterResult:
         """Dispatch a tool call through the SkillRegistry.
@@ -156,10 +222,29 @@ class CognitiveRouter:
             return RouterResult(status="hitl_required", hitl_message=msg)
 
         if tool_name == "request_capability":
+            gap_description = arguments.get("gap_description", "unspecified gap")
+            suggested_tool_name = arguments.get("suggested_tool_name", "new_tool")
+            existing_tool = self._find_existing_capability_match(
+                gap_description,
+                suggested_tool_name,
+            )
+            if existing_tool is not None:
+                matched_name = existing_tool.get("name", "existing_tool")
+                logger.info(
+                    "Capability-gap request matched existing tool '%s'; skipping synthesis.",
+                    matched_name,
+                )
+                return RouterResult(
+                    status="ok",
+                    content=(
+                        f"Existing capability already available: use the '{matched_name}' tool instead of requesting a new one. "
+                        f"Tool purpose: {existing_tool.get('description', '').strip()}"
+                    ),
+                )
             return RouterResult(
                 status="capability_gap",
-                gap_description=arguments.get("gap_description", "unspecified gap"),
-                suggested_tool_name=arguments.get("suggested_tool_name", "new_tool"),
+                gap_description=gap_description,
+                suggested_tool_name=suggested_tool_name,
             )
 
         if tool_name == "escalate_to_system_2":
@@ -237,6 +322,161 @@ class CognitiveRouter:
         logger.debug(f"sanitize_response output preview: {logged!r}")
         return text.strip()
 
+    @staticmethod
+    def _parse_bool_env(name: str, default: bool = False) -> bool:
+        raw = os.getenv(name, "").strip().lower()
+        if not raw:
+            return default
+        if raw in {"1", "true", "yes", "on"}:
+            return True
+        if raw in {"0", "false", "no", "off"}:
+            return False
+        logger.warning("Invalid %s=%r. Falling back to %s.", name, raw, default)
+        return default
+
+    @staticmethod
+    def _parse_int_env(name: str) -> Optional[int]:
+        raw = os.getenv(name, "").strip()
+        if not raw:
+            return None
+        try:
+            return int(raw)
+        except ValueError:
+            logger.warning("Invalid %s=%r. Ignoring.", name, raw)
+            return None
+
+    @staticmethod
+    def _parse_float_env(name: str) -> Optional[float]:
+        raw = os.getenv(name, "").strip()
+        if not raw:
+            return None
+        try:
+            return float(raw)
+        except ValueError:
+            logger.warning("Invalid %s=%r. Ignoring.", name, raw)
+            return None
+
+    @staticmethod
+    def _resolve_ollama_keep_alive() -> Optional[str]:
+        raw = os.getenv("OLLAMA_KEEP_ALIVE", "15m").strip()
+        return raw or None
+
+    @staticmethod
+    def _resolve_ollama_think() -> Optional[Any]:
+        raw = os.getenv("OLLAMA_THINK", "false").strip().lower()
+        if not raw:
+            return None
+        if raw in {"1", "true", "yes", "on"}:
+            return True
+        if raw in {"0", "false", "no", "off"}:
+            return False
+        if raw in {"low", "medium", "high"}:
+            return raw
+        logger.warning("Invalid OLLAMA_THINK=%r. Falling back to False.", raw)
+        return False
+
+    @staticmethod
+    def _extract_context_length(modelinfo: Dict[str, Any]) -> Optional[int]:
+        for key, value in (modelinfo or {}).items():
+            if not str(key).endswith(".context_length"):
+                continue
+            try:
+                return int(value)
+            except (TypeError, ValueError):
+                continue
+        return None
+
+    def _resolve_ollama_runtime_options(self) -> Dict[str, Any]:
+        options: Dict[str, Any] = {}
+
+        num_gpu = self._parse_int_env("OLLAMA_NUM_GPU")
+        if num_gpu is not None and num_gpu != -1:
+            options["num_gpu"] = num_gpu
+
+        int_options = {
+            "OLLAMA_NUM_CTX": "num_ctx",
+            "OLLAMA_REPEAT_LAST_N": "repeat_last_n",
+            "OLLAMA_NUM_PREDICT": "num_predict",
+            "OLLAMA_TOP_K": "top_k",
+            "OLLAMA_SEED": "seed",
+            "OLLAMA_NUM_BATCH": "num_batch",
+            "OLLAMA_NUM_THREAD": "num_thread",
+        }
+        for env_name, option_name in int_options.items():
+            value = self._parse_int_env(env_name)
+            if value is not None:
+                options[option_name] = value
+
+        float_options = {
+            "OLLAMA_TEMPERATURE": "temperature",
+            "OLLAMA_TOP_P": "top_p",
+            "OLLAMA_MIN_P": "min_p",
+            "OLLAMA_REPEAT_PENALTY": "repeat_penalty",
+            "OLLAMA_PRESENCE_PENALTY": "presence_penalty",
+            "OLLAMA_FREQUENCY_PENALTY": "frequency_penalty",
+        }
+        for env_name, option_name in float_options.items():
+            value = self._parse_float_env(env_name)
+            if value is not None:
+                options[option_name] = value
+
+        return options
+
+    def _inspect_system_1_model(self) -> None:
+        try:
+            show = ollama.Client().show(self.local_model)
+            self._system_1_capabilities = set(getattr(show, "capabilities", []) or [])
+            self._system_1_modelinfo = dict(getattr(show, "modelinfo", {}) or {})
+            self._system_1_context_length = self._extract_context_length(self._system_1_modelinfo)
+
+            if self._ollama_think is not None and "thinking" not in self._system_1_capabilities:
+                logger.warning(
+                    "OLLAMA_THINK is configured but model '%s' does not advertise thinking support. Disabling think override.",
+                    self.local_model,
+                )
+                self._ollama_think = None
+
+            if "tools" not in self._system_1_capabilities:
+                logger.warning(
+                    "System 1 model '%s' does not advertise tool support. Tool-calling reliability may be degraded.",
+                    self.local_model,
+                )
+
+            logger.info(
+                "System 1 model inspected: capabilities=%s context_length=%s options=%s",
+                ", ".join(sorted(self._system_1_capabilities)) or "unknown",
+                self._system_1_context_length or "unknown",
+                self._ollama_options or {},
+            )
+        except Exception as exc:
+            logger.warning("Unable to inspect System 1 model '%s': %s", self.local_model, exc)
+
+    def _build_system_1_chat_kwargs(
+        self,
+        model: str,
+        messages: List[Dict[str, str]],
+        *,
+        tools=None,
+    ) -> Dict[str, Any]:
+        ollama_options = getattr(self, "_ollama_options", {}) or {}
+        ollama_keep_alive = getattr(self, "_ollama_keep_alive", None)
+        ollama_think = getattr(self, "_ollama_think", None)
+        system_1_capabilities = getattr(self, "_system_1_capabilities", set()) or set()
+        kwargs: Dict[str, Any] = {
+            "model": model,
+            "messages": messages,
+            "options": ollama_options,
+        }
+        if tools is not None:
+            kwargs["tools"] = tools
+        if ollama_keep_alive is not None:
+            kwargs["keep_alive"] = ollama_keep_alive
+        if ollama_think is not None and (
+            not system_1_capabilities or "thinking" in system_1_capabilities
+        ):
+            kwargs["think"] = ollama_think
+        return kwargs
+
     def __init__(self, model_name: str = "gemini-2.0-flash", local_model: str = "gemma4:e4b") -> None:
         self.model_name = model_name
         self.local_model = os.getenv("OLLAMA_MODEL", local_model)
@@ -261,19 +501,34 @@ class CognitiveRouter:
 
         # System 1: cached Ollama client — created once, reused across all calls
         self._ollama_client: Optional[ollama.AsyncClient] = None
+        self._ollama_keep_alive = self._resolve_ollama_keep_alive()
+        self._ollama_think = self._resolve_ollama_think()
+        self._preload_system_1_on_startup = self._parse_bool_env("SYSTEM_1_PRELOAD_ON_STARTUP", False)
+        self._system_1_capabilities: set[str] = set()
+        self._system_1_modelinfo: Dict[str, Any] = {}
+        self._system_1_context_length: Optional[int] = None
 
-        # Ollama runtime options — num_gpu=0 forces CPU-only, -1 means all layers on GPU
-        _num_gpu = int(os.getenv("OLLAMA_NUM_GPU", "-1"))
-        self._ollama_options = {"num_gpu": _num_gpu} if _num_gpu != -1 else {}
-        if _num_gpu == 0:
+        # Ollama runtime options — these map directly to Modelfile/API controls.
+        self._ollama_options = self._resolve_ollama_runtime_options()
+        if self._ollama_options.get("num_gpu") == 0:
             logger.info("System 1: CPU-only mode (OLLAMA_NUM_GPU=0)")
+        self._inspect_system_1_model()
 
-        # System 2 provider selection: Groq takes priority over Gemini
+        # System 2 provider selection:
+        #   Priority: Ollama Cloud > Groq > Gemini
         self.groq_client = None
         self.gemini_client = None
+        self.ollama_cloud_client: Optional[ollama.AsyncClient] = None
         self.groq_model = os.getenv('GROQ_MODEL', 'llama-3.3-70b-versatile')
+        self.system_2_model = SYSTEM_2_MODEL
 
-        if GROQ_AVAILABLE and GROQ_API_KEY:
+        if OLLAMA_CLOUD_API_KEY:
+            self.ollama_cloud_client = ollama.AsyncClient(
+                host=OLLAMA_CLOUD_HOST,
+                headers={'Authorization': f'Bearer {OLLAMA_CLOUD_API_KEY}'},
+            )
+            logger.info(f"System 2: Ollama Cloud ({self.system_2_model} @ {OLLAMA_CLOUD_HOST}) — API key configured")
+        elif GROQ_AVAILABLE and GROQ_API_KEY:
             self.groq_client = AsyncGroq(api_key=GROQ_API_KEY)
             logger.info(f"System 2: Groq ({self.groq_model}) — API key configured")
         elif not GROQ_AVAILABLE and GROQ_API_KEY:
@@ -292,13 +547,15 @@ class CognitiveRouter:
         else:
             logger.warning(
                 "No System 2 provider configured — capability synthesis will be unavailable. "
-                "Set GROQ_API_KEY (free at console.groq.com) or GEMINI_API_KEY + USE_GEMINI=True."
+                "Set OLLAMA_CLOUD_API_KEY, GROQ_API_KEY, or GEMINI_API_KEY+USE_GEMINI=True."
             )
 
         logger.info(
-            "CognitiveRouter initialized. System 1: %s (max concurrency: %s)",
+            "CognitiveRouter initialized. System 1: %s (max concurrency: %s, keep_alive=%s, think=%s)",
             self.local_model,
             self._system_1_max_concurrency,
+            self._ollama_keep_alive or "default",
+            self._ollama_think,
         )
 
     @staticmethod
@@ -610,8 +867,7 @@ class CognitiveRouter:
         """
         model = self.local_model
         response = await asyncio.wait_for(
-            client.chat(model=model, messages=messages, tools=tools,
-                        options=self._ollama_options),
+            client.chat(**self._build_system_1_chat_kwargs(model, messages, tools=tools)),
             timeout=self._ollama_timeout,
         )
         return response, model
@@ -758,12 +1014,7 @@ class CognitiveRouter:
         tools=None,
     ):
         async with asyncio.timeout(self._ollama_timeout):
-            return await client.chat(
-                model=model,
-                messages=messages,
-                tools=tools,
-                options=self._ollama_options,
-            )
+            return await client.chat(**self._build_system_1_chat_kwargs(model, messages, tools=tools))
 
     async def _chat_with_ollama_with_timeout(
         self,
@@ -775,12 +1026,19 @@ class CognitiveRouter:
         tools=None,
     ):
         async with asyncio.timeout(timeout_seconds):
-            return await client.chat(
-                model=model,
-                messages=messages,
-                tools=tools,
-                options=self._ollama_options,
+            return await client.chat(**self._build_system_1_chat_kwargs(model, messages, tools=tools))
+
+    async def preload_system_1(self) -> None:
+        """Warm-load the local model so the first live turn avoids cold-start latency."""
+        client = self._get_or_create_ollama_client()
+        preload_timeout = min(self._ollama_timeout, 20.0)
+        async with asyncio.timeout(preload_timeout):
+            await client.chat(
+                model=self.local_model,
+                messages=[],
+                keep_alive=self._ollama_keep_alive,
             )
+        logger.info("System 1 preloaded: %s", self.local_model)
 
     async def _summarize_pdf_tool_output(
         self,
@@ -1332,20 +1590,24 @@ Rules:
         allowed_tools: Optional[List[str]] = None
     ) -> RouterResult:
         """
-        Route to System 2. Uses Groq if available, falls back to Gemini.
-        Groq is preferred: free tier, very fast, high quality (llama-3.3-70b).
+        Route to System 2. Priority: Ollama Cloud > Groq > Gemini.
         Returns a :class:`RouterResult` — never raises for security intercepts.
         """
         if self._system2_cooldown_until and time.time() < self._system2_cooldown_until:
             msg = self._format_cooldown_message() or "Rate limited. Please try again later."
             return RouterResult(status="ok", content=f"[System 2 - Error]: {msg}")
 
-        if self.groq_client is not None:
+        if self.ollama_cloud_client is not None:
+            return await self._route_to_ollama_cloud(messages, allowed_tools=allowed_tools)
+        elif self.groq_client is not None:
             return await self._route_to_groq(messages, allowed_tools=allowed_tools)
         elif self.gemini_client is not None:
             return await self._route_to_gemini(messages)
         else:
-            raise RuntimeError("No System 2 provider configured. Set GROQ_API_KEY or GEMINI_API_KEY+USE_GEMINI=True.")
+            raise RuntimeError(
+                "No System 2 provider configured. "
+                "Set OLLAMA_CLOUD_API_KEY, GROQ_API_KEY, or GEMINI_API_KEY+USE_GEMINI=True."
+            )
 
     def _format_groq_tools(self, allowed_tools: Optional[List[str]]) -> List[dict]:
         groq_tools = []
@@ -1561,6 +1823,116 @@ Rules:
         result = (final_response.choices[0].message.content or "").strip()
         logger.info("System 2 (Groq) fallback response generated without tools")
         return RouterResult(status="ok", content=result)
+
+    # ── Ollama Cloud (System 2 primary) ──────────────────────────────────────
+
+    def _format_ollama_cloud_tools(self, allowed_tools: Optional[List[str]]) -> List[dict]:
+        """Build the tool list in the format expected by the Ollama chat API."""
+        tools = []
+        for schema in self.registry.get_schemas():
+            if allowed_tools is not None and schema["name"] not in allowed_tools:
+                continue
+            tools.append({
+                "type": "function",
+                "function": {
+                    "name": schema["name"],
+                    "description": schema["description"],
+                    "parameters": schema["parameters"],
+                },
+            })
+        return tools
+
+    async def _route_to_ollama_cloud(
+        self,
+        messages: List[Dict[str, str]],
+        allowed_tools: Optional[List[str]] = None,
+    ) -> RouterResult:
+        """Route to Ollama Cloud (primary System 2) with full tool calling support."""
+        logger.info(f"Routing to System 2 (Ollama Cloud/{self.system_2_model})")
+        try:
+            tools = self._format_ollama_cloud_tools(allowed_tools)
+            kwargs: Dict[str, Any] = {"model": self.system_2_model, "messages": messages}
+            if tools:
+                kwargs["tools"] = tools
+
+            resp = await self.ollama_cloud_client.chat(**kwargs)
+            msg = resp.message if hasattr(resp, "message") else resp["message"]
+            tool_calls = msg.tool_calls if hasattr(msg, "tool_calls") else msg.get("tool_calls")
+
+            if tool_calls:
+                return await self._handle_ollama_cloud_tool_call(messages, tool_calls[0])
+
+            content = (msg.content if hasattr(msg, "content") else msg.get("content", "")) or ""
+            logger.info(f"System 2 (Ollama Cloud) response received ({len(content)} chars)")
+            return RouterResult(status="ok", content=content.strip())
+
+        except Exception as e:
+            err_text = str(e)
+            logger.error(f"Ollama Cloud error: {e}", exc_info=True)
+            # Fall back to Groq when available
+            if self.groq_client is not None:
+                logger.warning("Ollama Cloud failed, falling back to Groq")
+                return await self._route_to_groq(messages, allowed_tools=allowed_tools)
+            return RouterResult(status="ok", content=f"[System 2 - Error]: {err_text[:200]}")
+
+    async def _handle_ollama_cloud_tool_call(
+        self,
+        messages: List[Dict[str, str]],
+        tool_call: Any,
+    ) -> RouterResult:
+        """Execute a tool requested by Ollama Cloud and feed the result back."""
+        fn = tool_call.function if hasattr(tool_call, "function") else tool_call.get("function", {})
+        tool_name = fn.name if hasattr(fn, "name") else fn.get("name", "")
+        raw_args = fn.arguments if hasattr(fn, "arguments") else fn.get("arguments", {})
+        if isinstance(raw_args, str):
+            try:
+                arguments = json.loads(raw_args)
+            except (json.JSONDecodeError, TypeError):
+                arguments = {}
+        elif isinstance(raw_args, dict):
+            arguments = raw_args
+        else:
+            arguments = {}
+
+        logger.info(f"Ollama Cloud requested tool call: {tool_name}")
+        exec_result = await self._execute_tool(tool_name, arguments)
+        if exec_result.status != "ok":
+            return exec_result
+
+        logger.info(f"Ollama Cloud tool '{tool_name}' executed: {exec_result.content[:100]}")
+        if tool_name == "extract_pdf_text":
+            return await self._summarize_pdf_with_ollama_cloud(exec_result.content)
+
+        # Build a follow-up with the tool result injected as a user message so the
+        # model synthesises a natural language answer from the output.
+        followup_messages = list(messages) + [
+            {
+                "role": "tool",
+                "content": exec_result.content,
+            }
+        ]
+        resp = await self.ollama_cloud_client.chat(
+            model=self.system_2_model,
+            messages=followup_messages,
+        )
+        msg = resp.message if hasattr(resp, "message") else resp["message"]
+        content = (msg.content if hasattr(msg, "content") else msg.get("content", "")) or ""
+        logger.info(f"System 2 (Ollama Cloud) response after tool call ({len(content)} chars)")
+        return RouterResult(status="ok", content=content.strip())
+
+    async def _summarize_pdf_with_ollama_cloud(self, tool_output: str) -> RouterResult:
+        if tool_output.strip().lower().startswith("error:"):
+            return RouterResult(status="ok", content=tool_output.strip())
+        resp = await self.ollama_cloud_client.chat(
+            model=self.system_2_model,
+            messages=self._build_pdf_summary_messages(tool_output),
+        )
+        msg = resp.message if hasattr(resp, "message") else resp["message"]
+        content = (msg.content if hasattr(msg, "content") else msg.get("content", "")) or ""
+        logger.info(f"System 2 (Ollama Cloud) PDF summary generated ({len(content)} chars)")
+        return RouterResult(status="ok", content=content.strip())
+
+    # ── Groq (System 2 fallback) ──────────────────────────────────────────────
 
     async def _route_to_groq(
         self,
