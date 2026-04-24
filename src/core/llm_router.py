@@ -11,6 +11,7 @@ System 2: Cloud LLM for complex reasoning. Provider priority:
 import ast
 import base64
 import difflib
+import io
 import os
 import logging
 import json
@@ -18,6 +19,7 @@ import asyncio
 import math
 import re
 import time
+import tokenize
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from typing import Optional, Dict, Any, List, AsyncIterator
@@ -132,7 +134,24 @@ _BLOCKED_DUNDER_ATTRIBUTES = {
 
 _BLOCKED_TOOL_BUILTINS = {
     "eval", "exec", "compile", "open", "__import__", "globals", "locals",
+    "getattr", "setattr", "delattr", "vars",
 }
+
+_BLOCKED_DYNAMIC_TOOL_TOKENS = {
+    "__subclasses__", "__mro__", "__globals__", "__builtins__", "__import__",
+}
+
+_BLOCKED_DYNAMIC_TOOL_DOTTED_TOKENS = {"sys.modules"}
+
+_DYNAMIC_TOOL_IGNORED_TOKEN_TYPES = frozenset({
+    tokenize.COMMENT,
+    tokenize.ENCODING,
+    tokenize.ENDMARKER,
+    tokenize.INDENT,
+    tokenize.DEDENT,
+    tokenize.NL,
+    tokenize.NEWLINE,
+})
 
 _BLOCKED_ASYNCIO_CALLS = {
     "create_subprocess_exec",
@@ -2282,6 +2301,16 @@ Rules:
         return True
 
     @staticmethod
+    def _validate_ast_string_constant_node(node: ast.AST, tool_name: str) -> bool:
+        if not isinstance(node, ast.Constant) or not isinstance(node.value, str):
+            return False
+        if node.value in _BLOCKED_TOP_LEVEL_MODULES:
+            raise ValueError(
+                f"Synthesised tool '{tool_name}' references blocked module string literal '{node.value}'."
+            )
+        return True
+
+    @staticmethod
     def _validate_tool_code_ast(code: str, tool_name: str) -> None:
         """
         Parse the synthesised code as an AST and reject any import that
@@ -2301,6 +2330,8 @@ Rules:
             CognitiveRouter._validate_ast_asyncio_call(node, tool_name)
             if CognitiveRouter._validate_ast_attribute_node(node, tool_name):
                 continue
+            if CognitiveRouter._validate_ast_string_constant_node(node, tool_name):
+                continue
             CognitiveRouter._validate_ast_call_node(node, tool_name)
 
     @staticmethod
@@ -2317,7 +2348,59 @@ Rules:
             CognitiveRouter._validate_ast_asyncio_call(node, tool_name)
             if CognitiveRouter._validate_ast_attribute_node(node, tool_name):
                 continue
+            if CognitiveRouter._validate_ast_string_constant_node(node, tool_name):
+                continue
             CognitiveRouter._validate_ast_call_node(node, tool_name)
+
+    @staticmethod
+    def _dynamic_tool_significant_tokens(code: str, tool_name: str) -> List[tokenize.TokenInfo]:
+        try:
+            tokens = list(tokenize.tokenize(io.BytesIO(code.encode("utf-8")).readline))
+        except tokenize.TokenError as exc:
+            raise ValueError(f"Synthesised code for '{tool_name}' could not be tokenized: {exc}") from exc
+        return [token for token in tokens if token.type not in _DYNAMIC_TOOL_IGNORED_TOKEN_TYPES]
+
+    @staticmethod
+    def _string_token_literal_value(token: tokenize.TokenInfo) -> Optional[str]:
+        if token.type != tokenize.STRING:
+            return None
+        try:
+            literal_value = ast.literal_eval(token.string)
+        except (SyntaxError, ValueError):
+            return None
+        return literal_value if isinstance(literal_value, str) else None
+
+    @staticmethod
+    def _validate_dynamic_tool_bare_token(token: tokenize.TokenInfo, tool_name: str) -> None:
+        token_value = token.string
+        literal_value = CognitiveRouter._string_token_literal_value(token)
+        blocked_value = token_value if token_value in _BLOCKED_DYNAMIC_TOOL_TOKENS else literal_value
+        if blocked_value in _BLOCKED_DYNAMIC_TOOL_TOKENS:
+            raise ValueError(
+                f"Synthesised tool '{tool_name}' contains blocked runtime token '{blocked_value}'."
+            )
+
+    @staticmethod
+    def _validate_dynamic_tool_dotted_token(
+        tokens: List[tokenize.TokenInfo],
+        index: int,
+        tool_name: str,
+    ) -> None:
+        if tokens[index].string != "sys" or index + 2 >= len(tokens):
+            return
+        dotted = "".join(next_token.string for next_token in tokens[index:index + 3])
+        if dotted in _BLOCKED_DYNAMIC_TOOL_DOTTED_TOKENS:
+            raise ValueError(
+                f"Synthesised tool '{tool_name}' contains blocked runtime token '{dotted}'."
+            )
+
+    @staticmethod
+    def _validate_dynamic_tool_token_scan(code: str, tool_name: str) -> None:
+        """Reject known escape tokens immediately before dynamic exec."""
+        significant_tokens = CognitiveRouter._dynamic_tool_significant_tokens(code, tool_name)
+        for index, token in enumerate(significant_tokens):
+            CognitiveRouter._validate_dynamic_tool_bare_token(token, tool_name)
+            CognitiveRouter._validate_dynamic_tool_dotted_token(significant_tokens, index, tool_name)
 
     def register_dynamic_tool(self, tool_name: str, code: str, schema_json: str) -> None:
         """Load synthesised Python code into the runtime via the SkillRegistry.
@@ -2330,6 +2413,7 @@ Rules:
 
         # ── AST sandbox check ──────────────────────────────────────────────
         self._validate_tool_code_ast(code, tool_name)
+        self._validate_dynamic_tool_token_scan(code, tool_name)
 
         module = types.ModuleType(f"dynamic_tool_{tool_name}")
         # Restrict built-ins to a safe subset so that exec() cannot reach
@@ -2338,17 +2422,17 @@ Rules:
         _safe_builtins = {
             "None": None, "True": True, "False": False,
             "abs": abs, "all": all, "any": any, "bool": bool,
-            "bytes": bytes, "chr": chr, "dict": dict, "dir": dir,
+            "bytes": bytes, "chr": chr, "dict": dict,
             "divmod": divmod, "enumerate": enumerate, "filter": filter,
             "float": float, "format": format, "frozenset": frozenset,
-            "getattr": getattr, "hasattr": hasattr, "hash": hash,
+            "hasattr": hasattr, "hash": hash,
             "int": int, "isinstance": isinstance, "issubclass": issubclass,
             "iter": iter, "len": len, "list": list, "map": map,
-            "max": max, "min": min, "next": next, "object": object,
+            "max": max, "min": min, "next": next,
             "ord": ord, "pow": pow, "print": print, "range": range,
             "repr": repr, "reversed": reversed, "round": round,
             "set": set, "slice": slice, "sorted": sorted, "str": str,
-            "sum": sum, "tuple": tuple, "type": type, "vars": vars,
+            "sum": sum, "tuple": tuple,
             "zip": zip,
         }
         module.__dict__["__builtins__"] = _safe_builtins

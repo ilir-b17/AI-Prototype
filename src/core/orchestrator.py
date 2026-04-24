@@ -36,7 +36,7 @@ from src.core.prompt_config import load_prompt_config, build_supervisor_prompt
 from src.core.runtime_context import set_runtime_context
 from src.core.state_model import AgentState, normalize_state
 from src.core.workflow_graph import build_orchestrator_graph
-from src.core.security import verify_mfa_challenge
+from src.core.security import validate_mfa_configuration, verify_mfa_challenge
 from src.core.nocturnal_consolidation import NocturnalConsolidationSlice1
 from src.core.goal_planner import GoalPlanner, PlanningResult
 from src.core.energy_judge import EnergyJudge, EnergyEvaluation
@@ -364,6 +364,7 @@ class Orchestrator:
             logger.warning("Invalid groq_cooldown_until value in DB: %s", e)
 
     def _enforce_charter_policy(self) -> None:
+        validate_mfa_configuration()
         allow_missing = os.getenv("ALLOW_MISSING_CHARTER", "false").strip().lower() in {"1", "true", "yes"}
         if self.charter_text == self._CHARTER_FALLBACK:
             if not allow_missing:
@@ -5291,7 +5292,7 @@ class Orchestrator:
             self._fire_and_forget(
                 self.ledger_memory.save_mfa_state(user_id, result.mfa_tool_name, result.mfa_arguments)
             )
-            return "SECURITY LOCK: To authorize this core change, complete the phrase: 'The sky is...'"
+            return "SECURITY LOCK: Provide the authorization passphrase to continue."
 
         if result.status == "hitl_required":
             state["_hitl_question"] = result.hitl_message

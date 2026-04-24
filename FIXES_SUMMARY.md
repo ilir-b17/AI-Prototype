@@ -1,5 +1,14 @@
 # AI System Fixes Summary
 
+## Slice 1: Security Hardening
+
+- Hardened dynamic-tool AST validation by blocking reflection builtins (`getattr`, `setattr`, `delattr`, `vars`, `globals`, `locals`) and blocked module-name string literals.
+- Removed reflection helpers (`getattr`, `vars`, `type`, `object`, `dir`) from dynamic tool safe builtins before `exec`.
+- Added tokenizer-based defense-in-depth scanning before dynamic tool registration for `__subclasses__`, `__mro__`, `__globals__`, `__builtins__`, `__import__`, and `sys.modules` outside comments.
+- Made MFA fail closed on startup unless `MFA_PASSPHRASE` is configured, at least 12 characters long, and free of common authorization words.
+- Removed the old user-facing MFA hint and added optional `MFA_TOTP_SECRET` support for 6-digit TOTP authorization codes.
+- Added focused security tests under `tests/security/` for sandbox bypass attempts, runtime token scanning, safe builtin removal, MFA validation, and TOTP verification.
+
 ## Issues Identified
 
 ### 1. **Timeout Errors** (Critical)
