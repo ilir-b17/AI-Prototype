@@ -91,7 +91,6 @@ _BLOCKED_TOP_LEVEL_MODULES = {
     "importlib", "builtins", "ctypes", "multiprocessing", "threading",
     "signal", "pty", "popen", "pexpect", "atexit", "gc",
     # Additional dangerous modules blocked to close sandbox escape paths:
-    "asyncio",      # asyncio.create_subprocess_shell/exec can launch child processes
     "concurrent",   # concurrent.futures.ProcessPoolExecutor / ThreadPoolExecutor
     "runpy",        # runpy.run_path() executes arbitrary code files
     "code",         # interactive Python interpreter
@@ -110,7 +109,6 @@ _BLOCKED_TOP_LEVEL_MODULES = {
 _ALLOWED_PYTEST_TOP_LEVEL_MODULES = {
     "pytest",
     "unittest",
-    "asyncio",
     "json",
     "re",
     "math",
@@ -126,6 +124,11 @@ _BLOCKED_DUNDER_ATTRIBUTES = {
 
 _BLOCKED_TOOL_BUILTINS = {
     "eval", "exec", "compile", "open", "__import__", "globals", "locals",
+}
+
+_BLOCKED_ASYNCIO_CALLS = {
+    "create_subprocess_exec",
+    "create_subprocess_shell",
 }
 
 logger = logging.getLogger(__name__)
@@ -2194,6 +2197,9 @@ Rules:
         if module_name == "unittest.mock":
             return
 
+        if base == "asyncio":
+            return
+
         if base not in _ALLOWED_PYTEST_TOP_LEVEL_MODULES:
             raise ValueError(
                 f"Synthesised pytest for '{tool_name}' imports non-allowlisted module '{module_name}'. "
@@ -2230,6 +2236,19 @@ Rules:
         return True
 
     @staticmethod
+    def _validate_ast_asyncio_call(node: ast.AST, tool_name: str) -> bool:
+        """Block asyncio.create_subprocess_* specifically."""
+        if not isinstance(node, ast.Attribute):
+            return False
+        if node.attr in _BLOCKED_ASYNCIO_CALLS:
+            if isinstance(node.value, ast.Name) and node.value.id == "asyncio":
+                raise ValueError(
+                    f"Synthesised tool '{tool_name}' calls blocked asyncio function '{node.attr}'. "
+                    "Subprocess creation is not permitted in synthesised tools."
+                )
+        return True
+
+    @staticmethod
     def _validate_ast_call_node(node: ast.AST, tool_name: str) -> bool:
         if not isinstance(node, ast.Call):
             return False
@@ -2258,6 +2277,7 @@ Rules:
         for node in ast.walk(tree):
             if CognitiveRouter._validate_ast_import_node(node, tool_name):
                 continue
+            CognitiveRouter._validate_ast_asyncio_call(node, tool_name)
             if CognitiveRouter._validate_ast_attribute_node(node, tool_name):
                 continue
             CognitiveRouter._validate_ast_call_node(node, tool_name)
@@ -2273,6 +2293,7 @@ Rules:
         for node in ast.walk(tree):
             if CognitiveRouter._validate_pytest_import_node(node, tool_name):
                 continue
+            CognitiveRouter._validate_ast_asyncio_call(node, tool_name)
             if CognitiveRouter._validate_ast_attribute_node(node, tool_name):
                 continue
             CognitiveRouter._validate_ast_call_node(node, tool_name)
@@ -2462,7 +2483,7 @@ Rules:
                 "type": "function",
                 "function": {
                     "name": raw_tool_name,
-                    "arguments": raw_arguments,
+                    "arguments": raw_arguments if isinstance(raw_arguments, str) else json.dumps(raw_arguments),
                 },
             })
             tool_messages.append({

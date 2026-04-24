@@ -221,6 +221,35 @@ def test_parse_supervisor_response_handles_multiline_structured_payload():
     ]
 
 
+def test_parse_supervisor_response_invalid_workers_payload_falls_back_to_full_response_when_answer_too_short():
+    orchestrator = Orchestrator.__new__(Orchestrator)
+    state = AgentState.new("user-1", "investigate this").to_dict()
+    orchestrator._extract_workers_payload = MagicMock(return_value=("ok", "{not-json"))
+
+    response = (
+        "Supervisor analysis summary: this output should be preserved when malformed WORKERS payload appears."
+    )
+    result = Orchestrator._parse_supervisor_response(orchestrator, response, state)
+
+    assert result["current_plan"] == []
+    assert result["final_response"] == response
+
+
+def test_parse_supervisor_response_invalid_workers_payload_keeps_long_answer_prefix():
+    orchestrator = Orchestrator.__new__(Orchestrator)
+    state = AgentState.new("user-1", "investigate this").to_dict()
+    long_answer = (
+        "Here is a detailed supervisor answer that is intentionally longer than forty characters."
+    )
+    orchestrator._extract_workers_payload = MagicMock(return_value=(long_answer, "{not-json"))
+
+    response = long_answer + "\nWORKERS: {not-json"
+    result = Orchestrator._parse_supervisor_response(orchestrator, response, state)
+
+    assert result["current_plan"] == []
+    assert result["final_response"] == long_answer
+
+
 def test_build_execution_plan_respects_task_packet_dependencies():
     orchestrator = Orchestrator.__new__(Orchestrator)
     orchestrator.agent_registry = AgentRegistry(agents_dir=Path("does-not-matter"))

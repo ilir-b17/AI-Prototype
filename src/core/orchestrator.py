@@ -12,6 +12,7 @@ import logging
 import json
 import hashlib
 import asyncio
+import math
 import re
 import sys
 import tempfile
@@ -70,6 +71,9 @@ MEMORY_CONSOLIDATION_INTERVAL = int(os.getenv("MEMORY_CONSOLIDATION_INTERVAL", "
 _PENDING_STATE_TTL_SECONDS = int(os.getenv("PENDING_STATE_TTL_SECONDS", "86400"))  # 24 hours
 _SYNTHESIS_SELF_TEST_TIMEOUT_DEFAULT_SECONDS = 12.0
 _MAX_SYNTHESIS_RETRIES = int(os.getenv("MAX_SYNTHESIS_RETRIES", "3"))
+_CONSOLIDATION_TRIGGER_TURNS = int(os.getenv("CONSOLIDATION_TRIGGER_TURNS", "10"))
+_SAFE_ENV_KEYS = {"PATH", "PYTHONPATH", "SYSTEMROOT", "TEMP", "TMP", "HOME", "USER", "LANG", "LC_ALL"}
+_BLOCKED_ENV_PREFIXES = ("TELEGRAM_", "GROQ_", "GEMINI_", "ANTHROPIC_", "OPENAI_", "OLLAMA_CLOUD_", "ADMIN_")
 _SYSTEM_1_ERROR_PREFIX = "[System 1 - Error]"
 _ROUTING_STOPWORDS = {
     "a", "an", "and", "are", "at", "be", "can", "could", "do", "for", "from",
@@ -195,6 +199,20 @@ _CATALOG_META_TOOL_NAMES = {
 }
 
 
+def _build_safe_subprocess_env() -> Dict[str, str]:
+    safe_env: Dict[str, str] = {}
+    for key, value in os.environ.items():
+        if key in _SAFE_ENV_KEYS:
+            safe_env[key] = value
+            continue
+        if any(key.startswith(prefix) for prefix in _BLOCKED_ENV_PREFIXES):
+            continue
+        safe_env[key] = value
+    # Ensure Python can find packages
+    safe_env.setdefault("PYTHONPATH", os.getcwd())
+    return safe_env
+
+
 class Orchestrator:
     """
     Central orchestration engine using a State Graph architecture.
@@ -249,9 +267,11 @@ class Orchestrator:
             self._predictive_energy_budget_lock: asyncio.Lock = asyncio.Lock()
 
             self.charter_text = self._load_charter()
+            self._ready: asyncio.Event = asyncio.Event()
             self.pending_mfa: Dict[str, dict] = {}
             self.pending_hitl_state: Dict[str, dict] = {}
             self.pending_tool_approval: Dict[str, dict] = {}
+            self._consolidation_turn_counts: Dict[str, int] = {}
             self.outbound_queue: Optional[asyncio.Queue] = None
             self.sensory_state: Dict[str, str] = {}
             # Background task registry — holds strong references to prevent GC (ISSUE-002)
@@ -281,18 +301,7 @@ class Orchestrator:
             await self.ledger_memory.set_system_state("groq_cooldown_until", str(expiry))
 
         self.cognitive_router._persist_cooldown_cb = _save_groq_cooldown
-        try:
-            saved_cooldown = await self.ledger_memory.get_system_state("groq_cooldown_until")
-            if saved_cooldown:
-                expiry = float(saved_cooldown)
-                if expiry > time.time():
-                    self.cognitive_router._system2_cooldown_until = expiry
-                    logger.info(
-                        "Restored Groq rate-limit cooldown from DB: %.0fs remaining.",
-                        expiry - time.time(),
-                    )
-        except Exception as _ce:
-            logger.warning("Failed to restore Groq cooldown from DB: %s", _ce)
+        await self._restore_persisted_groq_cooldown()
 
         await self.ledger_memory.seed_initial_goals()
         await self._load_approved_tools()
@@ -306,7 +315,7 @@ class Orchestrator:
             except Exception as _preload_err:
                 logger.warning("System 1 preload skipped: %s", _preload_err)
         self._compiled_graph = build_orchestrator_graph(self)
-        set_runtime_context(self.ledger_memory, self.core_memory)
+        set_runtime_context(self.ledger_memory, self.core_memory, self.vector_memory)
         # Record the host OS now that we're in an async context
         await self.core_memory.update("host_os", platform.system())
         # Startup pruning: remove stale chat_history rows
@@ -319,11 +328,51 @@ class Orchestrator:
                 logger.info("Startup pruning: removed %d stale chat_history rows.", deleted)
         except Exception as _prune_err:
             logger.warning("Startup chat history pruning failed: %s", _prune_err)
+
+        self._enforce_charter_policy()
+        self._ready.set()
+        logger.info("Orchestrator async_init complete")
+
+    async def _restore_persisted_groq_cooldown(self) -> None:
+        saved_cooldown = None
+        try:
+            saved_cooldown = await self.ledger_memory.get_system_state("groq_cooldown_until")
+        except Exception as _ce:
+            logger.warning("Failed to restore Groq cooldown from DB: %s", _ce)
+            return
+
+        if not saved_cooldown:
+            return
+
+        try:
+            expiry = float(saved_cooldown)
+            now = time.time()
+            max_expiry = now + 7200.0
+            if not math.isfinite(expiry):
+                logger.warning("Invalid groq_cooldown_until value in DB: non-finite (%r)", saved_cooldown)
+            elif now < expiry <= max_expiry:
+                self.cognitive_router._system2_cooldown_until = expiry
+                logger.info(
+                    "Restored Groq rate-limit cooldown: %.0fs remaining.",
+                    expiry - now,
+                )
+            elif expiry > max_expiry:
+                logger.warning("Persisted Groq cooldown exceeded 2-hour cap; ignoring.")
+        except (TypeError, ValueError) as e:
+            logger.warning("Invalid groq_cooldown_until value in DB: %s", e)
+
+    def _enforce_charter_policy(self) -> None:
+        allow_missing = os.getenv("ALLOW_MISSING_CHARTER", "false").strip().lower() in {"1", "true", "yes"}
         if self.charter_text == self._CHARTER_FALLBACK:
+            if not allow_missing:
+                raise RuntimeError(
+                    "FATAL: charter.md not found or empty. The moral evaluation framework cannot operate. "
+                    "Place a valid charter.md in the working directory or set ALLOW_MISSING_CHARTER=true "
+                    "to explicitly permit degraded operation."
+                )
             logger.warning(
                 "SECURITY: Running without a full charter. Charter enforcement will be minimal."
             )
-        logger.info("Orchestrator async_init complete")
 
     def _refresh_sensory_state(self) -> None:
         """Snapshot current machine state into self.sensory_state."""
@@ -735,6 +784,7 @@ class Orchestrator:
             prompt = dict(prompt)
             prompt.pop("audio_bytes", None)
             sanitized["user_prompt"] = prompt
+        sanitized.pop("_energy_gate_cleared", None)
         return sanitized
 
     @staticmethod
@@ -1204,6 +1254,7 @@ class Orchestrator:
             )
             if deferred is not None:
                 return deferred
+            state["_energy_gate_cleared"] = True
 
             archival_ctx = ""
             if hasattr(self, "vector_memory"):
@@ -1245,6 +1296,7 @@ class Orchestrator:
             )
             if deferred is not None:
                 return deferred
+            state["_energy_gate_cleared"] = True
 
             tickers = assessment["tickers"]
             ticker_results = []
@@ -1294,6 +1346,7 @@ class Orchestrator:
         )
         if deferred is not None:
             return deferred
+        state["_energy_gate_cleared"] = True
 
         tool_result = await self.cognitive_router._execute_tool(tool_name, assessment["arguments"])
         if tool_result.status != "ok":
@@ -1975,11 +2028,13 @@ class Orchestrator:
         *,
         user_prompt: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
-        return AgentState.new(
+        state = AgentState.new(
             user_id=user_id,
             user_input=user_message,
             user_prompt=user_prompt,
         ).to_dict()
+        state["_energy_gate_cleared"] = False
+        return state
 
     @staticmethod
     def _is_explicit_epic_request(user_message: str) -> bool:
@@ -2545,7 +2600,8 @@ class Orchestrator:
 
     def _parse_supervisor_response(self, response: str, state: Dict[str, Any]) -> Dict[str, Any]:
         """Parse the WORKERS tag from *response* and update *state* in-place."""
-        answer, workers_payload = self._extract_workers_payload(response.strip())
+        response_text = response.strip()
+        answer, workers_payload = self._extract_workers_payload(response_text)
 
         if workers_payload is None:
             state["current_plan"] = []
@@ -2556,7 +2612,10 @@ class Orchestrator:
         if not self._is_structured_plan_payload(decoded_payload):
             logger.warning("Supervisor produced invalid or non-structured WORKERS payload: %r", workers_payload)
             state["current_plan"] = []
-            state["final_response"] = answer or response.strip()
+            fallback_answer = answer if (answer and len(answer.strip()) >= 40) else response_text
+            if fallback_answer == response_text:
+                fallback_answer = re.sub(r"WORKERS:\s*.*$", "", fallback_answer, flags=re.DOTALL).strip()
+            state["final_response"] = fallback_answer or answer or response_text
             return state
 
         normalized_plan = self._normalize_current_plan(decoded_payload)
@@ -2566,7 +2625,7 @@ class Orchestrator:
                 state["worker_outputs"]["supervisor_context"] = answer
         else:
             state["current_plan"] = []
-            state["final_response"] = answer or response.strip()
+            state["final_response"] = answer or response_text
         return state
 
     def _get_agent_registry(self) -> AgentRegistry:
@@ -3448,9 +3507,29 @@ class Orchestrator:
         when it completes, so the set never grows unboundedly while still
         preventing the garbage collector from destroying mid-flight tasks.
         """
+        task_name = getattr(coro, "__name__", "")
+        if not task_name and hasattr(coro, "cr_code"):
+            task_name = getattr(coro.cr_code, "co_name", "")
+        if not task_name:
+            task_name = repr(coro)
+
         task = asyncio.create_task(coro)
         self._background_tasks.add(task)
-        task.add_done_callback(self._background_tasks.discard)
+
+        def _on_done(t: asyncio.Task) -> None:
+            self._background_tasks.discard(t)
+            if t.cancelled():
+                return
+            exc = t.exception()
+            if exc is not None:
+                logger.error(
+                    "Background task '%s' raised an unhandled exception: %s",
+                    task_name,
+                    exc,
+                    exc_info=exc,
+                )
+
+        task.add_done_callback(_on_done)
         return task
 
     async def _get_user_lock(self, user_id: str) -> asyncio.Lock:
@@ -3665,6 +3744,7 @@ class Orchestrator:
                     "-q",
                     test_file_name,
                     cwd=temp_dir,
+                    env=_build_safe_subprocess_env(),
                     stdout=asyncio.subprocess.PIPE,
                     stderr=asyncio.subprocess.PIPE,
                 )
@@ -4097,14 +4177,16 @@ class Orchestrator:
         """Plans execution. Tries System 1 (local) first per Directive 1.3; escalates to System 2 only on failure."""
         state = normalize_state(state)
 
-        deferred = await self._try_ad_hoc_dispatch_energy_gate(
-            state,
-            dispatch_context="graph_dispatch",
-        )
-        if deferred is not None:
-            state["current_plan"] = []
-            state["final_response"] = deferred
-            return state
+        if not state.get("_energy_gate_cleared"):
+            deferred = await self._try_ad_hoc_dispatch_energy_gate(
+                state,
+                dispatch_context="graph_dispatch",
+            )
+            if deferred is not None:
+                state["current_plan"] = []
+                state["final_response"] = deferred
+                return state
+            state["_energy_gate_cleared"] = True
 
         state = self._deduct_energy(state, ENERGY_COST_SUPERVISOR, "supervisor")
         user_input = state["user_input"]
@@ -4884,6 +4966,7 @@ class Orchestrator:
                 state["user_prompt"] = dict(user_prompt or {})
                 state["iteration_count"] = 0
                 state["current_plan"] = []
+                state["_energy_gate_cleared"] = False
                 # Track how many HITL cycles have been spent on this task (ISSUE-005)
                 state["hitl_count"] = state.get("hitl_count", 0) + 1
                 # Cap recharge to 75 so energy budget is never fully restored — this
@@ -4988,7 +5071,15 @@ class Orchestrator:
             await self.ledger_memory.save_chat_turn(user_id, "assistant", final_resp)
         except Exception as e:
             logger.warning(f"Failed to save chat turn for {user_id}: {e}")
-        self._fire_and_forget(self._consolidate_memory(user_id))
+
+        if not hasattr(self, "_consolidation_turn_counts"):
+            self._consolidation_turn_counts = {}
+
+        trigger_turns = max(1, _CONSOLIDATION_TRIGGER_TURNS)
+        self._consolidation_turn_counts[user_id] = self._consolidation_turn_counts.get(user_id, 0) + 1
+        if self._consolidation_turn_counts[user_id] >= trigger_turns:
+            self._consolidation_turn_counts[user_id] = 0
+            self._fire_and_forget(self._consolidate_memory(user_id))
 
     def _schedule_response_memory_save(self, user_message: str, final_resp: str) -> None:
         self._fire_and_forget(
@@ -5045,11 +5136,36 @@ class Orchestrator:
         if not normalized_user_message and not has_audio_prompt:
             return "Error: Invalid message"
 
+        if not hasattr(self, "_ready"):
+            self._ready = asyncio.Event()
+            self._ready.set()
+
+        if not self._ready.is_set():
+            try:
+                await asyncio.wait_for(self._ready.wait(), timeout=30.0)
+            except asyncio.TimeoutError:
+                return "System is still initializing. Please try again in a moment."
+
         # Serialise concurrent messages for the same user_id to prevent
         # race conditions on pending_mfa / pending_hitl_state / pending_tool_approval
         # dicts (ISSUE-012).  Different users are still processed concurrently.
         lock = await self._get_user_lock(user_id)
         async with lock:
+            if not hasattr(self, "_predictive_energy_budget_lock"):
+                self._predictive_energy_budget_lock = asyncio.Lock()
+            if not hasattr(self, "_predictive_energy_budget_remaining"):
+                self._predictive_energy_budget_remaining = max(
+                    0,
+                    int(os.getenv("INITIAL_ENERGY_BUDGET", "100")),
+                )
+
+            async with self._predictive_energy_budget_lock:
+                replenishment = int(os.getenv("ENERGY_REPLENISH_PER_TURN", "5"))
+                cap = int(os.getenv("INITIAL_ENERGY_BUDGET", "100"))
+                self._predictive_energy_budget_remaining = min(
+                    self._predictive_energy_budget_remaining + replenishment, cap
+                )
+
             reply = await self._try_resume_mfa(user_id, normalized_user_message)
             if reply is not None:
                 return reply
@@ -5232,7 +5348,7 @@ class Orchestrator:
 
     def close(self) -> None:
         try:
-            set_runtime_context(None, None)
+            set_runtime_context(None, None, None)
             if hasattr(self, 'vector_memory') and self.vector_memory:
                 self.vector_memory.close()
             if hasattr(self, 'cognitive_router') and self.cognitive_router:

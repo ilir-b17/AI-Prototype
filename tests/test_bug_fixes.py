@@ -11,6 +11,7 @@ import asyncio
 import pytest
 import tempfile
 import time
+import src.core.orchestrator as orchestrator_module
 
 from unittest.mock import AsyncMock, MagicMock
 from src.core.llm_router import CognitiveRouter, RouterResult
@@ -262,7 +263,6 @@ class TestExpandedBlockedModules:
     """Verify that all newly blocked modules are rejected by the AST sandbox (ISSUE-009)."""
 
     @pytest.mark.parametrize("module_name", [
-        "asyncio",
         "concurrent",
         "runpy",
         "code",
@@ -292,7 +292,6 @@ class TestExpandedBlockedModules:
             CognitiveRouter._validate_tool_code_ast(code, "malicious_tool")
 
     @pytest.mark.parametrize("module_name", [
-        "asyncio",
         "concurrent",
         "pickle",
         "marshal",
@@ -318,6 +317,47 @@ class TestExpandedBlockedModules:
         )
         # Must not raise
         CognitiveRouter._validate_tool_code_ast(safe_code, "safe_tool")
+
+    def test_asyncio_import_is_allowed(self):
+        """asyncio imports are allowed for async tool synthesis."""
+        safe_code = (
+            "import asyncio\n"
+            "async def safe_async_tool() -> str:\n"
+            "    await asyncio.sleep(0)\n"
+            "    return 'ok'\n"
+        )
+        CognitiveRouter._validate_tool_code_ast(safe_code, "safe_async_tool")
+
+    @pytest.mark.parametrize("call_name", [
+        "create_subprocess_exec",
+        "create_subprocess_shell",
+    ])
+    def test_asyncio_subprocess_calls_are_rejected_in_tool_code(self, call_name: str):
+        """Tool code may import asyncio, but subprocess creation APIs remain blocked."""
+        code = (
+            "import asyncio\n"
+            "async def malicious_tool() -> str:\n"
+            f"    await asyncio.{call_name}('python')\n"
+            "    return 'bad'\n"
+        )
+        with pytest.raises(ValueError, match=call_name):
+            CognitiveRouter._validate_tool_code_ast(code, "malicious_tool")
+
+    @pytest.mark.parametrize("call_name", [
+        "create_subprocess_exec",
+        "create_subprocess_shell",
+    ])
+    def test_asyncio_subprocess_calls_are_rejected_in_pytest_code(self, call_name: str):
+        """Generated pytest code is subject to the same asyncio subprocess guard."""
+        pytest_code = (
+            "import pytest\n"
+            "import asyncio\n\n"
+            "@pytest.mark.asyncio\n"
+            "async def test_bad_asyncio_usage():\n"
+            f"    await asyncio.{call_name}('python')\n"
+        )
+        with pytest.raises(ValueError, match=call_name):
+            CognitiveRouter._validate_pytest_code_ast(pytest_code, "safe_tool")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -673,6 +713,53 @@ class TestCoreMemoryPromptContext:
 
             assert "Conversation_Summary" not in context
             assert "Current_Focus" in context
+
+
+class TestConsolidationTurnThrottling:
+    @pytest.mark.asyncio
+    async def test_persist_chat_turns_triggers_consolidation_only_after_threshold(self, monkeypatch):
+        orchestrator = Orchestrator.__new__(Orchestrator)
+        orchestrator.ledger_memory = MagicMock()
+        orchestrator.ledger_memory.save_chat_turn = AsyncMock()
+        orchestrator._consolidate_memory = AsyncMock()
+        scheduled = []
+
+        def fake_fire_and_forget(coro):
+            scheduled.append(coro)
+            coro.close()
+
+        orchestrator._fire_and_forget = fake_fire_and_forget
+
+        monkeypatch.setattr(orchestrator_module, "_CONSOLIDATION_TRIGGER_TURNS", 3)
+
+        await Orchestrator._persist_chat_turns(orchestrator, "user_1", "msg_1", "resp_1")
+        await Orchestrator._persist_chat_turns(orchestrator, "user_1", "msg_2", "resp_2")
+
+        assert len(scheduled) == 0
+        assert orchestrator._consolidation_turn_counts["user_1"] == 2
+
+        await Orchestrator._persist_chat_turns(orchestrator, "user_1", "msg_3", "resp_3")
+
+        assert len(scheduled) == 1
+        assert orchestrator._consolidation_turn_counts["user_1"] == 0
+
+
+class TestOrchestratorReadyGate:
+    @pytest.mark.asyncio
+    async def test_process_message_returns_initializing_message_when_ready_gate_times_out(self, monkeypatch):
+        orchestrator = Orchestrator.__new__(Orchestrator)
+        orchestrator._ready = asyncio.Event()
+
+        async def _always_timeout(awaitable, *_args, **_kwargs):
+            if hasattr(awaitable, "close"):
+                awaitable.close()
+            raise asyncio.TimeoutError()
+
+        monkeypatch.setattr(orchestrator_module.asyncio, "wait_for", _always_timeout)
+
+        result = await Orchestrator.process_message(orchestrator, "hello", "test_user")
+
+        assert result == "System is still initializing. Please try again in a moment."
 
 
 class TestRequestAssessment:

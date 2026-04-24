@@ -10,6 +10,7 @@ import os
 import logging
 import uuid
 from datetime import datetime, timedelta
+from datetime import timezone
 from typing import Dict, List, Any, Optional
 import chromadb
 from chromadb.config import Settings
@@ -131,7 +132,9 @@ class VectorMemory:
         # Stamp metadata with current time if not already present
         if "timestamp" not in metadata:
             metadata = dict(metadata)
-            metadata["timestamp"] = datetime.now().isoformat()
+            # Use a consistent UTC-naive format so lexical comparison remains stable.
+            # Existing records with legacy timestamp formats are not rewritten here.
+            metadata["timestamp"] = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S")
 
         # Generate ID if not provided
         if not memory_id:
@@ -297,7 +300,9 @@ class VectorMemory:
 
     def prune_old_memories(self, days: int = 180) -> int:
         """Delete memories whose metadata timestamp is older than *days* days."""
-        cutoff = (datetime.now() - timedelta(days=days)).isoformat()
+        # Keep cutoff format aligned with newly-stamped UTC timestamps.
+        # Existing DB rows with legacy/mixed timestamp formats are not retroactively fixed.
+        cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).strftime("%Y-%m-%dT%H:%M:%S")
         try:
             results = self.collection.get(
                 where={"timestamp": {"$lt": cutoff}},

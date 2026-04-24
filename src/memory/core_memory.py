@@ -69,13 +69,14 @@ class CoreMemory:
 
     async def get_all(self) -> Dict[str, Any]:
         """Retrieve entire memory state (non-blocking)."""
-        try:
-            async with aiofiles.open(self.memory_file_path, 'r') as f:
-                content = await f.read()
-            return json.loads(content)
-        except Exception as e:
-            logger.error(f"Failed to load core memory: {e}")
-            return {"current_focus": "", "user_preferences": ""}
+        async with self._lock:
+            try:
+                async with aiofiles.open(self.memory_file_path, 'r') as f:
+                    content = await f.read()
+                return json.loads(content)
+            except Exception as e:
+                logger.error(f"Failed to load core memory: {e}")
+                return {"current_focus": "", "user_preferences": ""}
 
     async def get_context_string(self, include_summary: bool = False) -> str:
         """Return the core memory formatted for prompt injection (non-blocking).
@@ -107,7 +108,13 @@ class CoreMemory:
     async def update(self, key: str, value: Any) -> bool:
         """Update a specific key in core memory (non-blocking, concurrency-safe)."""
         async with self._lock:
-            state = await self.get_all()
+            try:
+                async with aiofiles.open(self.memory_file_path, 'r') as f:
+                    content = await f.read()
+                state = json.loads(content)
+            except Exception as e:
+                logger.error(f"Failed to load core memory for update: {e}")
+                state = {"current_focus": "", "user_preferences": ""}
             state[key] = value
             await self._save_memory_async(state)
         logger.info(f"Updated Core Memory: {key} = {value}")

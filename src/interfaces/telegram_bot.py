@@ -519,6 +519,12 @@ async def _async_run(application: Application, orchestrator_inst: "Orchestrator"
 
         # Async-init the orchestrator
         await orchestrator_inst.async_init()
+        ready_event = getattr(orchestrator_inst, "_ready", None)
+        if ready_event is not None and not ready_event.is_set():
+            try:
+                await asyncio.wait_for(ready_event.wait(), timeout=30.0)
+            except asyncio.TimeoutError as exc:
+                raise RuntimeError("Orchestrator did not become ready during startup.") from exc
         outbound_queue: asyncio.Queue = asyncio.Queue()
         orchestrator_inst.outbound_queue = outbound_queue
 

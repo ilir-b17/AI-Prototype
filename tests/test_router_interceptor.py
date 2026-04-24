@@ -269,6 +269,46 @@ class TestParseNativeToolCall:
         assert args == {"x": 1}
 
 
+class TestBuildGroqFollowupMessages:
+    class _ToolCall:
+        def __init__(self, tool_call_id: str):
+            self.id = tool_call_id
+
+    def test_dict_arguments_are_json_encoded_for_assistant_tool_calls(self):
+        messages = [{"role": "user", "content": "Find weather"}]
+        executed_calls = [
+            {
+                "tool_call": self._ToolCall("call_1"),
+                "raw_tool_name": "web_search",
+                "raw_arguments": {"query": "Vienna weather"},
+                "tool_output": "Sunny",
+            }
+        ]
+
+        followup = CognitiveRouter._build_groq_followup_messages(messages, executed_calls)
+        assistant_call = followup[-2]["tool_calls"][0]["function"]
+
+        assert isinstance(assistant_call["arguments"], str)
+        assert json.loads(assistant_call["arguments"]) == {"query": "Vienna weather"}
+
+    def test_string_arguments_are_preserved_for_assistant_tool_calls(self):
+        messages = [{"role": "user", "content": "Find weather"}]
+        raw_arguments = '{"query":"Vienna weather"}'
+        executed_calls = [
+            {
+                "tool_call": self._ToolCall("call_2"),
+                "raw_tool_name": "web_search",
+                "raw_arguments": raw_arguments,
+                "tool_output": "Sunny",
+            }
+        ]
+
+        followup = CognitiveRouter._build_groq_followup_messages(messages, executed_calls)
+        assistant_call = followup[-2]["tool_calls"][0]["function"]
+
+        assert assistant_call["arguments"] == raw_arguments
+
+
 # ── sanitize_response ─────────────────────────────────────────────────────────
 
 class TestSanitizeResponse:

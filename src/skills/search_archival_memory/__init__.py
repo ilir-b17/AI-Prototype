@@ -1,43 +1,9 @@
 import asyncio
-import logging
-
-logger = logging.getLogger(__name__)
-
-
 import json
+import logging
 import os
 
-def _sync_search_archival_memory(query: str, n_results: int) -> str:
-    try:
-        from src.memory.vector_db import VectorMemory
-        vector_memory = VectorMemory()
-        results = vector_memory.query_memory(query, n_results=n_results)
-        if not results:
-            return json.dumps({
-                "status": "success",
-                "message": "No relevant archival memory found for the query.",
-                "results": []
-            })
-
-        parsed_results = []
-        for res in results:
-            parsed_results.append({
-                "document": res.get("document", ""),
-                "metadata": res.get("metadata", {}),
-                "distance": res.get("distance", None)
-            })
-
-        return json.dumps({
-            "status": "success",
-            "results": parsed_results
-        }, indent=2)
-    except Exception as exc:
-        return json.dumps({
-            "status": "error",
-            "message": "Could not search archival memory",
-            "details": str(exc),
-            "suggestion": "Check if the ChromaDB vector storage is properly initialized."
-        })
+logger = logging.getLogger(__name__)
 
 
 async def search_archival_memory(query: str, n_results: int = 3) -> str:
@@ -47,13 +13,12 @@ async def search_archival_memory(query: str, n_results: int = 3) -> str:
         return json.dumps({
             "status": "error",
             "message": "Invalid query",
-            "details": "The search query must be a non-empty string."
+            "details": "The query must be a non-empty string."
         })
 
     try:
-        n_results = int(n_results)
-        n_results = min(max(1, n_results), 10)
-    except ValueError:
+        n_results = max(1, min(int(n_results), 10))
+    except (TypeError, ValueError):
         n_results = 3
 
     try:
@@ -61,14 +26,55 @@ async def search_archival_memory(query: str, n_results: int = 3) -> str:
     except ValueError:
         timeout_seconds = 10.0
 
+    vector_memory = None
+    owns_instance = False
     try:
-        return await asyncio.wait_for(
-            asyncio.to_thread(_sync_search_archival_memory, query, n_results),
-            timeout=timeout_seconds
+        from src.core.runtime_context import get_vector_memory
+        from src.memory.vector_db import VectorMemory
+
+        vector_memory = get_vector_memory()
+        if vector_memory is None:
+            vector_memory = VectorMemory()
+            owns_instance = True
+
+        results = await asyncio.wait_for(
+            vector_memory.query_memory_async(query, n_results=n_results),
+            timeout=timeout_seconds,
         )
+
+        if not results:
+            return json.dumps({
+                "status": "success",
+                "message": "No relevant archival memory found.",
+                "results": []
+            })
+
+        return json.dumps({
+            "status": "success",
+            "results": [
+                {
+                    "document": result.get("document", ""),
+                    "metadata": result.get("metadata", {}),
+                    "distance": result.get("distance"),
+                }
+                for result in results
+            ]
+        }, indent=2)
     except asyncio.TimeoutError:
-         return json.dumps({
+        return json.dumps({
             "status": "error",
-            "message": f"Archival search timed out after {timeout_seconds}s",
-            "details": "The vector database took too long to respond."
-         })
+            "message": f"Archival search timed out after {timeout_seconds}s."
+        })
+    except Exception as exc:
+        logger.error(f"search_archival_memory error: {exc}", exc_info=True)
+        return json.dumps({
+            "status": "error",
+            "message": "Could not search archival memory",
+            "details": str(exc)
+        })
+    finally:
+        if owns_instance and vector_memory is not None:
+            try:
+                vector_memory.close()
+            except Exception:
+                pass
