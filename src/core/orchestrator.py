@@ -143,6 +143,7 @@ _ERROR_RESPONSE_PREFIXES = (
     "No valid response could be generated",
     "An internal error occurred",
 )
+_VOICE_INPUT_PLACEHOLDER = "[Voice note]"
 _CLOUD_REDACTION_BLOCK_PATTERNS = (
     r"<context_and_memory>.*?</context_and_memory>",
     r"<Core_Working_Memory>.*?</Core_Working_Memory>",
@@ -179,6 +180,19 @@ _SENSITIVE_CONTEXT_HINT_RE = re.compile(
 
 # Key used in the state dict to signal a blocked (non-ok) router result
 _BLOCKED_KEY = "_blocked_result"
+_CATALOG_MATCH_STOPWORDS = {
+    "a", "an", "and", "the", "to", "for", "of", "in", "on", "or", "is", "are",
+    "be", "can", "could", "would", "should", "have", "has", "with", "new", "needed",
+    "need", "admin", "user", "function", "tool", "tools", "skill", "skills",
+    "capability", "capabilities", "allow", "provide", "more", "than", "just", "use",
+    "using", "this", "that", "from", "missing", "cannot", "couldnt", "unable",
+}
+_CATALOG_META_TOOL_NAMES = {
+    "request_capability",
+    "request_core_update",
+    "ask_admin_for_guidance",
+    "escalate_to_system_2",
+}
 
 
 class Orchestrator:
@@ -211,6 +225,11 @@ class Orchestrator:
             self.ledger_memory = LedgerMemory(db_path=ledger_db_path)
             self.core_memory = CoreMemory(memory_file_path=core_memory_path)
             self.cognitive_router = CognitiveRouter(model_name=gemini_model, local_model=local_model)
+            self._enable_local_skill_discovery_gate = (
+                str(os.getenv("ENABLE_LOCAL_SKILL_DISCOVERY_GATE", "true")).strip().lower()
+                in {"1", "true", "yes", "on"}
+            )
+            self.cognitive_router._skill_context_resolver = self._build_scoped_skill_runtime_context
             self.prompt_config = load_prompt_config()
             self.agent_registry = AgentRegistry()
             self.nocturnal_consolidation = NocturnalConsolidationSlice1(
@@ -635,8 +654,88 @@ class Orchestrator:
             merged = dict(state or {})
             merged["user_input"] = str(state_or_user_message or "")
         merged.setdefault("user_input", "")
+        merged.setdefault("user_prompt", {})
         merged.setdefault("chat_history", [])
         return merged
+
+    @staticmethod
+    def _extract_audio_bytes(payload: Dict[str, Any]) -> bytes:
+        if not isinstance(payload, dict):
+            return b""
+        raw = payload.get("audio_bytes")
+        if isinstance(raw, bytes):
+            return raw
+        if isinstance(raw, bytearray):
+            return bytes(raw)
+        if isinstance(raw, memoryview):
+            return raw.tobytes()
+        return b""
+
+    @classmethod
+    def _coerce_user_prompt_payload(cls, user_message: Any) -> Dict[str, Any]:
+        if isinstance(user_message, dict):
+            payload = dict(user_message)
+            text = str(
+                payload.get("text")
+                or payload.get("user_input")
+                or payload.get("content")
+                or ""
+            ).strip()
+            audio_bytes = cls._extract_audio_bytes(payload)
+            if not text and audio_bytes:
+                text = _VOICE_INPUT_PLACEHOLDER
+
+            normalized: Dict[str, Any] = {
+                "text": text,
+                "audio_bytes": audio_bytes,
+                "audio_mime_type": str(payload.get("audio_mime_type") or "audio/ogg"),
+                "audio_source": str(payload.get("audio_source") or ""),
+                "audio_file_id": str(payload.get("audio_file_id") or ""),
+            }
+            return normalized
+
+        text = str(user_message or "").strip()
+        return {
+            "text": text,
+            "audio_bytes": b"",
+            "audio_mime_type": "",
+            "audio_source": "",
+            "audio_file_id": "",
+        }
+
+    @classmethod
+    def _state_has_audio_prompt(cls, state: Dict[str, Any]) -> bool:
+        prompt = state.get("user_prompt")
+        if not isinstance(prompt, dict):
+            return False
+        return bool(cls._extract_audio_bytes(prompt))
+
+    @classmethod
+    def _build_user_prompt_message(cls, state: Dict[str, Any]) -> Dict[str, Any]:
+        user_text = str(state.get("user_input") or "")
+        message: Dict[str, Any] = {
+            "role": "user",
+            "content": f"<user_input>{user_text}</user_input>",
+        }
+        prompt = state.get("user_prompt")
+        if not isinstance(prompt, dict):
+            return message
+
+        audio_bytes = cls._extract_audio_bytes(prompt)
+        if audio_bytes:
+            message["audio_bytes"] = audio_bytes
+            message["audio_mime_type"] = str(prompt.get("audio_mime_type") or "audio/ogg")
+        return message
+
+    @classmethod
+    def _strip_audio_bytes_for_persistence(cls, state: Dict[str, Any]) -> Dict[str, Any]:
+        sanitized = normalize_state(dict(state))
+        prompt = sanitized.get("user_prompt")
+        if isinstance(prompt, dict) and "audio_bytes" in prompt:
+            prompt = dict(prompt)
+            prompt.pop("audio_bytes", None)
+            sanitized["user_prompt"] = prompt
+        return sanitized
 
     @staticmethod
     def _normalize_display_name(raw_name: str) -> str:
@@ -1079,6 +1178,10 @@ class Orchestrator:
         state = self._coerce_fast_path_state(state_or_user_message, state)
         user_message = state.get("user_input", "")
 
+        if self._state_has_audio_prompt(state):
+            logger.info("Fast path bypassed: multimodal audio prompt detected.")
+            return None
+
         meta_response = await self._try_meta_fast_path_response(state)
         if meta_response:
             return meta_response
@@ -1251,14 +1354,187 @@ class Orchestrator:
         return self._CHARTER_FALLBACK
 
     def _get_capabilities_string(self) -> str:
-        """Compact tool names list derived live from the SkillRegistry.
+        """Build an ultra-lean Level-1 catalog: name + description only."""
+        rows = self._build_capability_catalog_rows()
+        if not rows:
+            return "Available skills catalog (name: description): none loaded"
+        return "Available skills catalog (name: description):\n" + "\n".join(rows)
 
-        Full schemas are already sent to Ollama as structured JSON — this
-        one-liner is enough for conversational self-reference without
-        duplicating ~400 tokens of schema text per call.
-        """
-        names = ", ".join(s["name"] for s in self.cognitive_router.registry.get_schemas())
-        return f"Available tools (use them — do not claim you lack them): {names}"
+    def _build_capability_catalog_rows(self) -> List[str]:
+        rows: List[str] = []
+        for item in self._load_capability_catalog_entries():
+            name = str(item.get("name") or "").strip()
+            description = str(item.get("description") or "").strip()
+            if name and description:
+                rows.append(f"- {name}: {description}")
+        return rows
+
+    def _load_capability_catalog_entries(self) -> List[Dict[str, str]]:
+        catalog_getter = getattr(self.cognitive_router.registry, "get_skill_catalog", None)
+        if callable(catalog_getter):
+            try:
+                raw_catalog = catalog_getter()
+                if isinstance(raw_catalog, list):
+                    return [item for item in raw_catalog if isinstance(item, dict)]
+            except Exception as exc:
+                logger.warning("Failed to load skill catalog from registry: %s", exc)
+
+        # Backward-compatible fallback for tests/mocks that still expose get_schemas only.
+        fallback: List[Dict[str, str]] = []
+        for schema in self.cognitive_router.registry.get_schemas():
+            fallback.append(
+                {
+                    "name": str(schema.get("name") or "").strip(),
+                    "description": str(schema.get("description") or "").strip(),
+                }
+            )
+        return fallback
+
+    def _load_executable_capability_catalog_entries(self) -> List[Dict[str, str]]:
+        registry = getattr(self.cognitive_router, "registry", None)
+        if registry is not None:
+            executable_getter = getattr(registry, "get_executable_skill_catalog", None)
+            if callable(executable_getter):
+                try:
+                    entries = executable_getter()
+                    if isinstance(entries, list):
+                        return [item for item in entries if isinstance(item, dict)]
+                except Exception as exc:
+                    logger.warning("Failed to load executable skill catalog from registry: %s", exc)
+        return self._load_capability_catalog_entries()
+
+    def _build_scoped_skill_runtime_context(self, skill_name: str) -> str:
+        """Load full SKILL.md body on demand for the current execution turn only."""
+        registry = getattr(self.cognitive_router, "registry", None)
+        if registry is None:
+            return ""
+
+        get_skill_body = getattr(registry, "get_skill_body", None)
+        if not callable(get_skill_body):
+            return ""
+
+        raw_body = str(get_skill_body(skill_name) or "").strip()
+        if not raw_body:
+            return ""
+
+        description = ""
+        for item in self._load_capability_catalog_entries():
+            if str(item.get("name") or "").strip() == skill_name:
+                description = str(item.get("description") or "").strip()
+                break
+
+        return (
+            "<scoped_skill_context>\n"
+            f"Skill: {skill_name}\n"
+            f"Description: {description}\n"
+            "Scope: immediate execution turn only\n\n"
+            "SKILL_BODY:\n"
+            f"{raw_body}\n"
+            "</scoped_skill_context>"
+        )
+
+    @staticmethod
+    def _capability_catalog_tokens(text: str) -> set[str]:
+        return {
+            token
+            for token in re.findall(_ROUTING_TOKEN_RE, str(text or "").lower())
+            if len(token) > 2 and token not in _CATALOG_MATCH_STOPWORDS
+        }
+
+    def _find_local_skill_catalog_match(
+        self,
+        gap_description: str,
+        suggested_tool_name: str,
+    ) -> Optional[Dict[str, str]]:
+        query_tokens = self._capability_catalog_tokens(gap_description)
+        query_tokens |= self._capability_catalog_tokens(str(suggested_tool_name or "").replace("_", " "))
+        if not query_tokens:
+            return None
+
+        best_item: Optional[Dict[str, str]] = None
+        best_score = 0.0
+
+        for item in self._load_executable_capability_catalog_entries():
+            name = str(item.get("name") or "").strip()
+            if not name or name in _CATALOG_META_TOOL_NAMES:
+                continue
+
+            name_tokens = self._capability_catalog_tokens(name.replace("_", " "))
+            desc_tokens = self._capability_catalog_tokens(item.get("description", ""))
+
+            score = 0.0
+            if suggested_tool_name and name.lower() == str(suggested_tool_name).strip().lower():
+                score += 6.0
+            score += 3.0 * len(query_tokens & name_tokens)
+            score += 1.5 * len(query_tokens & desc_tokens)
+
+            if score > best_score:
+                best_item = {"name": name, "description": str(item.get("description") or "").strip()}
+                best_score = score
+
+        return best_item if best_score >= 1.5 else None
+
+    async def _try_resolve_capability_gap_locally(
+        self,
+        user_id: str,
+        result: RouterResult,
+        state: Dict[str, Any],
+    ) -> Optional[str]:
+        if not bool(getattr(self, "_enable_local_skill_discovery_gate", True)):
+            return None
+
+        local_match = self._find_local_skill_catalog_match(
+            result.gap_description,
+            result.suggested_tool_name,
+        )
+        if local_match is None:
+            return None
+
+        matched_name = local_match["name"]
+        matched_description = local_match["description"]
+        user_request = str(state.get("user_input") or result.gap_description or "").strip()
+
+        logger.info(
+            "Capability gap pre-check matched local skill '%s' for user %s; attempting local recovery.",
+            matched_name,
+            user_id,
+        )
+
+        messages = [
+            {
+                "role": "system",
+                "content": (
+                    "A request_capability escalation was triggered, but a matching local skill already exists.\n"
+                    f"Matched skill: {matched_name}\n"
+                    f"Skill purpose: {matched_description}\n"
+                    "Use that existing skill to solve the request now. "
+                    "Do not call request_capability for this request."
+                ),
+            },
+            {
+                "role": "user",
+                "content": user_request,
+            },
+        ]
+
+        local_result = await self._route_to_system_1(
+            messages,
+            allowed_tools=[matched_name],
+            deadline_seconds=45.0,
+            context="capability_gap_local_recovery",
+        )
+
+        if local_result.status in {"mfa_required", "hitl_required"}:
+            return await self._handle_blocked_result(local_result, user_id, state)
+
+        if local_result.status == "ok" and local_result.content and not self._is_system_1_error(local_result):
+            return self.cognitive_router.sanitize_response(local_result.content)
+
+        logger.warning(
+            "Local capability recovery with '%s' did not resolve the request; continuing to synthesis path.",
+            matched_name,
+        )
+        return None
 
     @staticmethod
     def _is_system_1_error(result: Optional[RouterResult]) -> bool:
@@ -1692,8 +1968,18 @@ class Orchestrator:
         )
         return None
 
-    def _new_state(self, user_id: str, user_message: str) -> Dict[str, Any]:
-        return AgentState.new(user_id=user_id, user_input=user_message).to_dict()
+    def _new_state(
+        self,
+        user_id: str,
+        user_message: str,
+        *,
+        user_prompt: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        return AgentState.new(
+            user_id=user_id,
+            user_input=user_message,
+            user_prompt=user_prompt,
+        ).to_dict()
 
     @staticmethod
     def _is_explicit_epic_request(user_message: str) -> bool:
@@ -3843,7 +4129,7 @@ class Orchestrator:
             messages.append({"role": turn["role"], "content": turn["content"]})
         if state.get("critic_instructions"):
             messages.append({"role": "system", "content": state["critic_instructions"]})
-        messages.append({"role": "user", "content": f"<user_input>{user_input}</user_input>"})
+        messages.append(self._build_user_prompt_message(state))
 
         try:
             router_result = await self._route_supervisor_request(messages)
@@ -4390,7 +4676,7 @@ class Orchestrator:
         )
         if exec_result.status == "ok":
             return exec_result.content
-        return self._handle_blocked_result(exec_result, pending_tool.get("user_id", user_id), {})
+        return await self._handle_blocked_result(exec_result, pending_tool.get("user_id", user_id), {})
 
     async def _pop_pending_tool_approval_payload(self, user_id: str) -> Optional[Dict[str, Any]]:
         if user_id not in self.pending_tool_approval:
@@ -4567,7 +4853,13 @@ class Orchestrator:
                 error=e,
             )
 
-    async def _load_state(self, user_id: str, user_message: str) -> Dict[str, Any]:
+    async def _load_state(
+        self,
+        user_id: str,
+        user_message: str,
+        *,
+        user_prompt: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
         """Return a state dict: resumes a HITL conversation if pending, else creates fresh."""
         if user_id in self.pending_hitl_state:
             _hitl_entry = self.pending_hitl_state[user_id]
@@ -4589,6 +4881,7 @@ class Orchestrator:
                     logger.warning(f"Failed to clear HITL state from DB for {user_id}: {e}")
                 state["admin_guidance"] = user_message
                 state["user_input"] += f"\n[ADMIN GUIDANCE: {user_message}]"
+                state["user_prompt"] = dict(user_prompt or {})
                 state["iteration_count"] = 0
                 state["current_plan"] = []
                 # Track how many HITL cycles have been spent on this task (ISSUE-005)
@@ -4609,7 +4902,8 @@ class Orchestrator:
                         "an infinite loop. Please rephrase or break it into smaller steps."
                     )
                 return normalize_state(state)
-        state = self._new_state(user_id, user_message)
+        state = self._new_state(user_id, user_message, user_prompt=user_prompt)
+        state["user_prompt"] = dict(user_prompt or {})
         if user_id != "heartbeat":
             try:
                 state["chat_history"] = await self.ledger_memory.get_chat_history(
@@ -4624,11 +4918,11 @@ class Orchestrator:
     def _has_ready_final_response(state: Dict[str, Any]) -> bool:
         return bool(state.get("final_response") and not state.get("current_plan"))
 
-    def _consume_blocked_result(self, state: Dict[str, Any], user_id: str) -> Optional[str]:
+    async def _consume_blocked_result(self, state: Dict[str, Any], user_id: str) -> Optional[str]:
         blocked_result = state.pop(_BLOCKED_KEY, None)
         if blocked_result is None:
             return None
-        return self._handle_blocked_result(blocked_result, user_id, state)
+        return await self._handle_blocked_result(blocked_result, user_id, state)
 
     @staticmethod
     def _apply_critic_retry_instructions(state: Dict[str, Any]) -> None:
@@ -4652,7 +4946,7 @@ class Orchestrator:
     ) -> tuple[Dict[str, Any], Optional[str]]:
         for node in (self.supervisor_node, self.execute_workers_node, self.critic_node):
             state = await node(state)
-            blocked_response = self._consume_blocked_result(state, user_id)
+            blocked_response = await self._consume_blocked_result(state, user_id)
             if blocked_response is not None:
                 return state, blocked_response
         return state, None
@@ -4664,7 +4958,7 @@ class Orchestrator:
     ) -> tuple[Dict[str, Any], Optional[str]]:
         if self._compiled_graph is not None:
             state = await self._compiled_graph.ainvoke(state)
-            return state, self._consume_blocked_result(state, user_id)
+            return state, await self._consume_blocked_result(state, user_id)
         return await self._run_manual_graph_pass(state, user_id)
 
     @staticmethod
@@ -4718,7 +5012,7 @@ class Orchestrator:
             return self.cognitive_router.sanitize_response(state["final_response"])
 
         while state["iteration_count"] < max_iterations:
-            blocked_response = self._consume_blocked_result(state, user_id)
+            blocked_response = await self._consume_blocked_result(state, user_id)
             if blocked_response is not None:
                 return blocked_response
 
@@ -4738,9 +5032,17 @@ class Orchestrator:
         self._ensure_final_response(state, max_iterations)
         return await self._finalize_user_response(user_id, user_message, state["final_response"])
 
-    async def process_message(self, user_message: str, user_id: str) -> str:
+    async def process_message(self, user_message: Any, user_id: str) -> str:
         """Main entry point: State Graph execution with Energy Budget."""
-        if not user_message:
+        user_prompt = self._coerce_user_prompt_payload(user_message)
+        normalized_user_message = str(user_prompt.get("text") or "").strip()
+        has_audio_prompt = bool(self._extract_audio_bytes(user_prompt))
+
+        if not normalized_user_message and has_audio_prompt:
+            normalized_user_message = _VOICE_INPUT_PLACEHOLDER
+            user_prompt["text"] = normalized_user_message
+
+        if not normalized_user_message and not has_audio_prompt:
             return "Error: Invalid message"
 
         # Serialise concurrent messages for the same user_id to prevent
@@ -4748,43 +5050,52 @@ class Orchestrator:
         # dicts (ISSUE-012).  Different users are still processed concurrently.
         lock = await self._get_user_lock(user_id)
         async with lock:
-            reply = await self._try_resume_mfa(user_id, user_message)
+            reply = await self._try_resume_mfa(user_id, normalized_user_message)
             if reply is not None:
                 return reply
 
-            reply = await self._try_resume_tool_approval(user_id, user_message)
+            reply = await self._try_resume_tool_approval(user_id, normalized_user_message)
             if reply is not None:
                 return reply
 
-            state = await self._load_state(user_id, user_message)
+            state = await self._load_state(
+                user_id,
+                normalized_user_message,
+                user_prompt=user_prompt,
+            )
             if state.get("final_response") and not state.get("current_plan"):
                 return self.cognitive_router.sanitize_response(state["final_response"])
 
-            await self._remember_user_profile(user_id, user_message)
-            await self._remember_assistant_identity(user_message)
+            if not has_audio_prompt:
+                await self._remember_user_profile(user_id, normalized_user_message)
+                await self._remember_assistant_identity(normalized_user_message)
+            else:
+                logger.info("Audio prompt detected for %s; bypassing text-only fast-path memory hooks.", user_id)
 
-            reply = await self._try_goal_planning_response(state)
-            if reply is not None:
-                return await self._finalize_user_response(user_id, user_message, reply)
+            if not has_audio_prompt:
+                reply = await self._try_goal_planning_response(state)
+                if reply is not None:
+                    return await self._finalize_user_response(user_id, normalized_user_message, reply)
 
-            reply = await self._try_fast_path_response(state)
-            if reply is not None:
-                return await self._finalize_user_response(user_id, user_message, reply)
+                reply = await self._try_fast_path_response(state)
+                if reply is not None:
+                    return await self._finalize_user_response(user_id, normalized_user_message, reply)
 
             try:
-                return await self._run_graph_loop(state, user_id, user_message)
+                return await self._run_graph_loop(state, user_id, normalized_user_message)
             except RequiresHITLError as hitl_err:
                 state["_hitl_question"] = str(hitl_err)
                 state["_hitl_created_at"] = time.time()
-                self.pending_hitl_state[user_id] = state
+                pending_state = self._strip_audio_bytes_for_persistence(state)
+                self.pending_hitl_state[user_id] = pending_state
                 # Persist so the state survives a bot restart (ISSUE-013)
-                self._fire_and_forget(self.ledger_memory.save_hitl_state(user_id, state))
+                self._fire_and_forget(self.ledger_memory.save_hitl_state(user_id, pending_state))
                 return str(hitl_err)
             except Exception as e:
                 logger.error(f"Graph execution failed: {e}", exc_info=True)
                 return "An internal error occurred."
 
-    def _handle_blocked_result(
+    async def _handle_blocked_result(
         self,
         result: RouterResult,
         user_id: str,
@@ -4808,12 +5119,21 @@ class Orchestrator:
         if result.status == "hitl_required":
             state["_hitl_question"] = result.hitl_message
             state["_hitl_created_at"] = time.time()
-            self.pending_hitl_state[user_id] = state
+            pending_state = self._strip_audio_bytes_for_persistence(state)
+            self.pending_hitl_state[user_id] = pending_state
             # Persist so the HITL state survives a bot restart (ISSUE-013)
-            self._fire_and_forget(self.ledger_memory.save_hitl_state(user_id, state))
+            self._fire_and_forget(self.ledger_memory.save_hitl_state(user_id, pending_state))
             return result.hitl_message
 
         if result.status == "capability_gap":
+            local_resolution = await self._try_resolve_capability_gap_locally(
+                user_id,
+                result,
+                state,
+            )
+            if local_resolution is not None:
+                return local_resolution
+
             # Run synthesis in the background via _fire_and_forget which holds
             # a strong GC-safe reference (ISSUE-002).
             self._fire_and_forget(self._async_tool_synthesis(user_id, result, state))

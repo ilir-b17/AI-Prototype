@@ -10,6 +10,7 @@ class AgentState:
 
     user_id: str
     user_input: str
+    user_prompt: Dict[str, Any] = field(default_factory=dict)
     chat_history: List[Dict[str, str]] = field(default_factory=list)
     current_plan: List[Any] = field(default_factory=list)
     worker_outputs: Dict[str, str] = field(default_factory=dict)
@@ -29,14 +30,25 @@ class AgentState:
     moral_halt_summary: str = ""
 
     @classmethod
-    def new(cls, user_id: str, user_input: str) -> "AgentState":
-        return cls(user_id=user_id, user_input=user_input)
+    def new(
+        cls,
+        user_id: str,
+        user_input: str,
+        *,
+        user_prompt: Dict[str, Any] | None = None,
+    ) -> "AgentState":
+        return cls(
+            user_id=user_id,
+            user_input=user_input,
+            user_prompt=dict(user_prompt or {}),
+        )
 
     @classmethod
     def from_dict(cls, raw: Dict[str, Any]) -> "AgentState":
         return cls(
             user_id=str(raw.get("user_id", "")),
             user_input=str(raw.get("user_input", "")),
+            user_prompt=dict(raw.get("user_prompt", {}) or {}),
             chat_history=list(raw.get("chat_history", []) or []),
             current_plan=list(raw.get("current_plan", []) or []),
             worker_outputs=dict(raw.get("worker_outputs", {}) or {}),

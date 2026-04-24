@@ -13,6 +13,7 @@ import logging
 import asyncio
 import sys
 import socket
+from io import BytesIO
 from dotenv import load_dotenv
 
 # Load .env BEFORE importing any project modules so that module-level os.getenv()
@@ -53,6 +54,16 @@ _UNAUTHORIZED_MSG = "Unauthorized."
 TELEGRAM_BOT_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN')
 ADMIN_USER_ID = int(os.getenv('ADMIN_USER_ID', 0))
 AGENT_TIMEOUT_SECONDS = float(os.getenv('AGENT_TIMEOUT_SECONDS', 300.0))
+
+
+def _env_bool(name: str, default: bool = False) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    return str(raw).strip().lower() in {'1', 'true', 'yes', 'on'}
+
+
+ENABLE_NATIVE_AUDIO = _env_bool('ENABLE_NATIVE_AUDIO', default=False)
 
 if not TELEGRAM_BOT_TOKEN:
     raise ValueError("TELEGRAM_BOT_TOKEN environment variable not set")
@@ -211,6 +222,85 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     except Exception as e:
         logger.error(f"Error processing message: {e}", exc_info=True)
         await update.message.reply_text("An error occurred while processing your message. Please try again.")
+
+
+async def handle_voice_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle Telegram voice notes using in-memory buffering only."""
+    global orchestrator
+
+    user_id = update.effective_user.id
+    voice = update.message.voice
+
+    if not is_authorized(user_id):
+        logger.warning(f"Unauthorized voice message from user {user_id}")
+        await update.message.reply_text(_UNAUTHORIZED_MSG)
+        return
+
+    if voice is None:
+        await update.message.reply_text("Unsupported voice payload.")
+        return
+
+    if not ENABLE_NATIVE_AUDIO:
+        logger.info("Voice message rejected for user %s: ENABLE_NATIVE_AUDIO is disabled.", user_id)
+        await update.message.reply_text(
+            "Native audio input is disabled. Set ENABLE_NATIVE_AUDIO=true to enable voice notes."
+        )
+        return
+
+    logger.info(
+        "Voice note received from user %s: duration=%ss size=%s bytes",
+        user_id,
+        voice.duration,
+        voice.file_size,
+    )
+
+    try:
+        if orchestrator is None:
+            logger.error("Orchestrator not initialized")
+            await update.message.reply_text("System error: Service temporarily unavailable.")
+            return
+
+        stop_typing = asyncio.Event()
+        typing_task = asyncio.create_task(
+            _keep_typing_alive(context.bot, update.effective_chat.id, stop_typing)
+        )
+
+        try:
+            telegram_file = await context.bot.get_file(voice.file_id)
+            buffer = BytesIO()
+            await telegram_file.download_to_memory(out=buffer)
+            audio_bytes = buffer.getvalue()
+            if not audio_bytes:
+                await update.message.reply_text("I could not read that voice note. Please try again.")
+                return
+
+            prompt_payload = {
+                "text": str(update.message.caption or "").strip(),
+                "audio_bytes": audio_bytes,
+                "audio_mime_type": "audio/ogg",
+                "audio_source": "telegram_voice",
+                "audio_file_id": voice.file_id,
+            }
+
+            ai_response = await asyncio.wait_for(
+                orchestrator.process_message(prompt_payload, str(user_id)),
+                timeout=AGENT_TIMEOUT_SECONDS,
+            )
+        finally:
+            stop_typing.set()
+            await typing_task
+
+        await update.message.reply_text(ai_response)
+        logger.info("Voice response sent to user %s", user_id)
+
+    except (TimeoutError, asyncio.TimeoutError) as e:
+        timeout_msg = "Request timed out. Please try again."
+        logger.warning(f"Voice timeout error after {AGENT_TIMEOUT_SECONDS}s: {e}")
+        await update.message.reply_text(timeout_msg)
+
+    except Exception as e:
+        logger.error(f"Error processing voice message: {e}", exc_info=True)
+        await update.message.reply_text("An error occurred while processing your voice note. Please try again.")
 
 
 async def goals(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -570,6 +660,7 @@ def main() -> None:
         application.add_handler(CommandHandler("addgoal", addgoal))
         application.add_handler(CommandHandler("shutdown", shutdown))
         application.add_handler(CommandHandler("restart", restart))
+        application.add_handler(MessageHandler(filters.VOICE, handle_voice_message))
         application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
         application.add_error_handler(error_handler)
 

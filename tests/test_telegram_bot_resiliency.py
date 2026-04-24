@@ -25,7 +25,7 @@ os.environ['TELEGRAM_BOT_TOKEN'] = 'mock_token'
 os.environ['ADMIN_USER_ID'] = '12345'
 
 from src.interfaces import telegram_bot
-from src.interfaces.telegram_bot import handle_message
+from src.interfaces.telegram_bot import handle_message, handle_voice_message
 from telegram import Update, Message, Chat, User
 from unittest.mock import AsyncMock
 
@@ -68,3 +68,82 @@ async def test_telegram_bot_timeout():
     # After we implement the fix, handle_message should complete in 0.5s internally,
     # catching the TimeoutError from its wait_for and replying to the user.
     mock_update.message.reply_text.assert_called_with("Request timed out. Please try again.")
+
+
+@pytest.mark.asyncio
+async def test_voice_message_disabled_flag_returns_graceful_message():
+    mock_update = MagicMock(spec=Update)
+    mock_message = AsyncMock(spec=Message)
+    mock_update.message = mock_message
+    mock_update.effective_user = MagicMock(spec=User)
+    mock_update.effective_user.id = 12345
+    mock_update.effective_chat = MagicMock(spec=Chat)
+    mock_update.effective_chat.id = 12345
+    mock_update.message.voice = MagicMock(file_id="voice-file-id", duration=3, file_size=2048)
+
+    mock_context = MagicMock()
+    mock_context.bot = AsyncMock()
+
+    mock_orchestrator = MagicMock()
+    mock_orchestrator.process_message = AsyncMock(return_value="should-not-run")
+    telegram_bot.orchestrator = mock_orchestrator
+
+    prior_flag = telegram_bot.ENABLE_NATIVE_AUDIO
+    telegram_bot.ENABLE_NATIVE_AUDIO = False
+    try:
+        await handle_voice_message(mock_update, mock_context)
+    finally:
+        telegram_bot.ENABLE_NATIVE_AUDIO = prior_flag
+
+    mock_update.message.reply_text.assert_called_with(
+        "Native audio input is disabled. Set ENABLE_NATIVE_AUDIO=true to enable voice notes."
+    )
+    mock_orchestrator.process_message.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_voice_message_enabled_passes_in_memory_payload_to_orchestrator():
+    mock_update = MagicMock(spec=Update)
+    mock_message = AsyncMock(spec=Message)
+    mock_update.message = mock_message
+    mock_update.effective_user = MagicMock(spec=User)
+    mock_update.effective_user.id = 12345
+    mock_update.effective_chat = MagicMock(spec=Chat)
+    mock_update.effective_chat.id = 12345
+    mock_update.message.caption = "Please transcribe"
+    mock_update.message.voice = MagicMock(file_id="voice-file-id", duration=4, file_size=4096)
+
+    def _download_to_memory(*args, **kwargs):
+        out = kwargs.get("out")
+        out.write(b"voice-bytes")
+
+    mock_file = MagicMock()
+    mock_file.download_to_memory = AsyncMock(side_effect=_download_to_memory)
+
+    mock_context = MagicMock()
+    mock_context.bot = AsyncMock()
+    mock_context.bot.get_file = AsyncMock(return_value=mock_file)
+    mock_context.bot.send_chat_action = AsyncMock()
+
+    mock_orchestrator = MagicMock()
+    mock_orchestrator.process_message = AsyncMock(return_value="voice response")
+    telegram_bot.orchestrator = mock_orchestrator
+    telegram_bot.AGENT_TIMEOUT_SECONDS = 1.0
+
+    prior_flag = telegram_bot.ENABLE_NATIVE_AUDIO
+    telegram_bot.ENABLE_NATIVE_AUDIO = True
+    try:
+        await handle_voice_message(mock_update, mock_context)
+    finally:
+        telegram_bot.ENABLE_NATIVE_AUDIO = prior_flag
+
+    mock_context.bot.get_file.assert_awaited_once_with("voice-file-id")
+    mock_orchestrator.process_message.assert_awaited_once()
+    args, _kwargs = mock_orchestrator.process_message.await_args
+    payload = args[0]
+    assert payload["text"] == "Please transcribe"
+    assert payload["audio_bytes"] == b"voice-bytes"
+    assert payload["audio_mime_type"] == "audio/ogg"
+    assert payload["audio_source"] == "telegram_voice"
+    assert args[1] == "12345"
+    mock_update.message.reply_text.assert_called_with("voice response")

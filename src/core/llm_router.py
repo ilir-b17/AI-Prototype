@@ -9,11 +9,13 @@ System 2: Cloud LLM for complex reasoning. Provider priority:
 """
 
 import ast
+import base64
 import difflib
 import os
 import logging
 import json
 import asyncio
+import math
 import re
 import time
 from contextlib import asynccontextmanager
@@ -135,6 +137,22 @@ OLLAMA_CLOUD_API_KEY = os.getenv('OLLAMA_CLOUD_API_KEY', '').strip()
 OLLAMA_CLOUD_HOST = os.getenv('OLLAMA_CLOUD_HOST', 'https://api.ollama.com').strip()
 SYSTEM_2_MODEL = os.getenv('SYSTEM_2_MODEL', 'deepseek-v3.2').strip()
 TOOL_EXEC_TIMEOUT_SECONDS = float(os.getenv("TOOL_EXEC_TIMEOUT_SECONDS", "30"))
+DEFAULT_TARGET_CONTEXT_TOKENS = 131072
+DEFAULT_CONTEXT_RESERVE_TOKENS = 4096
+DEFAULT_MIN_INGESTION_CHARS = 4000
+DEFAULT_PARALLEL_READ_ONLY_TOOL_CONCURRENCY = 4
+_APPROX_CHARS_PER_TOKEN = 4
+_READ_ONLY_PARALLEL_TOOL_NAMES = {
+    "analyze_table_file",
+    "ask_admin_for_guidance",
+    "extract_pdf_text",
+    "extract_web_article",
+    "get_stock_price",
+    "get_system_info",
+    "query_highest_priority_task",
+    "search_archival_memory",
+    "web_search",
+}
 _CAPABILITY_MATCH_STOPWORDS = {
     "a", "an", "and", "the", "to", "for", "of", "in", "on", "or", "is", "are",
     "be", "can", "could", "would", "should", "have", "has", "with", "new", "needed",
@@ -371,6 +389,37 @@ class CognitiveRouter:
             return None
 
     @staticmethod
+    def _parse_positive_int_env(name: str, default: int) -> int:
+        raw = os.getenv(name, "").strip()
+        if not raw:
+            return default
+        try:
+            value = int(raw)
+            if value <= 0:
+                raise ValueError(raw)
+            return value
+        except ValueError:
+            logger.warning("Invalid %s=%r. Falling back to %s.", name, raw, default)
+            return default
+
+    @staticmethod
+    def _resolve_parallel_read_only_tool_concurrency() -> int:
+        raw = os.getenv(
+            "PARALLEL_READ_ONLY_TOOL_CONCURRENCY",
+            str(DEFAULT_PARALLEL_READ_ONLY_TOOL_CONCURRENCY),
+        ).strip()
+        try:
+            value = int(raw)
+        except ValueError:
+            logger.warning(
+                "Invalid PARALLEL_READ_ONLY_TOOL_CONCURRENCY=%r. Falling back to %s.",
+                raw,
+                DEFAULT_PARALLEL_READ_ONLY_TOOL_CONCURRENCY,
+            )
+            return DEFAULT_PARALLEL_READ_ONLY_TOOL_CONCURRENCY
+        return max(1, min(5, value))
+
+    @staticmethod
     def _resolve_ollama_keep_alive() -> Optional[str]:
         raw = os.getenv("OLLAMA_KEEP_ALIVE", "15m").strip()
         return raw or None
@@ -468,7 +517,7 @@ class CognitiveRouter:
     def _build_system_1_chat_kwargs(
         self,
         model: str,
-        messages: List[Dict[str, str]],
+        messages: List[Dict[str, Any]],
         *,
         tools=None,
     ) -> Dict[str, Any]:
@@ -491,6 +540,66 @@ class CognitiveRouter:
             kwargs["think"] = ollama_think
         return kwargs
 
+    @staticmethod
+    def _coerce_message_audio_bytes(message: Dict[str, Any]) -> bytes:
+        raw = message.get("audio_bytes")
+        if isinstance(raw, bytes):
+            return raw
+        if isinstance(raw, bytearray):
+            return bytes(raw)
+        if isinstance(raw, memoryview):
+            return raw.tobytes()
+        return b""
+
+    @staticmethod
+    def _coerce_message_text(raw: Any) -> str:
+        if raw is None:
+            return ""
+        if isinstance(raw, str):
+            return raw
+        return str(raw)
+
+    def _prepare_system_1_messages(self, messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        prepared: List[Dict[str, Any]] = []
+        for msg in messages or []:
+            role = str(msg.get("role") or "user")
+            content = self._coerce_message_text(msg.get("content", ""))
+            normalized: Dict[str, Any] = {
+                "role": role,
+                "content": content,
+            }
+
+            audio_bytes = self._coerce_message_audio_bytes(msg)
+            if audio_bytes and role == "user":
+                mime_type = str(msg.get("audio_mime_type") or "audio/ogg")
+                if self._enable_native_audio and "audio" in self._system_1_capabilities:
+                    normalized["audios"] = [base64.b64encode(audio_bytes).decode("ascii")]
+                    normalized["content"] = (f"{content}\n\n[Voice note attached]").strip()
+                else:
+                    fallback = (
+                        f"[Voice note attached: {len(audio_bytes)} bytes ({mime_type}). "
+                        "Native audio decoding is unavailable in this runtime. "
+                        "Use the textual context and ask for clarification if needed.]"
+                    )
+                    normalized["content"] = (f"{content}\n\n{fallback}").strip()
+
+            prepared.append(normalized)
+        return prepared
+
+    def _prepare_system_2_messages(self, messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        sanitized: List[Dict[str, Any]] = []
+        for msg in messages or []:
+            normalized: Dict[str, Any] = {
+                "role": str(msg.get("role") or "user"),
+                "content": self._coerce_message_text(msg.get("content", "")),
+            }
+            if "tool_calls" in msg:
+                normalized["tool_calls"] = msg.get("tool_calls")
+            if "tool_call_id" in msg:
+                normalized["tool_call_id"] = msg.get("tool_call_id")
+            sanitized.append(normalized)
+        return sanitized
+
     def __init__(self, model_name: str = "gemini-2.0-flash", local_model: str = "gemma4:e4b") -> None:
         self.model_name = model_name
         self.local_model = os.getenv("OLLAMA_MODEL", local_model)
@@ -509,6 +618,8 @@ class CognitiveRouter:
         self._system2_cooldown_until = 0.0
         # Optional callback to persist cooldown expiry to DB; set by Orchestrator.async_init
         self._persist_cooldown_cb = None  # Optional[Callable[[float], Awaitable[None]]]
+        # Optional callback to lazily resolve scoped SKILL.md context per tool call.
+        self._skill_context_resolver = None
 
         # SkillRegistry — single source of truth for all tool schemas and callables
         self.registry = SkillRegistry()
@@ -518,6 +629,23 @@ class CognitiveRouter:
         self._ollama_keep_alive = self._resolve_ollama_keep_alive()
         self._ollama_think = self._resolve_ollama_think()
         self._preload_system_1_on_startup = self._parse_bool_env("SYSTEM_1_PRELOAD_ON_STARTUP", False)
+        self._enable_128k_context = self._parse_bool_env("ENABLE_128K_CONTEXT", False)
+        self._enable_native_audio = self._parse_bool_env("ENABLE_NATIVE_AUDIO", False)
+        self._enable_parallel_tools = self._parse_bool_env("ENABLE_PARALLEL_TOOLS", False)
+        self._enable_scoped_skill_context = self._parse_bool_env("ENABLE_SCOPED_SKILL_CONTEXT", True)
+        self._parallel_read_only_tool_concurrency = self._resolve_parallel_read_only_tool_concurrency()
+        self._target_context_tokens = self._parse_positive_int_env(
+            "SYSTEM_1_TARGET_CONTEXT_TOKENS",
+            DEFAULT_TARGET_CONTEXT_TOKENS,
+        )
+        self._ingestion_context_reserve_tokens = self._parse_positive_int_env(
+            "INGESTION_CONTEXT_RESERVE_TOKENS",
+            DEFAULT_CONTEXT_RESERVE_TOKENS,
+        )
+        self._ingestion_min_context_chars = self._parse_positive_int_env(
+            "INGESTION_MIN_CONTEXT_CHARS",
+            DEFAULT_MIN_INGESTION_CHARS,
+        )
         self._system_1_capabilities: set[str] = set()
         self._system_1_modelinfo: Dict[str, Any] = {}
         self._system_1_context_length: Optional[int] = None
@@ -570,6 +698,17 @@ class CognitiveRouter:
             self._system_1_max_concurrency,
             self._ollama_keep_alive or "default",
             self._ollama_think,
+        )
+        logger.info(
+            "Feature flags: ENABLE_128K_CONTEXT=%s ENABLE_NATIVE_AUDIO=%s ENABLE_PARALLEL_TOOLS=%s ENABLE_SCOPED_SKILL_CONTEXT=%s",
+            self._enable_128k_context,
+            self._enable_native_audio,
+            self._enable_parallel_tools,
+            self._enable_scoped_skill_context,
+        )
+        logger.info(
+            "Parallel tool execution: read-only concurrency=%s",
+            self._parallel_read_only_tool_concurrency,
         )
 
     @staticmethod
@@ -694,6 +833,159 @@ class CognitiveRouter:
             "extract_pdf_text_from_file", "read_pdf", "pdf_extract",
         }
         return tool_name in _pdf_variants
+
+    @staticmethod
+    def _is_web_extraction_tool(tool_name: str) -> bool:
+        _web_variants = {
+            "extract_web_article", "extract_article", "fetch_article", "scrape_web",
+        }
+        return tool_name in _web_variants
+
+    @classmethod
+    def _is_context_ingestion_tool(cls, tool_name: str) -> bool:
+        return cls._is_pdf_extraction_tool(tool_name) or cls._is_web_extraction_tool(tool_name)
+
+    @staticmethod
+    def _coerce_tool_bool(value: Any, default: bool = False) -> bool:
+        if isinstance(value, bool):
+            return value
+        if value is None:
+            return default
+        if isinstance(value, str):
+            lowered = value.strip().lower()
+            if lowered in {"1", "true", "yes", "on"}:
+                return True
+            if lowered in {"0", "false", "no", "off"}:
+                return False
+            return default
+        if isinstance(value, (int, float)):
+            return bool(value)
+        return default
+
+    @staticmethod
+    def _coerce_positive_int(value: Any) -> Optional[int]:
+        if value is None:
+            return None
+        try:
+            parsed = int(value)
+        except (TypeError, ValueError):
+            return None
+        return parsed if parsed > 0 else None
+
+    def _resolve_effective_context_limit_tokens(self) -> int:
+        inspected = self._coerce_positive_int(getattr(self, "_system_1_context_length", None))
+        configured = self._coerce_positive_int((getattr(self, "_ollama_options", {}) or {}).get("num_ctx"))
+        target = self._coerce_positive_int(getattr(self, "_target_context_tokens", None)) or DEFAULT_TARGET_CONTEXT_TOKENS
+        enable_128k = bool(getattr(self, "_enable_128k_context", False))
+
+        limits = [value for value in (inspected, configured) if value is not None]
+        if enable_128k:
+            limits.append(target)
+
+        if limits:
+            return min(limits)
+        return target if enable_128k else 8192
+
+    @staticmethod
+    def _estimate_content_chars(content: Any) -> int:
+        if isinstance(content, str):
+            return len(content)
+        if isinstance(content, list):
+            total = 0
+            for part in content:
+                if isinstance(part, dict):
+                    total += len(str(part.get("text", "")))
+                else:
+                    total += len(str(part))
+            return total
+        if content is None:
+            return 0
+        return len(str(content))
+
+    @staticmethod
+    def _estimate_tool_calls_chars(tool_calls: Any) -> int:
+        if not tool_calls:
+            return 0
+        try:
+            return len(json.dumps(tool_calls, default=str))
+        except Exception:
+            return len(str(tool_calls))
+
+    @classmethod
+    def _estimate_messages_char_usage(cls, messages: List[dict]) -> int:
+        total_chars = 0
+        for msg in messages:
+            total_chars += cls._estimate_content_chars(msg.get("content", ""))
+            total_chars += cls._estimate_tool_calls_chars(msg.get("tool_calls"))
+            total_chars += 32
+        return total_chars
+
+    def _estimate_remaining_context_chars(self, current_messages: List[dict]) -> int:
+        token_limit = self._resolve_effective_context_limit_tokens()
+        reserve_tokens = self._coerce_positive_int(
+            getattr(self, "_ingestion_context_reserve_tokens", DEFAULT_CONTEXT_RESERVE_TOKENS)
+        ) or DEFAULT_CONTEXT_RESERVE_TOKENS
+        used_chars = self._estimate_messages_char_usage(current_messages)
+        used_tokens = int(math.ceil(used_chars / _APPROX_CHARS_PER_TOKEN))
+        remaining_tokens = max(0, token_limit - reserve_tokens - used_tokens)
+        return remaining_tokens * _APPROX_CHARS_PER_TOKEN
+
+    def _prepare_ingestion_tool_arguments(
+        self,
+        tool_name: str,
+        arguments: dict,
+        current_messages: List[dict],
+    ) -> tuple[dict, Optional[RouterResult]]:
+        prepared = dict(arguments or {})
+        if not self._is_context_ingestion_tool(tool_name):
+            return prepared, None
+
+        full_context = self._coerce_tool_bool(prepared.get("full_context", False), default=False)
+        prepared["full_context"] = full_context
+        if not full_context:
+            return prepared, None
+
+        if not bool(getattr(self, "_enable_128k_context", False)):
+            return prepared, RouterResult(
+                status="ok",
+                content=(
+                    "Error: full_context document ingestion is disabled. "
+                    "Set ENABLE_128K_CONTEXT=True in .env to enable 128K-context ingestion."
+                ),
+            )
+
+        remaining_chars = self._estimate_remaining_context_chars(current_messages)
+        min_chars = self._coerce_positive_int(
+            getattr(self, "_ingestion_min_context_chars", DEFAULT_MIN_INGESTION_CHARS)
+        ) or DEFAULT_MIN_INGESTION_CHARS
+        if remaining_chars < min_chars:
+            context_limit = self._resolve_effective_context_limit_tokens()
+            return prepared, RouterResult(
+                status="ok",
+                content=(
+                    "Error: Insufficient context budget for full_context ingestion "
+                    f"(remaining~{remaining_chars} chars, minimum required~{min_chars}, "
+                    f"context_limit~{context_limit} tokens). Please narrow the request "
+                    "or start a fresh turn before ingesting the full document."
+                ),
+            )
+
+        requested_max_chars = self._coerce_positive_int(prepared.get("max_chars"))
+        dynamic_max_chars = remaining_chars if requested_max_chars is None else min(remaining_chars, requested_max_chars)
+        prepared["max_chars"] = max(200, dynamic_max_chars)
+
+        if self._is_pdf_extraction_tool(tool_name) and prepared.get("max_pages") is None:
+            # Full-context mode reads all pages unless the caller requests a stricter page cap.
+            prepared["max_pages"] = 0
+
+        logger.info(
+            "Context handshake for %s: full_context=%s max_chars=%s remaining~%s chars",
+            tool_name,
+            full_context,
+            prepared.get("max_chars"),
+            remaining_chars,
+        )
+        return prepared, None
 
     def _normalize_tool_name(self, raw_name: str) -> str:
         """Best-effort normalization of hallucinated tool names.
@@ -895,10 +1187,24 @@ class CognitiveRouter:
         return raw_tc
 
     @staticmethod
-    def _parse_native_tool_call(message: dict) -> tuple:
-        """Extract (tool_name, arguments, success) from an Ollama tool_calls message."""
+    def _coerce_tool_arguments(raw_args: Any) -> dict:
+        if isinstance(raw_args, str):
+            try:
+                raw_args = json.loads(raw_args)
+            except ValueError:
+                logger.warning(f"Tool call args could not be JSON-parsed: {raw_args!r}")
+                return {}
+        if isinstance(raw_args, dict):
+            return raw_args
         try:
-            raw_tc = message["tool_calls"][0]
+            return dict(raw_args) if raw_args else {}
+        except Exception:
+            return {}
+
+    @staticmethod
+    def _parse_native_tool_call_from_raw(raw_tc: Any) -> tuple:
+        """Extract (tool_name, arguments, success) from a single Ollama tool_call item."""
+        try:
             fn_data = CognitiveRouter._extract_tool_call_function_data(raw_tc)
             tool_name = (
                 fn_data.get("name", "") if isinstance(fn_data, dict)
@@ -908,14 +1214,7 @@ class CognitiveRouter:
                 fn_data.get("arguments", {}) if isinstance(fn_data, dict)
                 else getattr(fn_data, "arguments", {})
             )
-            if isinstance(raw_args, str):
-                try:
-                    raw_args = json.loads(raw_args)
-                except ValueError:
-                    logger.warning(f"Tool call args could not be JSON-parsed: {raw_args!r}")
-                    raw_args = {}
-            elif not isinstance(raw_args, dict):
-                raw_args = dict(raw_args) if raw_args else {}
+            raw_args = CognitiveRouter._coerce_tool_arguments(raw_args)
             if not tool_name:
                 raise ValueError(f"Tool call missing 'name': {raw_tc!r}")
             # Strip namespace prefix (e.g. "extract_pdf_text:extract_pdf_text" → "extract_pdf_text")
@@ -927,11 +1226,118 @@ class CognitiveRouter:
             return "", {}, False
 
     @staticmethod
+    def _parse_native_tool_call(message: dict) -> tuple:
+        """Extract (tool_name, arguments, success) from an Ollama tool_calls message."""
+        tool_calls = message.get("tool_calls") or []
+        if not tool_calls:
+            return "", {}, False
+        return CognitiveRouter._parse_native_tool_call_from_raw(tool_calls[0])
+
+    @staticmethod
+    def _parse_native_tool_calls(message: dict) -> List[tuple[str, dict]]:
+        parsed: List[tuple[str, dict]] = []
+        for raw_tc in message.get("tool_calls") or []:
+            tool_name, arguments, ok = CognitiveRouter._parse_native_tool_call_from_raw(raw_tc)
+            if ok:
+                parsed.append((tool_name, arguments))
+        return parsed
+
+    @staticmethod
     def _message_has_tool_calls(message: dict) -> bool:
         return bool("tool_calls" in message and message["tool_calls"])
 
     def _should_continue_tool_loop(self, message: dict, iters: int) -> bool:
         return self._message_has_tool_calls(message) and iters < 10
+
+    @staticmethod
+    def _is_read_only_tool_call(tool_name: str, arguments: dict) -> bool:
+        if tool_name == "manage_file_system":
+            action = str((arguments or {}).get("action") or "").strip().lower()
+            return action in {"read", "list"}
+        return tool_name in _READ_ONLY_PARALLEL_TOOL_NAMES
+
+    async def _execute_tool_calls_sequential(self, tool_calls: List[tuple[str, dict]]) -> List[RouterResult]:
+        results: List[RouterResult] = []
+        for tool_name, arguments in tool_calls:
+            results.append(await self._execute_tool(tool_name, arguments))
+        return results
+
+    async def _execute_read_only_tool_calls_parallel(
+        self,
+        tool_calls: List[tuple[str, dict]],
+    ) -> List[RouterResult]:
+        if not tool_calls:
+            return []
+
+        max_concurrency = max(
+            1,
+            min(
+                5,
+                int(getattr(
+                    self,
+                    "_parallel_read_only_tool_concurrency",
+                    DEFAULT_PARALLEL_READ_ONLY_TOOL_CONCURRENCY,
+                )),
+            ),
+        )
+        semaphore = asyncio.Semaphore(max_concurrency)
+
+        async def _run_single(tool_name: str, arguments: dict) -> RouterResult:
+            async with semaphore:
+                return await self._execute_tool(tool_name, arguments)
+
+        return list(
+            await asyncio.gather(
+                *(_run_single(tool_name, arguments) for tool_name, arguments in tool_calls)
+            )
+        )
+
+    async def _execute_tool_calls_with_partition(
+        self,
+        tool_calls: List[tuple[str, dict]],
+    ) -> List[RouterResult]:
+        if not tool_calls:
+            return []
+
+        if not bool(getattr(self, "_enable_parallel_tools", False)):
+            return await self._execute_tool_calls_sequential(tool_calls)
+
+        results: List[RouterResult] = []
+        idx = 0
+        while idx < len(tool_calls):
+            tool_name, arguments = tool_calls[idx]
+            if self._is_read_only_tool_call(tool_name, arguments):
+                segment: List[tuple[str, dict]] = []
+                end_idx = idx
+                while end_idx < len(tool_calls):
+                    seg_name, seg_args = tool_calls[end_idx]
+                    if not self._is_read_only_tool_call(seg_name, seg_args):
+                        break
+                    segment.append((seg_name, seg_args))
+                    end_idx += 1
+
+                if len(segment) > 1:
+                    logger.info(
+                        "Parallel tool batch: %s read-only calls (concurrency=%s)",
+                        len(segment),
+                        getattr(
+                            self,
+                            "_parallel_read_only_tool_concurrency",
+                            DEFAULT_PARALLEL_READ_ONLY_TOOL_CONCURRENCY,
+                        ),
+                    )
+                    results.extend(await self._execute_read_only_tool_calls_parallel(segment))
+                else:
+                    results.extend(await self._execute_tool_calls_sequential(segment))
+
+                idx = end_idx
+                continue
+
+            # Mutating/unknown calls always execute serially to avoid races.
+            results.extend(await self._execute_tool_calls_sequential([(tool_name, arguments)]))
+            idx += 1
+
+        return results
 
     @staticmethod
     def _build_tool_signature(tool_name: str, arguments: dict) -> str:
@@ -1125,29 +1531,20 @@ class CognitiveRouter:
         arguments: dict,
         tool_output: str,
         active_tools,
-    ) -> tuple[List[dict], Optional[dict], Optional[RouterResult]]:
+    ) -> tuple[List[dict], Optional[dict]]:
         updated_messages = self._append_tool_result_messages(
             current_messages,
             tool_name,
             arguments,
             tool_output,
         )
-        pdf_result = await self._summarize_pdf_tool_output(
-            client,
-            model,
-            tool_name,
-            tool_output,
-        )
-        if pdf_result is not None:
-            return updated_messages, None, pdf_result
-
         next_message = await self._fetch_tool_followup_message(
             client,
             model,
             updated_messages,
             active_tools,
         )
-        return updated_messages, next_message, None
+        return updated_messages, next_message
 
     async def _force_tool_result_synthesis(
         self,
@@ -1176,6 +1573,45 @@ class CognitiveRouter:
             logger.warning(f"Force synthesis failed: {e}")
         return content
 
+    async def _inject_scoped_skill_context_if_needed(
+        self,
+        current_messages: List[dict],
+        tool_name: str,
+        injected_skill_names: set[str],
+    ) -> List[dict]:
+        if not bool(getattr(self, "_enable_scoped_skill_context", True)):
+            return current_messages
+
+        if tool_name in injected_skill_names:
+            return current_messages
+
+        resolver = getattr(self, "_skill_context_resolver", None)
+        if not callable(resolver):
+            return current_messages
+
+        try:
+            maybe_context = resolver(tool_name)
+            if asyncio.iscoroutine(maybe_context):
+                maybe_context = await maybe_context
+        except Exception as exc:
+            logger.warning("Failed to resolve scoped skill context for %s: %s", tool_name, exc)
+            return current_messages
+
+        context_text = str(maybe_context or "").strip()
+        if not context_text:
+            return current_messages
+
+        injected_skill_names.add(tool_name)
+        updated_messages = list(current_messages)
+        updated_messages.append(
+            {
+                "role": "system",
+                "content": context_text,
+            }
+        )
+        logger.info("Injected scoped SKILL.md context for tool '%s' in current turn.", tool_name)
+        return updated_messages
+
     async def _run_tool_loop(self, client, model: str, first_message: dict,
                              messages: List[dict], active_tools) -> RouterResult:
         """Execute a chain of tool calls until the model returns plain text.
@@ -1187,49 +1623,97 @@ class CognitiveRouter:
         message = first_message
         iters = 0
         seen_tool_calls = set()
+        injected_skill_names: set[str] = set()
         force_synthesis_prompt = ""
 
         while self._should_continue_tool_loop(message, iters):
             iters += 1
-            tool_name, arguments, ok = self._parse_native_tool_call(message)
-            if not ok:
+            raw_tool_calls = self._parse_native_tool_calls(message)
+            if not raw_tool_calls:
                 break
 
-            tool_name = self._normalize_tool_name(tool_name)
-            force_synthesis_prompt = self._track_tool_call(
-                tool_name,
-                arguments,
-                seen_tool_calls,
-            )
-            if force_synthesis_prompt:
+            normalized_calls: List[tuple[str, dict]] = []
+            duplicate_forced = False
+            for raw_tool_name, raw_arguments in raw_tool_calls:
+                tool_name = self._normalize_tool_name(raw_tool_name)
+                current_messages = await self._inject_scoped_skill_context_if_needed(
+                    current_messages,
+                    tool_name,
+                    injected_skill_names,
+                )
+                arguments, budget_result = self._prepare_ingestion_tool_arguments(
+                    tool_name,
+                    raw_arguments,
+                    current_messages,
+                )
+                if budget_result is not None:
+                    return budget_result
+
+                duplicate_prompt = self._track_tool_call(
+                    tool_name,
+                    arguments,
+                    seen_tool_calls,
+                )
+                if duplicate_prompt:
+                    force_synthesis_prompt = duplicate_prompt
+                    duplicate_forced = True
+                    break
+
+                normalized_calls.append((tool_name, arguments))
+
+            if duplicate_forced and not normalized_calls:
                 message = {"content": ""}
                 break
 
-            exec_result = await self._execute_tool(tool_name, arguments)
-            invalid_result, force_synthesis_prompt = self._process_tool_execution_result(
-                exec_result,
-                tool_name,
-                current_messages,
-                messages,
-            )
-            if invalid_result is not None:
-                return invalid_result
-            if force_synthesis_prompt:
+            if not normalized_calls:
+                break
+
+            exec_results = await self._execute_tool_calls_with_partition(normalized_calls)
+            force_after_execution = False
+
+            for batch_idx, ((tool_name, arguments), exec_result) in enumerate(
+                zip(normalized_calls, exec_results),
+                start=1,
+            ):
+                invalid_result, invalid_force_prompt = self._process_tool_execution_result(
+                    exec_result,
+                    tool_name,
+                    current_messages,
+                    messages,
+                )
+                if invalid_result is not None:
+                    return invalid_result
+                if invalid_force_prompt:
+                    force_synthesis_prompt = invalid_force_prompt
+                    force_after_execution = True
+
+                logger.info(
+                    "System 1 tool call #%s.%s: %s → %s chars",
+                    iters,
+                    batch_idx,
+                    tool_name,
+                    len(exec_result.content),
+                )
+                current_messages = self._append_tool_result_messages(
+                    current_messages,
+                    tool_name,
+                    arguments,
+                    exec_result.content,
+                )
+
+                if force_after_execution:
+                    break
+
+            if duplicate_forced or force_after_execution:
                 message = {"content": ""}
                 break
 
-            logger.info(f"System 1 tool call #{iters}: {tool_name} → {len(exec_result.content)} chars")
-            current_messages, next_message, tool_result = await self._advance_tool_loop(
+            next_message = await self._fetch_tool_followup_message(
                 client,
                 model,
                 current_messages,
-                tool_name,
-                arguments,
-                exec_result.content,
                 active_tools,
             )
-            if tool_result is not None:
-                return tool_result
             if next_message is None:
                 break
             message = next_message
@@ -1273,7 +1757,7 @@ class CognitiveRouter:
 
     async def route_to_system_1(
         self,
-        messages: List[Dict[str, str]],
+        messages: List[Dict[str, Any]],
         allowed_tools: Optional[List[str]] = None
     ) -> RouterResult:
         """
@@ -1287,8 +1771,9 @@ class CognitiveRouter:
             async with self._system_1_slot():
                 client = self._get_or_create_ollama_client()
                 active_tools = self._format_ollama_tools(allowed_tools) or None
+                prepared_messages = self._prepare_system_1_messages(messages)
                 response, available_model = await self._call_ollama_with_model_fallback(
-                    client, messages, active_tools
+                    client, prepared_messages, active_tools
                 )
 
                 if not (response and "message" in response):
@@ -1296,7 +1781,13 @@ class CognitiveRouter:
 
                 message = response["message"]
                 if "tool_calls" in message and message["tool_calls"]:
-                    return await self._run_tool_loop(client, available_model, message, list(messages), active_tools)
+                    return await self._run_tool_loop(
+                        client,
+                        available_model,
+                        message,
+                        list(prepared_messages),
+                        active_tools,
+                    )
 
                 return await self._handle_text_response(message)
 
@@ -1849,7 +2340,7 @@ Rules:
 
     async def route_to_system_2(
         self,
-        messages: List[Dict[str, str]],
+        messages: List[Dict[str, Any]],
         allowed_tools: Optional[List[str]] = None
     ) -> RouterResult:
         """
@@ -1860,12 +2351,14 @@ Rules:
             msg = self._format_cooldown_message() or "Rate limited. Please try again later."
             return RouterResult(status="ok", content=f"[System 2 - Error]: {msg}")
 
+        sanitized_messages = self._prepare_system_2_messages(messages)
+
         if self.ollama_cloud_client is not None:
-            return await self._route_to_ollama_cloud(messages, allowed_tools=allowed_tools)
+            return await self._route_to_ollama_cloud(sanitized_messages, allowed_tools=allowed_tools)
         elif self.groq_client is not None:
-            return await self._route_to_groq(messages, allowed_tools=allowed_tools)
+            return await self._route_to_groq(sanitized_messages, allowed_tools=allowed_tools)
         elif self.gemini_client is not None:
-            return await self._route_to_gemini(messages)
+            return await self._route_to_gemini(sanitized_messages)
         else:
             raise RuntimeError(
                 "No System 2 provider configured. "
@@ -1917,12 +2410,7 @@ Rules:
     @staticmethod
     def _parse_groq_tool_call(tool_call) -> tuple[str, dict]:
         tool_name = tool_call.function.name
-        try:
-            arguments = json.loads(tool_call.function.arguments)
-        except (json.JSONDecodeError, TypeError):
-            arguments = {}
-        if not isinstance(arguments, dict):
-            arguments = {}
+        arguments = CognitiveRouter._coerce_tool_arguments(tool_call.function.arguments)
         return tool_name, arguments
 
     @staticmethod
@@ -1957,50 +2445,92 @@ Rules:
 
     @staticmethod
     def _build_groq_followup_messages(
-        messages: List[Dict[str, str]],
-        tool_call,
-        tool_name: str,
-        tool_output: str,
+        messages: List[Dict[str, Any]],
+        executed_calls: List[dict],
     ) -> List[dict]:
+        assistant_tool_calls = []
+        tool_messages = []
+        for idx, executed in enumerate(executed_calls, start=1):
+            tool_call = executed["tool_call"]
+            raw_tool_name = executed["raw_tool_name"]
+            raw_arguments = executed["raw_arguments"]
+            tool_output = executed["tool_output"]
+            tool_call_id = getattr(tool_call, "id", "") or f"groq_call_{idx}"
+
+            assistant_tool_calls.append({
+                "id": tool_call_id,
+                "type": "function",
+                "function": {
+                    "name": raw_tool_name,
+                    "arguments": raw_arguments,
+                },
+            })
+            tool_messages.append({
+                "role": "tool",
+                "tool_call_id": tool_call_id,
+                "content": tool_output,
+            })
+
         return list(messages) + [
             {
                 "role": "assistant",
                 "content": None,
-                "tool_calls": [{
-                    "id": tool_call.id,
-                    "type": "function",
-                    "function": {"name": tool_name, "arguments": tool_call.function.arguments}
-                }]
+                "tool_calls": assistant_tool_calls,
             },
-            {
-                "role": "tool",
-                "tool_call_id": tool_call.id,
-                "content": tool_output
-            }
+            *tool_messages,
         ]
 
-    async def _handle_groq_tool_call(self, messages: List[Dict[str, str]], tool_call) -> RouterResult:
-        tool_name, arguments = self._parse_groq_tool_call(tool_call)
-        logger.info(f"Groq requested tool call: {tool_name}")
+    async def _handle_groq_tool_calls(
+        self,
+        messages: List[Dict[str, Any]],
+        tool_calls: List[Any],
+    ) -> RouterResult:
+        if not tool_calls:
+            return RouterResult(status="ok", content="[System 2 - Error]: Empty Groq tool call batch")
 
-        exec_result = await self._execute_tool(tool_name, arguments)
-        if exec_result.status != "ok":
-            return exec_result
+        parsed_calls = []
+        for tool_call in tool_calls:
+            raw_tool_name = getattr(getattr(tool_call, "function", None), "name", "")
+            raw_arguments = getattr(getattr(tool_call, "function", None), "arguments", {})
+            tool_name, arguments = self._parse_groq_tool_call(tool_call)
+            tool_name = self._normalize_tool_name(tool_name)
+            parsed_calls.append({
+                "tool_call": tool_call,
+                "raw_tool_name": raw_tool_name or tool_name,
+                "raw_arguments": raw_arguments,
+                "tool_name": tool_name,
+                "arguments": arguments,
+            })
 
-        logger.info(f"Groq tool '{tool_name}' executed: {exec_result.content[:100]}")
-        if tool_name == "extract_pdf_text":
-            return await self._summarize_pdf_with_groq(exec_result.content)
-
-        followup_messages = self._build_groq_followup_messages(
-            messages,
-            tool_call,
-            tool_name,
-            exec_result.content,
+        exec_results = await self._execute_tool_calls_with_partition(
+            [(item["tool_name"], item["arguments"]) for item in parsed_calls]
         )
+
+        executed_calls = []
+        for item, exec_result in zip(parsed_calls, exec_results):
+            if exec_result.status != "ok":
+                return exec_result
+            logger.info(
+                "Groq tool '%s' executed: %s",
+                item["tool_name"],
+                exec_result.content[:100],
+            )
+            executed_calls.append({
+                **item,
+                "tool_output": exec_result.content,
+            })
+
+        if len(executed_calls) == 1 and executed_calls[0]["tool_name"] == "extract_pdf_text":
+            return await self._summarize_pdf_with_groq(executed_calls[0]["tool_output"])
+
+        followup_messages = self._build_groq_followup_messages(messages, executed_calls)
         final_response = await self._create_groq_text_completion(followup_messages)
         result = (final_response.choices[0].message.content or "").strip()
         logger.info(f"System 2 (Groq) response after tool call ({len(result)} chars)")
         return RouterResult(status="ok", content=result)
+
+    async def _handle_groq_tool_call(self, messages: List[Dict[str, Any]], tool_call) -> RouterResult:
+        return await self._handle_groq_tool_calls(messages, [tool_call])
 
     @staticmethod
     def _extract_last_user_message(messages: List[Dict[str, str]]) -> str:
@@ -2035,7 +2565,8 @@ Rules:
         if self._persist_cooldown_cb is not None:
             import asyncio as _asyncio
             try:
-                _asyncio.create_task(self._persist_cooldown_cb(self._system2_cooldown_until))
+                task = _asyncio.create_task(self._persist_cooldown_cb(self._system2_cooldown_until))
+                self._cooldown_persist_task = task
             except RuntimeError:
                 pass  # No running event loop (e.g., during tests)
         msg = self._format_cooldown_message() or "Rate limited. Please try again later."
@@ -2107,7 +2638,7 @@ Rules:
 
     async def _route_to_ollama_cloud(
         self,
-        messages: List[Dict[str, str]],
+        messages: List[Dict[str, Any]],
         allowed_tools: Optional[List[str]] = None,
     ) -> RouterResult:
         """Route to Ollama Cloud (primary System 2) with full tool calling support."""
@@ -2123,7 +2654,7 @@ Rules:
             tool_calls = msg.tool_calls if hasattr(msg, "tool_calls") else msg.get("tool_calls")
 
             if tool_calls:
-                return await self._handle_ollama_cloud_tool_call(messages, tool_calls[0])
+                return await self._handle_ollama_cloud_tool_calls(messages, list(tool_calls))
 
             content = (msg.content if hasattr(msg, "content") else msg.get("content", "")) or ""
             logger.info(f"System 2 (Ollama Cloud) response received ({len(content)} chars)")
@@ -2138,42 +2669,103 @@ Rules:
                 return await self._route_to_groq(messages, allowed_tools=allowed_tools)
             return RouterResult(status="ok", content=f"[System 2 - Error]: {err_text[:200]}")
 
-    async def _handle_ollama_cloud_tool_call(
-        self,
-        messages: List[Dict[str, str]],
-        tool_call: Any,
-    ) -> RouterResult:
-        """Execute a tool requested by Ollama Cloud and feed the result back."""
-        fn = tool_call.function if hasattr(tool_call, "function") else tool_call.get("function", {})
+    @staticmethod
+    def _extract_ollama_tool_call_function(tool_call: Any) -> Any:
+        if hasattr(tool_call, "function"):
+            return tool_call.function
+        if isinstance(tool_call, dict):
+            return tool_call.get("function", {})
+        return {}
+
+    @staticmethod
+    def _parse_ollama_cloud_tool_call(tool_call: Any) -> tuple[str, dict]:
+        fn = CognitiveRouter._extract_ollama_tool_call_function(tool_call)
         tool_name = fn.name if hasattr(fn, "name") else fn.get("name", "")
         raw_args = fn.arguments if hasattr(fn, "arguments") else fn.get("arguments", {})
-        if isinstance(raw_args, str):
-            try:
-                arguments = json.loads(raw_args)
-            except (json.JSONDecodeError, TypeError):
-                arguments = {}
-        elif isinstance(raw_args, dict):
-            arguments = raw_args
-        else:
-            arguments = {}
+        arguments = CognitiveRouter._coerce_tool_arguments(raw_args)
+        return tool_name, arguments
 
-        logger.info(f"Ollama Cloud requested tool call: {tool_name}")
-        exec_result = await self._execute_tool(tool_name, arguments)
-        if exec_result.status != "ok":
-            return exec_result
+    @staticmethod
+    def _build_ollama_cloud_followup_messages(
+        messages: List[Dict[str, Any]],
+        executed_calls: List[dict],
+    ) -> List[Dict[str, Any]]:
+        assistant_tool_calls = []
+        for item in executed_calls:
+            assistant_tool_calls.append({
+                "function": {
+                    "name": item["raw_tool_name"],
+                    "arguments": item["raw_arguments"],
+                }
+            })
 
-        logger.info(f"Ollama Cloud tool '{tool_name}' executed: {exec_result.content[:100]}")
-        if tool_name == "extract_pdf_text":
-            return await self._summarize_pdf_with_ollama_cloud(exec_result.content)
-
-        # Build a follow-up with the tool result injected as a user message so the
-        # model synthesises a natural language answer from the output.
-        followup_messages = list(messages) + [
+        followup_messages: List[Dict[str, Any]] = list(messages) + [
             {
-                "role": "tool",
-                "content": exec_result.content,
+                "role": "assistant",
+                "content": "",
+                "tool_calls": assistant_tool_calls,
             }
         ]
+        for item in executed_calls:
+            followup_messages.append(
+                {
+                    "role": "tool",
+                    "content": item["tool_output"],
+                }
+            )
+        return followup_messages
+
+    async def _handle_ollama_cloud_tool_calls(
+        self,
+        messages: List[Dict[str, Any]],
+        tool_calls: List[Any],
+    ) -> RouterResult:
+        """Execute tool call batch requested by Ollama Cloud and feed results back."""
+        if not tool_calls:
+            return RouterResult(status="ok", content="[System 2 - Error]: Empty Ollama Cloud tool call batch")
+
+        parsed_calls = []
+        for tool_call in tool_calls:
+            raw_tool_name, arguments = self._parse_ollama_cloud_tool_call(tool_call)
+            tool_name = self._normalize_tool_name(raw_tool_name)
+            raw_function = self._extract_ollama_tool_call_function(tool_call)
+            raw_arguments = {}
+            if hasattr(raw_function, "arguments"):
+                raw_arguments = raw_function.arguments
+            elif isinstance(raw_function, dict):
+                raw_arguments = raw_function.get("arguments", {})
+            parsed_calls.append(
+                {
+                    "raw_tool_name": raw_tool_name or tool_name,
+                    "raw_arguments": raw_arguments,
+                    "tool_name": tool_name,
+                    "arguments": arguments,
+                }
+            )
+
+        exec_results = await self._execute_tool_calls_with_partition(
+            [(item["tool_name"], item["arguments"]) for item in parsed_calls]
+        )
+
+        executed_calls = []
+        for item, exec_result in zip(parsed_calls, exec_results):
+            if exec_result.status != "ok":
+                return exec_result
+
+            logger.info(
+                "Ollama Cloud tool '%s' executed: %s",
+                item["tool_name"],
+                exec_result.content[:100],
+            )
+            executed_calls.append({
+                **item,
+                "tool_output": exec_result.content,
+            })
+
+        if len(executed_calls) == 1 and executed_calls[0]["tool_name"] == "extract_pdf_text":
+            return await self._summarize_pdf_with_ollama_cloud(executed_calls[0]["tool_output"])
+
+        followup_messages = self._build_ollama_cloud_followup_messages(messages, executed_calls)
         resp = await self.ollama_cloud_client.chat(
             model=self.system_2_model,
             messages=followup_messages,
@@ -2182,6 +2774,13 @@ Rules:
         content = (msg.content if hasattr(msg, "content") else msg.get("content", "")) or ""
         logger.info(f"System 2 (Ollama Cloud) response after tool call ({len(content)} chars)")
         return RouterResult(status="ok", content=content.strip())
+
+    async def _handle_ollama_cloud_tool_call(
+        self,
+        messages: List[Dict[str, Any]],
+        tool_call: Any,
+    ) -> RouterResult:
+        return await self._handle_ollama_cloud_tool_calls(messages, [tool_call])
 
     async def _summarize_pdf_with_ollama_cloud(self, tool_output: str) -> RouterResult:
         if tool_output.strip().lower().startswith("error:"):
@@ -2209,7 +2808,7 @@ Rules:
             choice = response.choices[0]
 
             if self._choice_has_groq_tool_call(choice):
-                return await self._handle_groq_tool_call(messages, choice.message.tool_calls[0])
+                return await self._handle_groq_tool_calls(messages, list(choice.message.tool_calls))
 
             result = (choice.message.content or "").strip()
             logger.info(f"System 2 (Groq) response received ({len(result)} chars)")

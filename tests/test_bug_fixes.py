@@ -1133,6 +1133,13 @@ class TestTranscriptRegressionFixes:
         orchestrator._load_state.assert_awaited_once_with(
             "test_user",
             "Can you summerize the conversation we had so far?",
+            user_prompt={
+                "text": "Can you summerize the conversation we had so far?",
+                "audio_bytes": b"",
+                "audio_mime_type": "",
+                "audio_source": "",
+                "audio_file_id": "",
+            },
         )
         orchestrator._try_fast_path_response.assert_awaited_once_with(loaded_state)
 

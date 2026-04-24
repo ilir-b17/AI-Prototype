@@ -13,18 +13,29 @@ import asyncio
 import inspect
 import logging
 import importlib.util
+from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class SkillManifest:
+    name: str
+    description: str
+    source_path: str
+    has_frontmatter: bool
+    raw_body: str
+    is_executable: bool
 
 
 class SkillRegistry:
     """
     Loads skills from the skills directory.
 
-    Each skill folder must contain:
-      - __init__.py  : defines an async function named after the folder
-      - SKILL.md     : contains a ```json schema block
+        Supported skill types:
+            - Executable: SKILL.md + __init__.py + JSON schema block
+            - Instructional: SKILL.md only (frontmatter + markdown body)
 
     Usage:
         registry = SkillRegistry()
@@ -37,6 +48,7 @@ class SkillRegistry:
             skills_dir = os.path.join(os.path.dirname(__file__), "..", "skills")
         self.skills_dir = os.path.abspath(skills_dir)
         self._skills: Dict[str, Dict[str, Any]] = {}  # name → {fn, schema}
+        self._manifests: Dict[str, SkillManifest] = {}
         self._load_all()
 
     def _load_all(self) -> None:
@@ -65,22 +77,201 @@ class SkillRegistry:
 
         if not os.path.exists(md_path):
             raise FileNotFoundError(f"Missing SKILL.md in {path}")
-        if not os.path.exists(init_path):
-            raise FileNotFoundError(f"Missing __init__.py in {path}")
 
-        schema = self._parse_schema(md_path, name)
+        manifest = self._parse_manifest(md_path, name)
+        if os.path.exists(init_path):
+            schema = self._parse_schema(md_path, name)
+            tool_name = str(schema.get("name") or name).strip()
+            if not tool_name:
+                raise ValueError(f"Schema for '{name}' is missing a valid tool name")
 
-        spec   = importlib.util.spec_from_file_location(f"src.skills.{name}", init_path)
-        module = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(module)
+            spec   = importlib.util.spec_from_file_location(f"src.skills.{name}", init_path)
+            module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(module)
 
-        fn: Optional[Callable] = getattr(module, name, None)
-        if fn is None:
-            raise AttributeError(
-                f"__init__.py for skill '{name}' must define a function named '{name}'"
+            fn: Optional[Callable] = getattr(module, name, None)
+            if fn is None:
+                raise AttributeError(
+                    f"__init__.py for skill '{name}' must define a function named '{name}'"
+                )
+
+            if tool_name in self._skills:
+                raise ValueError(f"Duplicate tool name '{tool_name}' from skill folder '{name}'")
+
+            self._skills[tool_name] = {"fn": fn, "schema": schema}
+            self._register_manifest(tool_name, manifest, is_executable=True)
+            return
+
+        # Instructional skill: valid SKILL.md with no executable payload.
+        if not manifest.has_frontmatter:
+            raise ValueError(
+                f"Missing __init__.py for legacy executable skill in {path}. "
+                "Instructional skills must use YAML frontmatter."
+            )
+        self._register_manifest(manifest.name, manifest, is_executable=False)
+
+    def _register_manifest(self, name: str, manifest: SkillManifest, *, is_executable: bool) -> None:
+        canonical_name = str(name or "").strip()
+        if not canonical_name:
+            raise ValueError("Skill manifest has no valid canonical name")
+        if canonical_name in self._manifests:
+            raise ValueError(f"Duplicate skill manifest name '{canonical_name}'")
+
+        self._manifests[canonical_name] = SkillManifest(
+            name=canonical_name,
+            description=manifest.description,
+            source_path=manifest.source_path,
+            has_frontmatter=manifest.has_frontmatter,
+            raw_body=manifest.raw_body,
+            is_executable=is_executable,
+        )
+
+    @classmethod
+    def _parse_manifest(cls, md_path: str, skill_name: str) -> SkillManifest:
+        with open(md_path, "r", encoding="utf-8") as f:
+            content = f.read()
+
+        front_matter = cls._extract_front_matter(content, md_path)
+        raw_body = cls._extract_markdown_body(content)
+        if front_matter is not None:
+            metadata = cls._parse_front_matter(front_matter, md_path)
+            description = str(metadata.get("description") or "").strip()
+            if not description:
+                raise ValueError(
+                    f"Frontmatter description is required in {md_path}. "
+                    "Skipping skill to avoid low-quality routing context."
+                )
+            manifest_name = str(metadata.get("name") or skill_name).strip() or skill_name
+            return SkillManifest(
+                name=manifest_name,
+                description=description,
+                source_path=md_path,
+                has_frontmatter=True,
+                raw_body=raw_body,
+                is_executable=False,
             )
 
-        self._skills[name] = {"fn": fn, "schema": schema}
+        # Legacy path: no frontmatter, derive catalog metadata from JSON schema.
+        schema = cls._parse_schema(md_path, skill_name)
+        description = str(schema.get("description") or "").strip()
+        if not description:
+            raise ValueError(
+                f"No skill description found in frontmatter or JSON schema for {md_path}"
+            )
+        return SkillManifest(
+            name=str(schema.get("name") or skill_name),
+            description=description,
+            source_path=md_path,
+            has_frontmatter=False,
+            raw_body=raw_body,
+            is_executable=True,
+        )
+
+    @staticmethod
+    def _extract_front_matter(content: str, md_path: str) -> Optional[str]:
+        lines = content.splitlines()
+        if not lines or lines[0].strip() != "---":
+            return None
+
+        for index in range(1, len(lines)):
+            if lines[index].strip() == "---":
+                return "\n".join(lines[1:index])
+
+        raise ValueError(f"Malformed frontmatter in {md_path}: missing closing '---'")
+
+    @staticmethod
+    def _extract_markdown_body(content: str) -> str:
+        lines = content.splitlines()
+        if not lines:
+            return ""
+
+        if lines[0].strip() != "---":
+            return content.strip()
+
+        for index in range(1, len(lines)):
+            if lines[index].strip() == "---":
+                return "\n".join(lines[index + 1:]).strip()
+
+        # Malformed frontmatter path is handled by _extract_front_matter.
+        return ""
+
+    @classmethod
+    def _parse_front_matter(cls, front_matter: str, md_path: str) -> Dict[str, Any]:
+        parsed: Dict[str, Any] = {}
+        lines = front_matter.splitlines()
+        index = 0
+
+        while index < len(lines):
+            line = lines[index]
+            if not line.strip():
+                index += 1
+                continue
+
+            key, value = cls._parse_front_matter_line(line, md_path)
+            if value in {">", "|"}:
+                block_lines, index = cls._consume_indented_block(lines, index + 1)
+                parsed[key] = cls._format_block_value(block_lines, value)
+                continue
+            if value == "":
+                parsed[key], index = cls._consume_list_items(lines, index + 1)
+                continue
+
+            parsed[key] = cls._coerce_scalar(value)
+            index += 1
+
+        return parsed
+
+    @staticmethod
+    def _parse_front_matter_line(line: str, md_path: str) -> tuple[str, str]:
+        if ":" not in line:
+            raise ValueError(f"Malformed frontmatter in {md_path}: invalid line {line!r}")
+        key, raw_value = line.split(":", 1)
+        return key.strip(), raw_value.strip()
+
+    @staticmethod
+    def _consume_indented_block(lines: List[str], index: int) -> tuple[List[str], int]:
+        block_lines: List[str] = []
+        while index < len(lines):
+            block_line = lines[index]
+            if block_line.startswith("  ") or block_line.startswith("\t"):
+                block_lines.append(block_line.strip())
+                index += 1
+                continue
+            if not block_line.strip():
+                block_lines.append("")
+                index += 1
+                continue
+            break
+        return block_lines, index
+
+    @staticmethod
+    def _format_block_value(block_lines: List[str], operator: str) -> str:
+        if operator == ">":
+            return " ".join(part for part in block_lines if part).strip()
+        return "\n".join(block_lines).strip()
+
+    @staticmethod
+    def _consume_list_items(lines: List[str], index: int) -> tuple[List[str], int]:
+        list_items: List[str] = []
+        while index < len(lines):
+            stripped = lines[index].strip()
+            if not stripped:
+                index += 1
+                continue
+            if not stripped.startswith("- "):
+                break
+            list_items.append(stripped[2:].strip())
+            index += 1
+        return list_items, index
+
+    @staticmethod
+    def _coerce_scalar(value: str) -> Any:
+        stripped = value.strip()
+        if len(stripped) >= 2 and stripped[0] == stripped[-1] and stripped[0] in {'"', "'"}:
+            stripped = stripped[1:-1]
+        if re.fullmatch(r"-?\d+", stripped):
+            return int(stripped)
+        return stripped
 
     @staticmethod
     def _parse_schema(md_path: str, skill_name: str) -> Dict[str, Any]:
@@ -100,6 +291,30 @@ class SkillRegistry:
     def get_schemas(self) -> List[Dict[str, Any]]:
         """All loaded tool schemas, ready to pass to Ollama / Groq."""
         return [s["schema"] for s in self._skills.values()]
+
+    def get_skill_catalog(self) -> List[Dict[str, str]]:
+        """Ultra-lean Level-1 catalog: tool name + description only."""
+        catalog: List[Dict[str, str]] = []
+        for name in sorted(self._manifests):
+            manifest = self._manifests[name]
+            catalog.append({"name": manifest.name, "description": manifest.description})
+        return catalog
+
+    def get_executable_skill_catalog(self) -> List[Dict[str, str]]:
+        catalog: List[Dict[str, str]] = []
+        for name in sorted(self._manifests):
+            manifest = self._manifests[name]
+            if manifest.is_executable:
+                catalog.append({"name": manifest.name, "description": manifest.description})
+        return catalog
+
+    def is_executable_skill(self, name: str) -> bool:
+        manifest = self._manifests.get(name)
+        return bool(manifest and manifest.is_executable)
+
+    def get_skill_body(self, name: str) -> str:
+        manifest = self._manifests.get(name)
+        return manifest.raw_body if manifest else ""
 
     def get_function(self, name: str) -> Optional[Callable]:
         skill = self._skills.get(name)
@@ -158,6 +373,14 @@ class SkillRegistry:
     def register_dynamic(self, name: str, fn: Callable, schema: Dict[str, Any]) -> None:
         """Register a runtime-synthesised tool (System 2 capability synthesis)."""
         self._skills[name] = {"fn": fn, "schema": schema}
+        self._manifests[name] = SkillManifest(
+            name=name,
+            description=str(schema.get("description") or "Runtime dynamic tool"),
+            source_path="[runtime_dynamic]",
+            has_frontmatter=False,
+            raw_body="",
+            is_executable=True,
+        )
         logger.info(f"Dynamic skill '{name}' registered in SkillRegistry")
 
     def __len__(self) -> int:
