@@ -21,8 +21,16 @@ import time
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from typing import Optional, Dict, Any, List, AsyncIterator
-from google import genai
-from google.genai import types as genai_types
+
+try:
+    from google import genai
+    from google.genai import types as genai_types
+    GENAI_AVAILABLE = True
+except ImportError:
+    genai = None
+    genai_types = None
+    GENAI_AVAILABLE = False
+
 import ollama
 
 try:
@@ -681,9 +689,14 @@ class CognitiveRouter:
                 "GROQ_API_KEY is set but the 'groq' package is not installed. "
                 "Run: pip install groq"
             )
-        elif GEMINI_API_KEY and USE_GEMINI:
+        elif GEMINI_API_KEY and USE_GEMINI and GENAI_AVAILABLE:
             self.gemini_client = genai.Client(api_key=GEMINI_API_KEY)
             logger.info(f"System 2: Gemini ({model_name}) — API key configured")
+        elif GEMINI_API_KEY and USE_GEMINI and not GENAI_AVAILABLE:
+            logger.warning(
+                "GEMINI_API_KEY + USE_GEMINI=True is set but the 'google-genai' package "
+                "is not installed. Run: pip install google-genai"
+            )
         elif GEMINI_API_KEY and not USE_GEMINI:
             logger.warning(
                 "GEMINI_API_KEY is set but USE_GEMINI is not 'True'. "
@@ -1021,6 +1034,11 @@ class CognitiveRouter:
             return resolved
 
         # Return as-is; registry.execute() will return an error for unknowns
+        logger.debug(
+            "_normalize_tool_name: no registry match for %r - returning as-is "
+            "(will likely result in 'Unknown tool' error)",
+            raw_name,
+        )
         return raw_name
 
     @staticmethod
@@ -1817,6 +1835,9 @@ class CognitiveRouter:
         Route to System 2 (Gemini API) via the google-genai SDK.
         Tools are disabled on this path — Groq handles tool calling.
         """
+        if genai_types is None:
+            return RouterResult(status="ok", content="[System 2 - Error]: google-genai package not installed.")
+
         if not self.gemini_client:
             raise RuntimeError("Gemini not configured.")
 

@@ -6,9 +6,11 @@ using passphrase challenges, to authorize sensitive operations like modifying
 the charter or altering core memory.
 """
 
+import re
+
 def verify_mfa_challenge(user_response: str, expected_answer: str = "blue") -> bool:
     """
-    Verifies the user's response to an MFA challenge.
+    Verify MFA by requiring the expected answer as a standalone word.
 
     Args:
         user_response: The answer provided by the user.
@@ -20,9 +22,28 @@ def verify_mfa_challenge(user_response: str, expected_answer: str = "blue") -> b
     if not user_response:
         return False
 
-    # Simple case-insensitive exact match or substring match, but let's be lenient
-    # to typical input variations like "Blue.", "blue!", etc.
-    cleaned_response = "".join(c for c in user_response if c.isalnum()).lower()
-    cleaned_expected = "".join(c for c in expected_answer if c.isalnum()).lower()
+    # Normalize response/answer by lowercasing, stripping punctuation,
+    # and collapsing whitespace.
+    cleaned_response = re.sub(
+        r"\s+",
+        " ",
+        re.sub(r"[^\w\s]", "", user_response.lower()),
+    ).strip()
+    cleaned_expected = re.sub(
+        r"\s+",
+        " ",
+        re.sub(r"[^\w\s]", "", expected_answer.lower()),
+    ).strip()
 
-    return cleaned_expected in cleaned_response
+    if not cleaned_expected:
+        return False
+
+    # Require whole-word match, not substring-in-word.
+    pattern = r"\b" + re.escape(cleaned_expected) + r"\b"
+    return bool(re.search(pattern, cleaned_response))
+
+# verify_mfa_challenge("The sky is blue")  -> True
+# verify_mfa_challenge("blueprint")        -> False
+# verify_mfa_challenge("blueberry jam")    -> False
+# verify_mfa_challenge("BLUE!")            -> True
+# verify_mfa_challenge("")                 -> False

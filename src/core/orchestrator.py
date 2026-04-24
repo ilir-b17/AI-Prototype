@@ -243,6 +243,7 @@ class Orchestrator:
             self.ledger_memory = LedgerMemory(db_path=ledger_db_path)
             self.core_memory = CoreMemory(memory_file_path=core_memory_path)
             self.cognitive_router = CognitiveRouter(model_name=gemini_model, local_model=local_model)
+            self._capabilities_string_cache: Optional[str] = None
             self._enable_local_skill_discovery_gate = (
                 str(os.getenv("ENABLE_LOCAL_SKILL_DISCOVERY_GATE", "true")).strip().lower()
                 in {"1", "true", "yes", "on"}
@@ -271,6 +272,7 @@ class Orchestrator:
             self.pending_mfa: Dict[str, dict] = {}
             self.pending_hitl_state: Dict[str, dict] = {}
             self.pending_tool_approval: Dict[str, dict] = {}
+            self._synthesis_in_progress: set[str] = set()
             self._consolidation_turn_counts: Dict[str, int] = {}
             self.outbound_queue: Optional[asyncio.Queue] = None
             self.sensory_state: Dict[str, str] = {}
@@ -798,6 +800,7 @@ class Orchestrator:
         text = (user_message or "").strip()
         lowered = text.lower()
 
+        # Matches "my name is <Name>"; spaces are allowed in the name, and trailing punctuation or end-of-string is required. capitalize() is used, so mixed-case surnames like "McCaffrey" normalize to "Mccaffrey" (known limitation).
         name_match = re.search(
             r"\bmy name is\s+([a-z][a-z' -]{0,40})(?=,|\.|!|\?|$)",
             text,
@@ -808,6 +811,7 @@ class Orchestrator:
             if raw_name:
                 updates["name"] = raw_name
 
+        # Matches "<Name> is me"; question forms are intentionally not matched.
         identity_match = re.search(
             r"(?:^|[.!?,]\s*)([a-z][a-z' -]{0,60})\s+is me\b(?=,|\.|!|\?|$)",
             text,
@@ -1407,11 +1411,20 @@ class Orchestrator:
         return self._CHARTER_FALLBACK
 
     def _get_capabilities_string(self) -> str:
-        """Build an ultra-lean Level-1 catalog: name + description only."""
+        cached_value = getattr(self, "_capabilities_string_cache", None)
+        if cached_value is not None:
+            return cached_value
         rows = self._build_capability_catalog_rows()
         if not rows:
-            return "Available skills catalog (name: description): none loaded"
-        return "Available skills catalog (name: description):\n" + "\n".join(rows)
+            result = "Available skills catalog (name: description): none loaded"
+        else:
+            result = ("Available skills catalog (name: description):\n"
+                      + "\n".join(rows))
+        self._capabilities_string_cache = result
+        return result
+
+    def _invalidate_capabilities_cache(self) -> None:
+        self._capabilities_string_cache = None
 
     def _build_capability_catalog_rows(self) -> List[str]:
         rows: List[str] = []
@@ -2575,8 +2588,17 @@ class Orchestrator:
         except ValueError:
             return None
 
-        # If extra non-whitespace text appears after the JSON payload, reject it.
-        if workers_payload[end_index:].strip():
+        # Strip trailing markdown fences and punctuation the model may append.
+        remainder = workers_payload[end_index:]
+        # Allow trailing whitespace, backticks, and sentence-ending punctuation.
+        trailing = remainder.strip()
+        if trailing and not re.fullmatch(r"[\s`.,;!?]*", remainder):
+            logger.debug(
+                "_decode_workers_payload: rejected payload due to trailing "
+                "content %r (first 60 chars of payload: %r)",
+                trailing[:40],
+                workers_payload[:60],
+            )
             return None
         return decoded
 
@@ -3229,7 +3251,27 @@ class Orchestrator:
         candidate_contexts = await self._select_executable_heartbeat_tasks()
 
         if not candidate_contexts:
-            logger.info("Heartbeat: No executable dependency-resolved tasks available.")
+            # Try to report when the next deferred task becomes eligible.
+            try:
+                cursor = await self.ledger_memory._db.execute(
+                    "SELECT MIN(next_eligible_at) as earliest "
+                    "FROM objective_backlog "
+                    "WHERE tier='Task' AND status='deferred_due_to_energy' "
+                    "AND next_eligible_at IS NOT NULL"
+                )
+                row = await cursor.fetchone()
+                earliest = row["earliest"] if row else None
+            except Exception:
+                earliest = None
+
+            if earliest:
+                logger.info(
+                    "Heartbeat: No executable tasks available. "
+                    "Next deferred task eligible at: %s",
+                    earliest,
+                )
+            else:
+                logger.info("Heartbeat: No executable dependency-resolved tasks available.")
             return
 
         for candidate in candidate_contexts:
@@ -3407,6 +3449,7 @@ class Orchestrator:
                     logger.info(f"Restored dynamic tool '{tool['name']}' from registry")
                 except Exception as e:
                     logger.error(f"Failed to restore tool '{tool['name']}': {e}")
+            self._invalidate_capabilities_cache()
         except Exception as e:
             logger.warning(f"_load_approved_tools failed: {e}")
 
@@ -3542,9 +3585,19 @@ class Orchestrator:
                 return self._user_locks[user_id]
             lock = asyncio.Lock()
             self._user_locks[user_id] = lock
-            # Evict oldest entries when over the cap
-            while len(self._user_locks) > _max:
-                self._user_locks.pop(next(iter(self._user_locks)))
+            # Evict oldest UNLOCKED entry when over the cap.
+            # If all candidates are currently locked, keep them to avoid
+            # creating duplicate locks for an in-flight user.
+            if len(self._user_locks) > _max:
+                evict_key_to_remove = None
+                for evict_key, candidate in self._user_locks.items():
+                    if evict_key == user_id:
+                        continue
+                    if not candidate.locked():
+                        evict_key_to_remove = evict_key
+                        break
+                if evict_key_to_remove is not None:
+                    del self._user_locks[evict_key_to_remove]
             return lock
 
     @staticmethod
@@ -3730,7 +3783,9 @@ class Orchestrator:
         stderr_text = ""
 
         try:
-            with tempfile.TemporaryDirectory(prefix="synth_selftest_") as temp_dir:
+            tmp_dir_obj = tempfile.TemporaryDirectory(prefix="synth_selftest_")
+            try:
+                temp_dir = tmp_dir_obj.name
                 tool_path = os.path.join(temp_dir, tool_file_name)
                 test_path = os.path.join(temp_dir, test_file_name)
 
@@ -3780,6 +3835,11 @@ class Orchestrator:
                             f"(possible infinite loop or blocking operation)."
                         ),
                     }
+            finally:
+                try:
+                    tmp_dir_obj.cleanup()
+                except Exception as cleanup_err:
+                    logger.debug("Temp dir cleanup failed (non-fatal): %s", cleanup_err)
         except Exception as exc:
             elapsed_ms = int((time.perf_counter() - started) * 1000)
             return {
@@ -4842,6 +4902,7 @@ class Orchestrator:
         original_state: Dict[str, Any],
     ) -> str:
         self.cognitive_router.register_dynamic_tool(tool_name, synthesis["code"], synthesis["schema_json"])
+        self._invalidate_capabilities_cache()
         await self.ledger_memory.register_tool(
             name=tool_name,
             description=synthesis["description"],
@@ -5250,6 +5311,20 @@ class Orchestrator:
             if local_resolution is not None:
                 return local_resolution
 
+            in_progress = getattr(self, "_synthesis_in_progress", None)
+            if in_progress is None:
+                in_progress = set()
+                self._synthesis_in_progress = in_progress
+
+            if user_id in in_progress:
+                return (
+                    "A capability synthesis is already in progress for your "
+                    "request. Please wait for it to complete before sending "
+                    "a new request that requires tool synthesis."
+                )
+
+            in_progress.add(user_id)
+
             # Run synthesis in the background via _fire_and_forget which holds
             # a strong GC-safe reference (ISSUE-002).
             self._fire_and_forget(self._async_tool_synthesis(user_id, result, state))
@@ -5334,7 +5409,7 @@ class Orchestrator:
 
     async def _async_tool_synthesis(
         self,
-        _user_id: str,
+        user_id: str,
         result: RouterResult,
         state: Dict[str, Any],
     ) -> None:
@@ -5345,24 +5420,24 @@ class Orchestrator:
                 await self.outbound_queue.put(hitl_prompt)
         except Exception as e:
             logger.error(f"Background tool synthesis failed: {e}", exc_info=True)
+        finally:
+            in_progress = getattr(self, "_synthesis_in_progress", None)
+            if in_progress is not None:
+                in_progress.discard(user_id)
 
     def close(self) -> None:
         try:
             set_runtime_context(None, None, None)
             if hasattr(self, 'vector_memory') and self.vector_memory:
                 self.vector_memory.close()
-            if hasattr(self, 'cognitive_router') and self.cognitive_router:
-                # Schedule async close — best-effort at shutdown time
-                try:
-                    loop = asyncio.get_event_loop()
-                    if loop.is_running():
-                        loop.create_task(self.cognitive_router.close())
-                        loop.create_task(self.ledger_memory.close())
-                    else:
-                        loop.run_until_complete(self.cognitive_router.close())
-                        loop.run_until_complete(self.ledger_memory.close())
-                except Exception:
-                    pass
+            # cognitive_router and ledger_memory are async resources.
+            # They are closed by _async_run's finally block in telegram_bot.py.
+            # This synchronous close() path is only used in test/script contexts
+            # where those resources were never opened asynchronously.
+            logger.info(
+                "Synchronous close(): async resources (router, ledger) "
+                "must be closed by the async shutdown path."
+            )
             logger.info("Orchestrator resources cleaned up")
         except Exception as e:
             logger.error(f"Error closing Orchestrator: {e}", exc_info=True)

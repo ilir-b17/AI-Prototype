@@ -23,7 +23,7 @@ load_dotenv(override=True)
 
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
-from telegram.error import Conflict
+from telegram.error import Conflict, RetryAfter
 from src.core.orchestrator import Orchestrator
 
 # Ensure stdout/stderr use UTF-8 on Windows so Unicode log characters don't crash
@@ -124,12 +124,35 @@ async def _drain_outbound_queue(bot, queue: asyncio.Queue) -> None:
     messages to the admin via Telegram. Used by the Proactive Heartbeat.
     """
     while True:
-        try:
-            message = await queue.get()
-            await bot.send_message(chat_id=ADMIN_USER_ID, text=message[:4096])  # Telegram max length
-            queue.task_done()
-        except Exception as e:
-            logger.error(f"Failed to send admin notification: {e}", exc_info=True)
+        message = await queue.get()
+        attempts = 0
+        while attempts < 3:
+            try:
+                await bot.send_message(
+                    chat_id=ADMIN_USER_ID,
+                    text=message[:4096],
+                )
+                await asyncio.sleep(0.1)   # rate-limit guard
+                break
+            except RetryAfter as e:
+                wait = getattr(e, "retry_after", 30) + 1
+                logger.warning(
+                    "Telegram rate limit hit; retrying in %ss", wait
+                )
+                await asyncio.sleep(wait)
+                attempts += 1
+            except Exception as e:
+                logger.error(
+                    "Failed to send admin notification (attempt %s/3): %s",
+                    attempts + 1, e, exc_info=True,
+                )
+                attempts += 1
+        else:
+            logger.error(
+                "Dropped admin notification after 3 failed attempts: %s",
+                message[:120],
+            )
+        queue.task_done()
 
 
 def is_authorized(user_id: int) -> bool:
@@ -631,10 +654,10 @@ def main() -> None:
         raise
 
     try:
-        # Acquire a simple single-instance lock using a TCP port bind.
+        # Acquire a simple single-instance lock using a UDP port bind.
         lock_port = int(os.getenv("TELEGRAM_LOCK_PORT", "55678"))
         try:
-            lock_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            lock_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
             # SO_EXCLUSIVEADDRUSE (Windows) prevents other processes from binding
             # the same port even with SO_REUSEADDR set, fixing the lock on Windows.
             # Fall back to SO_REUSEADDR on non-Windows (Linux TIME_WAIT behaviour).
@@ -643,7 +666,6 @@ def main() -> None:
             else:
                 lock_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             lock_sock.bind(("127.0.0.1", lock_port))
-            lock_sock.listen(1)
             logger.info(f"Acquired single-instance lock on port {lock_port}")
         except OSError:
             logger.error(f"Another bot instance appears to be running (lock port {lock_port} in use). Exiting.")

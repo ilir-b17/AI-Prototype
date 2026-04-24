@@ -1,4 +1,5 @@
 import asyncio
+import json as _json
 import os
 
 from src.skills.manage_file_system import manage_file_system
@@ -52,11 +53,15 @@ async def test_run_terminal_command():
 
     # Test blacklist
     rm_res = await run_terminal_command("rm -rf /tmp/foo")
-    assert "Error: Command is blocked" in rm_res, f"Expected command to be blocked, got: {rm_res}"
+    rm_data = _json.loads(rm_res)
+    assert rm_data.get("status") == "error", f"Expected error status, got: {rm_res}"
+    assert "blocked" in rm_data.get("message", "").lower(), f"Expected command to be blocked, got: {rm_res}"
     print("[PASS] run_terminal_command blacklist (rm)")
 
     sudo_rm_res = await run_terminal_command("sudo rm -rf /tmp/foo")
-    assert "Error: Command is blocked" in sudo_rm_res, f"Expected command to be blocked, got: {sudo_rm_res}"
+    sudo_data = _json.loads(sudo_rm_res)
+    assert sudo_data.get("status") == "error", f"Expected error status, got: {sudo_rm_res}"
+    assert "blocked" in sudo_data.get("message", "").lower(), f"Expected command to be blocked, got: {sudo_rm_res}"
     print("[PASS] run_terminal_command blacklist (sudo rm)")
 
     # Test timeout — use a cross-platform Python one-liner so it works on both Windows and Linux

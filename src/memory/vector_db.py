@@ -8,6 +8,7 @@ contextual awareness in agent decision-making.
 
 import os
 import logging
+import threading
 import uuid
 from datetime import datetime, timedelta
 from datetime import timezone
@@ -19,6 +20,7 @@ logger = logging.getLogger(__name__)
 
 _HNSW_SPACE = "cosine"
 _COLLECTION_METADATA = {"hnsw:space": _HNSW_SPACE}
+_CLOSED_COLLECTION_ERROR = "VectorMemory has been closed"
 
 
 class VectorMemory:
@@ -42,6 +44,7 @@ class VectorMemory:
         """
         self.persist_dir = persist_dir
         self.collection = None
+        self._collection_lock = threading.Lock()
 
         # Ensure the persistence directory exists
         os.makedirs(self.persist_dir, exist_ok=True)
@@ -116,7 +119,10 @@ class VectorMemory:
 
         # Near-duplicate guard: skip insert if a very similar entry already exists
         try:
-            existing = self.collection.query(query_texts=[text], n_results=1)
+            with self._collection_lock:
+                if self.collection is None:
+                    raise RuntimeError(_CLOSED_COLLECTION_ERROR)
+                existing = self.collection.query(query_texts=[text], n_results=1)
             if existing.get("distances") and existing["distances"][0]:
                 similarity = 1.0 - existing["distances"][0][0]  # cosine: distance = 1 − sim
                 if similarity >= dedup_threshold:
@@ -145,11 +151,14 @@ class VectorMemory:
         for attempt in range(max_retries):
             try:
                 # Add memory to the collection with explicit ID
-                self.collection.add(
-                    ids=[memory_id],
-                    documents=[text],
-                    metadatas=[metadata]
-                )
+                with self._collection_lock:
+                    if self.collection is None:
+                        raise RuntimeError(_CLOSED_COLLECTION_ERROR)
+                    self.collection.add(
+                        ids=[memory_id],
+                        documents=[text],
+                        metadatas=[metadata]
+                    )
 
                 logger.info(f"Memory added with ID: {memory_id}")
                 return memory_id
@@ -194,10 +203,13 @@ class VectorMemory:
 
         try:
             # Query the collection
-            results = self.collection.query(
-                query_texts=[query_text],
-                n_results=n_results
-            )
+            with self._collection_lock:
+                if self.collection is None:
+                    raise RuntimeError(_CLOSED_COLLECTION_ERROR)
+                results = self.collection.query(
+                    query_texts=[query_text],
+                    n_results=n_results
+                )
 
             # Format results into a more readable structure
             formatted_results = []
@@ -227,7 +239,10 @@ class VectorMemory:
             Exception: If deletion fails.
         """
         try:
-            self.collection.delete(ids=[memory_id])
+            with self._collection_lock:
+                if self.collection is None:
+                    raise RuntimeError(_CLOSED_COLLECTION_ERROR)
+                self.collection.delete(ids=[memory_id])
             logger.info(f"Memory {memory_id} deleted")
         except Exception as e:
             logger.error(f"Failed to delete memory {memory_id}: {e}")
@@ -241,9 +256,14 @@ class VectorMemory:
             int: The total count of memories.
         """
         try:
-            count = self.collection.count()
+            with self._collection_lock:
+                if self.collection is None:
+                    raise RuntimeError(_CLOSED_COLLECTION_ERROR)
+                count = self.collection.count()
             logger.info(f"Total memories in database: {count}")
             return count
+        except RuntimeError:
+            raise
         except Exception as e:
             logger.error(f"Failed to retrieve memory count: {e}")
             return 0
@@ -258,12 +278,15 @@ class VectorMemory:
             Exception: If clearing fails.
         """
         try:
-            # Delete the collection and recreate it
-            self.client.delete_collection(name="agent_memory")
-            self.collection = self.client.get_or_create_collection(
-                name="agent_memory",
-                metadata=_COLLECTION_METADATA
-            )
+            with self._collection_lock:
+                if self.collection is None:
+                    raise RuntimeError(_CLOSED_COLLECTION_ERROR)
+                # Delete the collection and recreate it
+                self.client.delete_collection(name="agent_memory")
+                self.collection = self.client.get_or_create_collection(
+                    name="agent_memory",
+                    metadata=_COLLECTION_METADATA
+                )
             logger.warning("All memories cleared from the database")
         except Exception as e:
             logger.error(f"Failed to clear all memories: {e}")
@@ -279,11 +302,11 @@ class VectorMemory:
         nulling the client reference.
         """
         try:
-            # Drop the collection reference before touching the client so that
-            # any concurrent asyncio.to_thread() calls see None and raise an
-            # AttributeError rather than accessing a half-torn-down client.
-            if hasattr(self, 'collection') and self.collection is not None:
-                self.collection = None
+            # Drop the collection reference under a thread lock so any in-flight
+            # worker call completes before teardown begins.
+            with self._collection_lock:
+                if hasattr(self, 'collection') and self.collection is not None:
+                    self.collection = None
 
             if hasattr(self, 'client') and self.client is not None:
                 # Attempt to stop ChromaDB's internal background system
@@ -304,14 +327,17 @@ class VectorMemory:
         # Existing DB rows with legacy/mixed timestamp formats are not retroactively fixed.
         cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).strftime("%Y-%m-%dT%H:%M:%S")
         try:
-            results = self.collection.get(
-                where={"timestamp": {"$lt": cutoff}},
-                include=["metadatas"],
-            )
-            ids = results.get("ids", [])
-            if ids:
-                self.collection.delete(ids=ids)
-                logger.info("Pruned %d old vector memories (older than %d days).", len(ids), days)
+            with self._collection_lock:
+                if self.collection is None:
+                    raise RuntimeError(_CLOSED_COLLECTION_ERROR)
+                results = self.collection.get(
+                    where={"timestamp": {"$lt": cutoff}},
+                    include=["metadatas"],
+                )
+                ids = results.get("ids", [])
+                if ids:
+                    self.collection.delete(ids=ids)
+                    logger.info("Pruned %d old vector memories (older than %d days).", len(ids), days)
             return len(ids)
         except Exception as e:
             logger.warning("Vector memory pruning failed: %s", e)

@@ -1527,15 +1527,26 @@ class LedgerMemory:
         import json
         async with self._lock:
             cursor = await self._db.execute(
-                "SELECT user_id, synthesis_json, original_input FROM pending_tool_approvals"
+                "SELECT user_id, synthesis_json, original_input, created_at FROM pending_tool_approvals"
             )
             rows = await cursor.fetchall()
+
+        def _to_epoch(value) -> float:
+            if isinstance(value, (int, float)):
+                return float(value)
+            try:
+                from datetime import datetime
+                return datetime.fromisoformat(str(value)).timestamp()
+            except Exception:
+                return 0.0
+
         result = {}
         for row in rows:
             try:
                 result[row["user_id"]] = {
                     "synthesis": json.loads(row["synthesis_json"]),
                     "original_input": row["original_input"],
+                    "_created_at": _to_epoch(row["created_at"]),
                 }
             except Exception:
                 pass
@@ -1820,13 +1831,28 @@ class LedgerMemory:
         import json as _json
         async with self._lock:
             cursor = await self._db.execute(
-                "SELECT user_id, state_json FROM pending_hitl_states"
+                "SELECT user_id, state_json, created_at FROM pending_hitl_states"
             )
             rows = await cursor.fetchall()
+
+        def _to_epoch(value) -> float:
+            if isinstance(value, (int, float)):
+                return float(value)
+            try:
+                from datetime import datetime
+                return datetime.fromisoformat(str(value)).timestamp()
+            except Exception:
+                return 0.0
+
         result = {}
         for row in rows:
             try:
-                result[row["user_id"]] = _json.loads(row["state_json"])
+                state_payload = _json.loads(row["state_json"])
+                if isinstance(state_payload, dict):
+                    state_payload["_hitl_created_at"] = _to_epoch(row["created_at"])
+                    result[row["user_id"]] = state_payload
+                else:
+                    logger.warning("Could not deserialize HITL state for user '%s': payload is not a dict", row["user_id"])
             except Exception as e:
                 logger.warning(f"Could not deserialize HITL state for user '{row['user_id']}': {e}")
         return result
@@ -1887,13 +1913,23 @@ class LedgerMemory:
                 "SELECT user_id, tool_name, arguments_json, created_at FROM pending_mfa_states"
             )
             rows = await cursor.fetchall()
+
+        def _to_epoch(value) -> float:
+            if isinstance(value, (int, float)):
+                return float(value)
+            try:
+                from datetime import datetime
+                return datetime.fromisoformat(str(value)).timestamp()
+            except Exception:
+                return 0.0
+
         result = {}
         for row in rows:
             try:
                 result[row["user_id"]] = {
                     "name": row["tool_name"],
                     "arguments": _json.loads(row["arguments_json"]),
-                    "_created_at": row["created_at"],
+                    "_created_at": _to_epoch(row["created_at"]),
                 }
             except Exception as e:
                 logger.warning("Could not deserialize MFA state for '%s': %s", row["user_id"], e)
