@@ -13,6 +13,7 @@ import base64
 import difflib
 import io
 import os
+import sys
 import logging
 import json
 import asyncio
@@ -41,6 +42,7 @@ try:
 except ImportError:
     GROQ_AVAILABLE = False
 
+from src.core.dynamic_tool_worker import DynamicToolWorkerClient
 from src.core.skill_manager import SkillRegistry
 
 # ── Structured result returned by all router methods ─────────────────────────
@@ -112,6 +114,12 @@ _BLOCKED_TOP_LEVEL_MODULES = {
     "marshal",      # low-level serialization; can reconstruct code objects
     "shelve",       # uses pickle internally
     "ast",          # can parse/compile/reconstruct blocked expressions at runtime
+    "sqlite3",      # direct access to AIDEN's ledger DB must not be available
+    "dbm",
+    "fileinput",
+    "linecache",
+    "io",           # io.open would bypass the worker-local safe open wrapper
+    "src",          # dynamic tools must never import AIDEN modules
 }
 
 # Generated pytest scripts are intentionally constrained to a tight import
@@ -133,7 +141,7 @@ _BLOCKED_DUNDER_ATTRIBUTES = {
 }
 
 _BLOCKED_TOOL_BUILTINS = {
-    "eval", "exec", "compile", "open", "__import__", "globals", "locals",
+    "eval", "exec", "compile", "__import__", "globals", "locals",
     "getattr", "setattr", "delattr", "vars",
 }
 
@@ -550,8 +558,11 @@ class CognitiveRouter:
         messages: List[Dict[str, Any]],
         *,
         tools=None,
+        max_output_tokens: Optional[int] = None,
     ) -> Dict[str, Any]:
-        ollama_options = getattr(self, "_ollama_options", {}) or {}
+        ollama_options = dict(getattr(self, "_ollama_options", {}) or {})
+        if max_output_tokens is not None:
+            ollama_options["num_predict"] = max(1, int(max_output_tokens))
         ollama_keep_alive = getattr(self, "_ollama_keep_alive", None)
         ollama_think = getattr(self, "_ollama_think", None)
         system_1_capabilities = getattr(self, "_system_1_capabilities", set()) or set()
@@ -646,13 +657,18 @@ class CognitiveRouter:
         self._system_1_total_wait_seconds = 0.0
         self._system_1_peak_waiting_requests = 0
         self._system2_cooldown_until = 0.0
-        # Optional callback to persist cooldown expiry to DB; set by Orchestrator.async_init
-        self._persist_cooldown_cb = None  # Optional[Callable[[float], Awaitable[None]]]
+        # Optional callback to persist cooldown expiry to DB; set by Orchestrator.async_init.
+        # The orchestrator callback schedules persistence through Orchestrator._fire_and_forget.
+        self._persist_cooldown_cb = None
         # Optional callback to lazily resolve scoped SKILL.md context per tool call.
         self._skill_context_resolver = None
 
         # SkillRegistry — single source of truth for all tool schemas and callables
         self.registry = SkillRegistry()
+        self._dynamic_tool_worker = DynamicToolWorkerClient(
+            call_timeout_seconds=TOOL_EXEC_TIMEOUT_SECONDS,
+        )
+        self.registry.set_dynamic_tool_worker(self._dynamic_tool_worker)
 
         # System 1: cached Ollama client — created once, reused across all calls
         self._ollama_client: Optional[ollama.AsyncClient] = None
@@ -834,9 +850,25 @@ class CognitiveRouter:
             "peak_waiting_requests": self._system_1_peak_waiting_requests,
         }
 
+    def set_dynamic_tool_restart_callback(self, callback) -> None:
+        worker = getattr(self, "_dynamic_tool_worker", None)
+        if worker is not None:
+            worker.set_restart_callback(callback)
+
+    async def start_dynamic_tool_worker(self) -> None:
+        worker = getattr(self, "_dynamic_tool_worker", None)
+        if worker is None:
+            worker = DynamicToolWorkerClient(call_timeout_seconds=TOOL_EXEC_TIMEOUT_SECONDS)
+            self._dynamic_tool_worker = worker
+            self.registry.set_dynamic_tool_worker(worker)
+        await worker.start()
+
     async def close(self) -> None:
-        """Release the cached Ollama client connection."""
-        if self._ollama_client is not None:
+        """Release cached runtime resources."""
+        worker = getattr(self, "_dynamic_tool_worker", None)
+        if worker is not None:
+            await worker.shutdown()
+        if getattr(self, "_ollama_client", None) is not None:
             try:
                 await self._ollama_client.close()
             except Exception as e:
@@ -1205,7 +1237,14 @@ class CognitiveRouter:
         minutes, seconds = divmod(remaining, 60)
         return f"Rate limited. Retry in {minutes}m{seconds}s."
 
-    async def _call_ollama_with_model_fallback(self, client, messages, tools):
+    async def _call_ollama_with_model_fallback(
+        self,
+        client,
+        messages,
+        tools,
+        *,
+        max_output_tokens: Optional[int] = None,
+    ):
         """Call Ollama chat with the configured local model.
 
         Raises on failure so the orchestrator's S1→S2 escalation logic takes over.
@@ -1213,7 +1252,14 @@ class CognitiveRouter:
         """
         model = self.local_model
         response = await asyncio.wait_for(
-            client.chat(**self._build_system_1_chat_kwargs(model, messages, tools=tools)),
+            client.chat(
+                **self._build_system_1_chat_kwargs(
+                    model,
+                    messages,
+                    tools=tools,
+                    max_output_tokens=max_output_tokens,
+                )
+            ),
             timeout=self._ollama_timeout,
         )
         return response, model
@@ -1798,7 +1844,9 @@ class CognitiveRouter:
     async def route_to_system_1(
         self,
         messages: List[Dict[str, Any]],
-        allowed_tools: Optional[List[str]] = None
+        allowed_tools: Optional[List[str]] = None,
+        *,
+        max_output_tokens: Optional[int] = None,
     ) -> RouterResult:
         """
         Route to System 1 (Local Model) - Fast, pattern-based responses.
@@ -1813,7 +1861,10 @@ class CognitiveRouter:
                 active_tools = self._format_ollama_tools(allowed_tools) or None
                 prepared_messages = self._prepare_system_1_messages(messages)
                 response, available_model = await self._call_ollama_with_model_fallback(
-                    client, prepared_messages, active_tools
+                    client,
+                    prepared_messages,
+                    active_tools,
+                    max_output_tokens=max_output_tokens,
                 )
 
                 if not (response and "message" in response):
@@ -2209,6 +2260,12 @@ Rules:
                 f"Synthesised tool '{tool_name}' imports blocked module '{module_name}'. "
                 f"Blocked modules: {sorted(_BLOCKED_TOP_LEVEL_MODULES)}"
             )
+        stdlib_names = getattr(sys, "stdlib_module_names", set())
+        if stdlib_names and base not in stdlib_names:
+            raise ValueError(
+                f"Synthesised tool '{tool_name}' imports non-stdlib module '{module_name}'. "
+                "Dynamic tools may only import Python standard library modules."
+            )
 
     @staticmethod
     def _validate_ast_import_node(node: ast.AST, tool_name: str) -> bool:
@@ -2402,53 +2459,40 @@ Rules:
             CognitiveRouter._validate_dynamic_tool_bare_token(token, tool_name)
             CognitiveRouter._validate_dynamic_tool_dotted_token(significant_tokens, index, tool_name)
 
-    def register_dynamic_tool(self, tool_name: str, code: str, schema_json: str) -> None:
-        """Load synthesised Python code into the runtime via the SkillRegistry.
+    @staticmethod
+    def _coerce_dynamic_schema(tool_name: str, schema_json: Any) -> Dict[str, Any]:
+        if isinstance(schema_json, dict):
+            schema = dict(schema_json)
+        else:
+            try:
+                schema = json.loads(str(schema_json or ""))
+            except Exception as exc:
+                raise RuntimeError(f"Invalid schema JSON for '{tool_name}': {exc}") from exc
+        if not isinstance(schema, dict):
+            raise RuntimeError(f"Invalid schema JSON for '{tool_name}': schema must be an object")
+        schema.setdefault("name", tool_name)
+        return schema
 
-        The code is first validated through an AST sandbox that blocks imports
-        of dangerous modules (os, sys, subprocess, etc.) before execution.
+    async def register_dynamic_tool(self, tool_name: str, code: str, schema_json: Any) -> None:
+        """Register synthesised code in the isolated dynamic-tool worker.
+
+        The orchestrator process validates the payload, sends the source to the
+        worker for a second validation + exec pass, then stores only the schema
+        in the local SkillRegistry.
         """
-        import types
-        import json as _json
-
-        # ── AST sandbox check ──────────────────────────────────────────────
         self._validate_tool_code_ast(code, tool_name)
         self._validate_dynamic_tool_token_scan(code, tool_name)
+        schema = self._coerce_dynamic_schema(tool_name, schema_json)
 
-        module = types.ModuleType(f"dynamic_tool_{tool_name}")
-        # Restrict built-ins to a safe subset so that exec() cannot reach
-        # open(), eval(), __import__(), exec(), compile(), etc. even if the
-        # AST check is somehow bypassed.
-        _safe_builtins = {
-            "None": None, "True": True, "False": False,
-            "abs": abs, "all": all, "any": any, "bool": bool,
-            "bytes": bytes, "chr": chr, "dict": dict,
-            "divmod": divmod, "enumerate": enumerate, "filter": filter,
-            "float": float, "format": format, "frozenset": frozenset,
-            "hasattr": hasattr, "hash": hash,
-            "int": int, "isinstance": isinstance, "issubclass": issubclass,
-            "iter": iter, "len": len, "list": list, "map": map,
-            "max": max, "min": min, "next": next,
-            "ord": ord, "pow": pow, "print": print, "range": range,
-            "repr": repr, "reversed": reversed, "round": round,
-            "set": set, "slice": slice, "sorted": sorted, "str": str,
-            "sum": sum, "tuple": tuple,
-            "zip": zip,
-        }
-        module.__dict__["__builtins__"] = _safe_builtins
-        exec(compile(code, f"<dynamic:{tool_name}>", "exec"), module.__dict__)
+        worker = getattr(self, "_dynamic_tool_worker", None)
+        if worker is None:
+            raise RuntimeError("Dynamic tool worker is not configured.")
+        response = await worker.register_tool(tool_name, code, schema)
+        if not response.get("ok"):
+            raise RuntimeError(str(response.get("error") or "Dynamic tool worker registration failed."))
 
-        fn = getattr(module, tool_name, None)
-        if fn is None:
-            raise RuntimeError(f"Synthesised code does not define function '{tool_name}'")
-
-        try:
-            schema = _json.loads(schema_json)
-        except Exception as exc:
-            raise RuntimeError(f"Invalid schema JSON for '{tool_name}': {exc}")
-
-        self.registry.register_dynamic(tool_name, fn, schema)
-        logger.info(f"Dynamic tool '{tool_name}' registered via SkillRegistry")
+        self.registry.register_dynamic(tool_name, schema)
+        logger.info("Dynamic tool '%s' registered in isolated worker", tool_name)
 
     def get_system_1_available(self) -> bool:
         """System 1 (local Ollama) is always considered available."""
@@ -2689,12 +2733,10 @@ Rules:
         self._system2_cooldown_until = time.time() + cooldown_seconds
         # Persist cooldown so it survives a bot restart
         if self._persist_cooldown_cb is not None:
-            import asyncio as _asyncio
             try:
-                task = _asyncio.create_task(self._persist_cooldown_cb(self._system2_cooldown_until))
-                self._cooldown_persist_task = task
-            except RuntimeError:
-                pass  # No running event loop (e.g., during tests)
+                self._persist_cooldown_cb(self._system2_cooldown_until)
+            except Exception as persist_error:
+                logger.warning("Failed to schedule Groq cooldown persistence: %s", persist_error)
         msg = self._format_cooldown_message() or "Rate limited. Please try again later."
         logger.warning(f"Groq rate limit hit: {msg}")
         return RouterResult(status="ok", content=f"[System 2 - Error]: {msg}")

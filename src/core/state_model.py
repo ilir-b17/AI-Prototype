@@ -28,6 +28,7 @@ class AgentState:
     moral_remediation_constraints: List[str] = field(default_factory=list)
     moral_halt_required: bool = False
     moral_halt_summary: str = ""
+    _turn_failed: bool = False
 
     @classmethod
     def new(
@@ -42,6 +43,14 @@ class AgentState:
             user_input=user_input,
             user_prompt=dict(user_prompt or {}),
         )
+
+    @staticmethod
+    def _clean_string_list(raw_items: Any) -> List[str]:
+        return [
+            str(item).strip()
+            for item in (raw_items or [])
+            if str(item).strip()
+        ]
 
     @classmethod
     def from_dict(cls, raw: Dict[str, Any]) -> "AgentState":
@@ -63,13 +72,10 @@ class AgentState:
             moral_audit_mode=str(raw.get("moral_audit_mode", "") or ""),
             moral_audit_trace=str(raw.get("moral_audit_trace", "") or ""),
             moral_audit_bypassed=bool(raw.get("moral_audit_bypassed", False)),
-            moral_remediation_constraints=[
-                str(item).strip()
-                for item in (raw.get("moral_remediation_constraints", []) or [])
-                if str(item).strip()
-            ],
+            moral_remediation_constraints=cls._clean_string_list(raw.get("moral_remediation_constraints", [])),
             moral_halt_required=bool(raw.get("moral_halt_required", False)),
             moral_halt_summary=str(raw.get("moral_halt_summary", "") or ""),
+            _turn_failed=bool(raw.get("_turn_failed", False)),
         )
 
     def to_dict(self) -> Dict[str, Any]:

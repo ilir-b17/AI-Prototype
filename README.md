@@ -24,6 +24,15 @@ The core engine operates on a multi-node **State Graph Architecture** with a bui
 When System 1 encounters an explicit gap in its toolset, it raises a signal to the Orchestrator. The Orchestrator routes the request to System 2, which dynamically writes Python code for a new tool to bridge the gap.
 The system uses a **Human-in-the-Loop (HITL)** prompt to ask the Admin to approve the synthesized code before it is actively deployed and registered in the database.
 
+#### Dynamic Tool Isolation
+Approved synthesized tools do not execute inside the orchestrator process. At startup the orchestrator launches one long-lived Python worker subprocess in isolated mode (`python -I`) and communicates with it over newline-delimited JSON on stdin/stdout.
+
+The orchestrator stores only approved tool schemas in the local `SkillRegistry`; the approved source code is registered inside the worker and persisted in the SQLite `tool_registry` for restart recovery. Static skills under `src/skills/` still run in-process. Dynamic tool calls are forwarded to the worker with the same `TOOL_EXEC_TIMEOUT_SECONDS` guard used by normal tool execution.
+
+If the worker exits, hangs, or breaks its pipe, the next dynamic tool call logs a critical event, respawns the worker, and re-registers approved tools from the ledger. A periodic ping checks worker health, and shutdown sends a JSON `shutdown` request before force-killing the worker if it does not exit within three seconds.
+
+On POSIX systems the worker applies best-effort resource limits with `resource.setrlimit`: 5 CPU seconds per call, 256 MB address space, and 32 open files. On Windows these limits are best-effort because the stdlib `resource` module is unavailable; isolation still uses a separate process, `python -I`, a minimal environment, and a worker-local temp directory for `/tmp` and relative file writes.
+
 #### Cognitive Synergy & The Learning Loop (System 1 & System 2)
 When System 1 encounters a complex reasoning task or gets stuck, it can trigger the `escalate_to_system_2` tool.
 System 2 solves the problem and provides a "Reasoning Blueprint." This blueprint is seamlessly written into the agent's Vector Database (Archival Memory).

@@ -96,6 +96,17 @@ class LedgerMemory:
                 )
             """)
             await self._db.execute("""
+                CREATE TABLE IF NOT EXISTS cloud_payload_audit (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    purpose TEXT NOT NULL,
+                    message_count_before INTEGER NOT NULL,
+                    message_count_after INTEGER NOT NULL,
+                    allow_sensitive_context INTEGER NOT NULL DEFAULT 0,
+                    payload_sha256 TEXT NOT NULL,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            """)
+            await self._db.execute("""
                 CREATE INDEX IF NOT EXISTS idx_task_status ON task_queue(status)
             """)
             await self._db.execute("""
@@ -103,6 +114,10 @@ class LedgerMemory:
             """)
             await self._db.execute("""
                 CREATE INDEX IF NOT EXISTS idx_log_timestamp ON system_logs(timestamp)
+            """)
+            await self._db.execute("""
+                CREATE INDEX IF NOT EXISTS idx_cloud_payload_audit_created_at
+                ON cloud_payload_audit(created_at DESC, id DESC)
             """)
             await self._db.execute("""
                 CREATE TABLE IF NOT EXISTS objective_backlog (
@@ -807,6 +822,50 @@ class LedgerMemory:
         logger.info(f"Retrieved {len(logs)} log entries")
         return logs
 
+    async def append_cloud_payload_audit(
+        self,
+        *,
+        purpose: str,
+        message_count_before: int,
+        message_count_after: int,
+        allow_sensitive_context: bool,
+        payload_sha256: str,
+    ) -> int:
+        """Append one cloud payload audit row without storing payload contents."""
+        async with self._lock:
+            cursor = await self._db.execute(
+                "INSERT INTO cloud_payload_audit "
+                "(purpose, message_count_before, message_count_after, allow_sensitive_context, payload_sha256) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (
+                    str(purpose or ""),
+                    int(message_count_before),
+                    int(message_count_after),
+                    1 if allow_sensitive_context else 0,
+                    str(payload_sha256 or ""),
+                ),
+            )
+            await self._db.commit()
+            return int(cursor.lastrowid)
+
+    async def get_cloud_payload_audit_entries(self, limit: int = 100) -> List[Dict[str, Any]]:
+        """Read cloud payload audit rows, most recent first."""
+        async with self._lock:
+            cursor = await self._db.execute(
+                "SELECT id, purpose, message_count_before, message_count_after, "
+                "allow_sensitive_context, payload_sha256, created_at "
+                "FROM cloud_payload_audit ORDER BY created_at DESC, id DESC LIMIT ?",
+                (int(limit),),
+            )
+            rows = await cursor.fetchall()
+
+        entries: List[Dict[str, Any]] = []
+        for row in rows:
+            item = dict(row)
+            item["allow_sensitive_context"] = bool(item.get("allow_sensitive_context"))
+            entries.append(item)
+        return entries
+
     async def append_moral_audit_log(
         self,
         *,
@@ -1211,7 +1270,7 @@ class LedgerMemory:
         statuses: Optional[List[str]] = None,
     ) -> List[dict]:
         """Return Task rows that still have unresolved depends_on_ids."""
-        statuses = statuses or ["pending", "active"]
+        statuses = statuses or ["pending", "active", "deferred_due_to_energy"]
         if not statuses:
             return []
 

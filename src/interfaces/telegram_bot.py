@@ -51,6 +51,9 @@ logger = logging.getLogger(__name__)
 
 # Load configuration from environment
 _UNAUTHORIZED_MSG = "Unauthorized."
+_ORCHESTRATOR_NOT_INITIALIZED = "Orchestrator not initialized"
+_SERVICE_UNAVAILABLE_MSG = "System error: Service temporarily unavailable."
+_TIMEOUT_MSG = "Request timed out. Please try again."
 TELEGRAM_BOT_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN')
 ADMIN_USER_ID = int(os.getenv('ADMIN_USER_ID', 0))
 AGENT_TIMEOUT_SECONDS = float(os.getenv('AGENT_TIMEOUT_SECONDS', 300.0))
@@ -128,10 +131,7 @@ async def _drain_outbound_queue(bot, queue: asyncio.Queue) -> None:
         attempts = 0
         while attempts < 3:
             try:
-                await bot.send_message(
-                    chat_id=ADMIN_USER_ID,
-                    text=message[:4096],
-                )
+                await _send_admin_outbound_payload(bot, message)
                 await asyncio.sleep(0.1)   # rate-limit guard
                 break
             except RetryAfter as e:
@@ -150,9 +150,45 @@ async def _drain_outbound_queue(bot, queue: asyncio.Queue) -> None:
         else:
             logger.error(
                 "Dropped admin notification after 3 failed attempts: %s",
-                message[:120],
+                str(message)[:120],
             )
         queue.task_done()
+
+
+async def _send_admin_outbound_payload(bot, payload) -> None:
+    if not isinstance(payload, dict):
+        await bot.send_message(
+            chat_id=ADMIN_USER_ID,
+            text=str(payload)[:4096],
+        )
+        return
+
+    text = str(payload.get("text") or "").strip()
+    if text:
+        await bot.send_message(chat_id=ADMIN_USER_ID, text=text[:4096])
+
+    document_path = str(payload.get("document_path") or "").strip()
+    if not document_path:
+        return
+
+    document_filename = str(payload.get("document_filename") or os.path.basename(document_path))
+    document_bytes = await asyncio.to_thread(_read_binary_file, document_path)
+    await bot.send_document(
+        chat_id=ADMIN_USER_ID,
+        document=BytesIO(document_bytes),
+        filename=document_filename,
+    )
+
+    if payload.get("delete_after_send"):
+        try:
+            os.remove(document_path)
+        except OSError as remove_error:
+            logger.warning("Failed to remove temporary outbound document %s: %s", document_path, remove_error)
+
+
+def _read_binary_file(path: str) -> bytes:
+    with open(path, "rb") as document_file:
+        return document_file.read()
 
 
 def is_authorized(user_id: int) -> bool:
@@ -187,6 +223,51 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text("System online. Awaiting input.")
 
 
+async def status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/status — show operational health for the admin."""
+    if not is_authorized(update.effective_user.id):
+        await update.message.reply_text(_UNAUTHORIZED_MSG)
+        return
+
+    orchestrator_inst = context.bot_data.get("orchestrator") or orchestrator
+    if orchestrator_inst is None:
+        await update.message.reply_text("System error: Orchestrator not available.")
+        return
+
+    router = getattr(orchestrator_inst, "cognitive_router", None)
+    registry = getattr(router, "registry", None)
+    try:
+        loaded_count = len(registry) if registry is not None else 0
+    except Exception:
+        loaded_count = 0
+
+    load_errors_getter = getattr(registry, "get_load_errors", None)
+    if callable(load_errors_getter):
+        failed_skills = list(load_errors_getter())
+    else:
+        failed_skills = list(getattr(registry, "_load_errors", []) or [])
+    failed_names = [str(item[0]) for item in failed_skills]
+    failed_display = ", ".join(failed_names[:12]) if failed_names else "none"
+    if len(failed_names) > 12:
+        failed_display += f", and {len(failed_names) - 12} more"
+
+    try:
+        predictive_budget = await orchestrator_inst._get_predictive_energy_budget_remaining()
+    except Exception as budget_error:
+        logger.warning("/status could not read predictive energy budget: %s", budget_error)
+        predictive_budget = "unknown"
+
+    lines = [
+        "AIDEN status",
+        f"Loaded skills: {loaded_count}",
+        f"Failed skills: {len(failed_skills)} ({failed_display})",
+        f"Pending MFA: {len(getattr(orchestrator_inst, 'pending_mfa', {}) or {})}",
+        f"Pending HITL: {len(getattr(orchestrator_inst, 'pending_hitl_state', {}) or {})}",
+        f"Predictive energy budget: {predictive_budget}",
+    ]
+    await update.message.reply_text("\n".join(lines))
+
+
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """
     Handle text messages and process them through the Orchestrator.
@@ -214,8 +295,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
     try:
         if orchestrator is None:
-            logger.error("Orchestrator not initialized")
-            await update.message.reply_text("System error: Service temporarily unavailable.")
+            logger.error(_ORCHESTRATOR_NOT_INITIALIZED)
+            await update.message.reply_text(_SERVICE_UNAVAILABLE_MSG)
             return
 
         # Keep sending 'typing' every 4 s so the indicator stays visible throughout
@@ -238,9 +319,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         logger.info(f"Response sent to user {user_id}")
 
     except (TimeoutError, asyncio.TimeoutError) as e:
-        timeout_msg = "Request timed out. Please try again."
         logger.warning(f"Timeout error after {AGENT_TIMEOUT_SECONDS}s: {e}")
-        await update.message.reply_text(timeout_msg)
+        await update.message.reply_text(_TIMEOUT_MSG)
 
     except Exception as e:
         logger.error(f"Error processing message: {e}", exc_info=True)
@@ -279,8 +359,8 @@ async def handle_voice_message(update: Update, context: ContextTypes.DEFAULT_TYP
 
     try:
         if orchestrator is None:
-            logger.error("Orchestrator not initialized")
-            await update.message.reply_text("System error: Service temporarily unavailable.")
+            logger.error(_ORCHESTRATOR_NOT_INITIALIZED)
+            await update.message.reply_text(_SERVICE_UNAVAILABLE_MSG)
             return
 
         stop_typing = asyncio.Event()
@@ -317,13 +397,56 @@ async def handle_voice_message(update: Update, context: ContextTypes.DEFAULT_TYP
         logger.info("Voice response sent to user %s", user_id)
 
     except (TimeoutError, asyncio.TimeoutError) as e:
-        timeout_msg = "Request timed out. Please try again."
         logger.warning(f"Voice timeout error after {AGENT_TIMEOUT_SECONDS}s: {e}")
-        await update.message.reply_text(timeout_msg)
+        await update.message.reply_text(_TIMEOUT_MSG)
 
     except Exception as e:
         logger.error(f"Error processing voice message: {e}", exc_info=True)
         await update.message.reply_text("An error occurred while processing your voice note. Please try again.")
+
+
+async def handle_document_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle Telegram document attachments used as tool-approval context."""
+    global orchestrator
+
+    user_id = update.effective_user.id
+    if not is_authorized(user_id):
+        logger.warning("Unauthorized document message from user %s", user_id)
+        await update.message.reply_text(_UNAUTHORIZED_MSG)
+        return
+
+    if orchestrator is None:
+        logger.error(_ORCHESTRATOR_NOT_INITIALIZED)
+        await update.message.reply_text(_SERVICE_UNAVAILABLE_MSG)
+        return
+
+    pending_approvals = getattr(orchestrator, "pending_tool_approval", {}) or {}
+    if str(user_id) not in pending_approvals:
+        await update.message.reply_text("No pending tool approval is waiting for an attachment.")
+        return
+
+    caption = str(update.message.caption or "").strip()
+    if not caption:
+        await update.message.reply_text("Please resend the attachment with YES or NO as the caption.")
+        return
+
+    document = update.message.document
+    file_name = str(getattr(document, "file_name", "attachment") or "attachment")
+    file_size = getattr(document, "file_size", "unknown")
+    approval_message = f"{caption}\n[Approval attachment: {file_name}; size={file_size}]"
+
+    try:
+        ai_response = await asyncio.wait_for(
+            orchestrator.process_message(approval_message, str(user_id)),
+            timeout=AGENT_TIMEOUT_SECONDS,
+        )
+        await update.message.reply_text(ai_response)
+    except (TimeoutError, asyncio.TimeoutError) as e:
+        logger.warning("Document approval timeout after %ss: %s", AGENT_TIMEOUT_SECONDS, e)
+        await update.message.reply_text(_TIMEOUT_MSG)
+    except Exception as e:
+        logger.error("Error processing document approval: %s", e, exc_info=True)
+        await update.message.reply_text("An error occurred while processing the approval attachment. Please try again.")
 
 
 async def goals(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -540,6 +663,9 @@ async def _async_run(application: Application, orchestrator_inst: "Orchestrator"
         except Exception as e:
             logger.warning(f"delete_webhook failed (non-fatal): {e}")
 
+        outbound_queue: asyncio.Queue = asyncio.Queue()
+        orchestrator_inst.outbound_queue = outbound_queue
+
         # Async-init the orchestrator
         await orchestrator_inst.async_init()
         ready_event = getattr(orchestrator_inst, "_ready", None)
@@ -548,9 +674,6 @@ async def _async_run(application: Application, orchestrator_inst: "Orchestrator"
                 await asyncio.wait_for(ready_event.wait(), timeout=30.0)
             except asyncio.TimeoutError as exc:
                 raise RuntimeError("Orchestrator did not become ready during startup.") from exc
-        outbound_queue: asyncio.Queue = asyncio.Queue()
-        orchestrator_inst.outbound_queue = outbound_queue
-
         # Expose the orchestrator's existing LedgerMemory connection so that
         # command handlers (/goals, /addgoal) can re-use it instead of opening
         # a second parallel connection to the same DB (ISSUE-003).
@@ -684,11 +807,13 @@ def main() -> None:
 
         # Register handlers
         application.add_handler(CommandHandler("start", start))
+        application.add_handler(CommandHandler("status", status))
         application.add_handler(CommandHandler("goals", goals))
         application.add_handler(CommandHandler("addgoal", addgoal))
         application.add_handler(CommandHandler("shutdown", shutdown))
         application.add_handler(CommandHandler("restart", restart))
         application.add_handler(MessageHandler(filters.VOICE, handle_voice_message))
+        application.add_handler(MessageHandler(filters.Document.ALL, handle_document_message))
         application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
         application.add_error_handler(error_handler)
 

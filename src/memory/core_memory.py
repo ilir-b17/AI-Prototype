@@ -10,11 +10,13 @@ import json
 import os
 import asyncio
 import logging
-from typing import Dict, Any
+from typing import Dict, Any, List
 
 import aiofiles
 
 logger = logging.getLogger(__name__)
+
+_DEFAULT_NOCTURNAL_FACTS_CHARS = 1500
 
 class CoreMemory:
     """
@@ -78,6 +80,49 @@ class CoreMemory:
                 logger.error(f"Failed to load core memory: {e}")
                 return {"current_focus": "", "user_preferences": ""}
 
+    @staticmethod
+    def _dedupe_fact_lines(raw_facts: Any) -> List[str]:
+        if isinstance(raw_facts, str):
+            candidates = [raw_facts]
+        elif isinstance(raw_facts, list):
+            candidates = raw_facts
+        else:
+            candidates = []
+
+        deduped: List[str] = []
+        seen = set()
+        for item in candidates:
+            fact = " ".join(str(item or "").split())
+            if not fact:
+                continue
+            key = fact.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            deduped.append(fact)
+        return deduped
+
+    @staticmethod
+    def _nocturnal_facts_char_limit() -> int:
+        try:
+            return max(0, int(os.getenv("MAX_NOCTURNAL_FACTS_CHARS", str(_DEFAULT_NOCTURNAL_FACTS_CHARS))))
+        except ValueError:
+            return _DEFAULT_NOCTURNAL_FACTS_CHARS
+
+    def _format_nocturnal_core_facts(self, state: Dict[str, Any]) -> str:
+        facts = self._dedupe_fact_lines(state.get("nocturnal_core_facts", []))
+        if not facts:
+            return ""
+
+        rendered = "\n".join(f"    <Fact>{fact}</Fact>" for fact in facts)
+        char_limit = self._nocturnal_facts_char_limit()
+        if char_limit == 0:
+            return ""
+        if len(rendered) > char_limit:
+            rendered = rendered[:char_limit].rstrip()
+
+        return f"\n  <Nocturnal_Core_Facts>\n{rendered}\n  </Nocturnal_Core_Facts>"
+
     async def get_context_string(self, include_summary: bool = False) -> str:
         """Return the core memory formatted for prompt injection (non-blocking).
 
@@ -95,13 +140,15 @@ class CoreMemory:
         )
         insights = state.get('consolidated_insights', '')
         insights_line = f"\n  <Consolidated_Insights>{insights}</Consolidated_Insights>" if insights else ""
+        nocturnal_facts = self._format_nocturnal_core_facts(state)
         return (
             f"<Core_Working_Memory>\n"
             f"  <Current_Focus>{state.get('current_focus', '')}</Current_Focus>\n"
             f"  <User_Preferences>{state.get('user_preferences', '')}</User_Preferences>"
             f"{os_line}"
             f"{summary_line}"
-            f"{insights_line}\n"
+            f"{insights_line}"
+            f"{nocturnal_facts}\n"
             f"</Core_Working_Memory>"
         )
 

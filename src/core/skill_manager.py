@@ -14,7 +14,7 @@ import inspect
 import logging
 import importlib.util
 from dataclasses import dataclass
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
@@ -49,9 +49,16 @@ class SkillRegistry:
         self.skills_dir = os.path.abspath(skills_dir)
         self._skills: Dict[str, Dict[str, Any]] = {}  # name → {fn, schema}
         self._manifests: Dict[str, SkillManifest] = {}
+        self._load_errors: List[Tuple[str, str]] = []
+        self._dynamic_tool_worker = None
         self._load_all()
 
+    def set_dynamic_tool_worker(self, worker: Any) -> None:
+        """Set the isolated worker used for runtime-synthesised tools."""
+        self._dynamic_tool_worker = worker
+
     def _load_all(self) -> None:
+        self._load_errors = []
         if not os.path.isdir(self.skills_dir):
             logger.warning(f"Skills directory not found: {self.skills_dir}")
             return
@@ -64,8 +71,16 @@ class SkillRegistry:
                 self._load_skill(entry, skill_path)
                 logger.debug(f"Loaded skill: {entry}")
             except Exception as exc:
+                self._load_errors.append((entry, str(exc)))
                 logger.warning(f"Skipping skill '{entry}': {exc}")
 
+        failed_names = ", ".join(name for name, _error in self._load_errors)
+        logger.info(
+            "%d skills loaded, %d failed: [%s].",
+            len(self._skills),
+            len(self._load_errors),
+            failed_names,
+        )
         logger.info(
             f"SkillRegistry ready — {len(self._skills)} skills: "
             f"{', '.join(sorted(self._skills))}"
@@ -98,7 +113,7 @@ class SkillRegistry:
             if tool_name in self._skills:
                 raise ValueError(f"Duplicate tool name '{tool_name}' from skill folder '{name}'")
 
-            self._skills[tool_name] = {"fn": fn, "schema": schema}
+            self._skills[tool_name] = {"fn": fn, "schema": schema, "dynamic": False}
             self._register_manifest(tool_name, manifest, is_executable=True)
             return
 
@@ -292,6 +307,10 @@ class SkillRegistry:
         """All loaded tool schemas, ready to pass to Ollama / Groq."""
         return [s["schema"] for s in self._skills.values()]
 
+    def get_load_errors(self) -> List[Tuple[str, str]]:
+        """Return skill folders that failed to load and their error messages."""
+        return list(self._load_errors)
+
     def get_skill_catalog(self) -> List[Dict[str, str]]:
         """Ultra-lean Level-1 catalog: tool name + description only."""
         catalog: List[Dict[str, str]] = []
@@ -319,6 +338,15 @@ class SkillRegistry:
     def get_function(self, name: str) -> Optional[Callable]:
         skill = self._skills.get(name)
         return skill["fn"] if skill else None
+
+    async def _execute_dynamic_tool(self, tool_name: str, arguments: Dict[str, Any]) -> str:
+        worker = self._dynamic_tool_worker
+        if worker is None:
+            return f"Error: Dynamic tool worker is not available for '{tool_name}'."
+        response = await worker.call_tool(tool_name, arguments or {})
+        if not response.get("ok"):
+            return f"Error: Dynamic tool '{tool_name}' failed — {response.get('error', 'unknown worker error')}"
+        return str(response.get("result", ""))
 
     async def execute(self, tool_name: str, arguments: Dict[str, Any]) -> str:
         """Dispatch a tool call. Returns a plain string result."""
@@ -350,6 +378,8 @@ class SkillRegistry:
         skill = self._skills.get(tool_name)
         if skill is None:
             return f"Error: Unknown tool '{tool_name}'."
+        if skill.get("dynamic"):
+            return await self._execute_dynamic_tool(tool_name, arguments)
         if tool_name == "manage_file_system":
             if "path" in arguments and "file_path" not in arguments:
                 arguments["file_path"] = arguments.pop("path")
@@ -370,9 +400,9 @@ class SkillRegistry:
             logger.error(f"Tool '{tool_name}' raised: {exc}", exc_info=True)
             return f"Error: Tool '{tool_name}' failed — {exc}"
 
-    def register_dynamic(self, name: str, fn: Callable, schema: Dict[str, Any]) -> None:
-        """Register a runtime-synthesised tool (System 2 capability synthesis)."""
-        self._skills[name] = {"fn": fn, "schema": schema}
+    def register_dynamic(self, name: str, schema: Dict[str, Any]) -> None:
+        """Register a runtime-synthesised tool schema backed by the worker."""
+        self._skills[name] = {"fn": None, "schema": schema, "dynamic": True}
         self._manifests[name] = SkillManifest(
             name=name,
             description=str(schema.get("description") or "Runtime dynamic tool"),

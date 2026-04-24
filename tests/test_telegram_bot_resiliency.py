@@ -25,7 +25,7 @@ os.environ['TELEGRAM_BOT_TOKEN'] = 'mock_token'
 os.environ['ADMIN_USER_ID'] = '12345'
 
 from src.interfaces import telegram_bot
-from src.interfaces.telegram_bot import handle_message, handle_voice_message
+from src.interfaces.telegram_bot import handle_document_message, handle_message, handle_voice_message, status
 from telegram import Update, Message, Chat, User
 from unittest.mock import AsyncMock
 
@@ -45,6 +45,7 @@ async def test_telegram_bot_timeout():
 
     mock_context = MagicMock()
     mock_context.bot = AsyncMock()
+    mock_context.bot.get_file = AsyncMock()
 
     # Mock orchestrator to simulate a hung API call
     mock_orchestrator = MagicMock()
@@ -98,7 +99,71 @@ async def test_voice_message_disabled_flag_returns_graceful_message():
     mock_update.message.reply_text.assert_called_with(
         "Native audio input is disabled. Set ENABLE_NATIVE_AUDIO=true to enable voice notes."
     )
+    mock_context.bot.get_file.assert_not_awaited()
     mock_orchestrator.process_message.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_status_command_reports_operational_counts():
+    mock_update = MagicMock(spec=Update)
+    mock_message = AsyncMock(spec=Message)
+    mock_update.message = mock_message
+    mock_update.effective_user = MagicMock(spec=User)
+    mock_update.effective_user.id = 12345
+
+    class _Registry:
+        def __len__(self):
+            return 7
+
+        def get_load_errors(self):
+            return [("broken_skill", "bad schema")]
+
+    mock_orchestrator = MagicMock()
+    mock_orchestrator.cognitive_router.registry = _Registry()
+    mock_orchestrator.pending_mfa = {"user-1": {}}
+    mock_orchestrator.pending_hitl_state = {"user-2": {}, "user-3": {}}
+    mock_orchestrator._get_predictive_energy_budget_remaining = AsyncMock(return_value=81)
+
+    mock_context = MagicMock()
+    mock_context.bot_data = {"orchestrator": mock_orchestrator}
+
+    await status(mock_update, mock_context)
+
+    sent_text = mock_update.message.reply_text.await_args.args[0]
+    assert "Loaded skills: 7" in sent_text
+    assert "Failed skills: 1 (broken_skill)" in sent_text
+    assert "Pending MFA: 1" in sent_text
+    assert "Pending HITL: 2" in sent_text
+    assert "Predictive energy budget: 81" in sent_text
+
+
+@pytest.mark.asyncio
+async def test_document_message_uses_caption_as_tool_approval_context():
+    mock_update = MagicMock(spec=Update)
+    mock_message = AsyncMock(spec=Message)
+    mock_update.message = mock_message
+    mock_update.effective_user = MagicMock(spec=User)
+    mock_update.effective_user.id = 12345
+    mock_update.message.caption = "YES"
+    mock_update.message.document = MagicMock(file_name="long_tool.py", file_size=4096)
+
+    mock_context = MagicMock()
+    mock_context.bot = AsyncMock()
+
+    mock_orchestrator = MagicMock()
+    mock_orchestrator.pending_tool_approval = {"12345": {"synthesis": {}}}
+    mock_orchestrator.process_message = AsyncMock(return_value="approved")
+    telegram_bot.orchestrator = mock_orchestrator
+    telegram_bot.AGENT_TIMEOUT_SECONDS = 1.0
+
+    await handle_document_message(mock_update, mock_context)
+
+    mock_orchestrator.process_message.assert_awaited_once()
+    args, _kwargs = mock_orchestrator.process_message.await_args
+    assert args[0].startswith("YES")
+    assert "long_tool.py" in args[0]
+    assert args[1] == "12345"
+    mock_update.message.reply_text.assert_called_with("approved")
 
 
 @pytest.mark.asyncio

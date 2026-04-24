@@ -26,6 +26,7 @@ def build_supervisor_prompt(
     os_name: str,
     downloads_dir: str,
 ) -> str:
+    _ = (archival_block, sensory_context)
     # textwrap.dedent removes the leading whitespace, keeping the code clean 
     # while ensuring the LLM gets perfectly flush text.
     return textwrap.dedent(f"""\
@@ -58,14 +59,8 @@ def build_supervisor_prompt(
         </agent_charter>
 
         <context_and_memory>
-        --- Sensory Context ---
-        {sensory_context}
-
         --- Core Memory ---
         {core_mem_str}
-
-        --- Archival Memory ---
-        {archival_block}
         </context_and_memory>
 
         <available_capabilities>
@@ -86,3 +81,18 @@ def build_supervisor_prompt(
         - If multiple independent agents are needed but the user expects one polished final answer, add a final synthesis_agent task whose depends_on list names the upstream agents it must combine.
         </output_formatting>
     """)
+
+
+def build_supervisor_turn_context(
+    *,
+    sensory_context: str,
+    archival_block: str,
+) -> str:
+    sections = []
+    if str(sensory_context or "").strip():
+        sections.append(f"--- Sensory Context ---\n{str(sensory_context).strip()}")
+    if str(archival_block or "").strip():
+        sections.append(f"--- Archival Memory ---\n{str(archival_block).strip()}")
+    if not sections:
+        return ""
+    return "<turn_context>\n" + "\n\n".join(sections) + "\n</turn_context>"

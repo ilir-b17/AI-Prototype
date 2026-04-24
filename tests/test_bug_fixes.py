@@ -11,6 +11,7 @@ import asyncio
 import pytest
 import tempfile
 import time
+from pathlib import Path
 import src.core.orchestrator as orchestrator_module
 
 from unittest.mock import AsyncMock, MagicMock
@@ -681,7 +682,7 @@ class TestCriticSkipForDirectSupervisorReplies:
     async def test_critic_reviews_combined_independent_agent_output(self):
         orchestrator = Orchestrator.__new__(Orchestrator)
         orchestrator.cognitive_router = MagicMock()
-        orchestrator.charter_text = "Core Directive: Do no harm."
+        orchestrator.charter_text = Path("charter.md").read_text(encoding="utf-8")
         orchestrator.cognitive_router.get_system_2_available.return_value = False
         orchestrator._route_to_system_1 = AsyncMock(return_value=RouterResult(status="ok", content="PASS"))
 
@@ -999,7 +1000,9 @@ class TestTranscriptRegressionFixes:
             "extract_pdf_text",
         ]
         orchestrator.cognitive_router.registry.get_schemas.return_value = []
-        orchestrator.cognitive_router.route_to_system_1 = AsyncMock()
+        orchestrator._route_to_system_1 = AsyncMock(
+            return_value=RouterResult(status="ok", content='{"intent":"capability_query"}')
+        )
         orchestrator.cognitive_router._execute_tool = AsyncMock()
 
         result = await Orchestrator._try_fast_path_response(
@@ -1016,7 +1019,7 @@ class TestTranscriptRegressionFixes:
 
         assert "web_search" in result
         orchestrator.cognitive_router._execute_tool.assert_not_awaited()
-        orchestrator.cognitive_router.route_to_system_1.assert_not_awaited()
+        orchestrator._route_to_system_1.assert_awaited_once()
 
     @pytest.mark.asyncio
     async def test_last_shared_message_is_recalled_from_chat_history(self):
@@ -1080,7 +1083,7 @@ class TestTranscriptRegressionFixes:
             stored = await Orchestrator._remember_user_profile(
                 orchestrator,
                 "test_user",
-                "My name is Ilir, 37 years old",
+                "My name is Ilir, I am 37 years old",
             )
             name_result = await Orchestrator._try_fast_path_response(
                 orchestrator,
@@ -1233,12 +1236,12 @@ class TestTranscriptRegressionFixes:
     @pytest.mark.asyncio
     async def test_process_message_multi_turn_memory_and_capability_flow(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
-            async def fake_route_to_system_1(messages, allowed_tools=None):
+            async def fake_route_to_system_1(messages, allowed_tools=None, **_kwargs):
                 await asyncio.sleep(0)
                 user_prompt = messages[-1]["content"]
                 if "Tool used: web_search" in user_prompt:
                     return RouterResult(status="ok", content="Today in Vienna it is about 18C and cloudy.")
-                if "My name is Ilir, 37 years old" in user_prompt:
+                if "My name is Ilir, I am 37 years old" in user_prompt:
                     return RouterResult(
                         status="ok",
                         content="It is nice to meet you, Ilir. I will remember your name and age for later.",
@@ -1289,7 +1292,7 @@ class TestTranscriptRegressionFixes:
             )
             profile_ack = await Orchestrator.process_message(
                 orchestrator,
-                "My name is Ilir, 37 years old",
+                "My name is Ilir, I am 37 years old",
                 "test_user",
             )
             name_reply = await Orchestrator.process_message(
@@ -1309,7 +1312,7 @@ class TestTranscriptRegressionFixes:
             assert "Ilir" in profile_ack
             assert name_reply == "Yes. Your name is Ilir, and you told me that you are 37 years old."
             assert "weather in vienna" in summary_reply.lower()
-            assert "my name is ilir, 37 years old" in summary_reply.lower()
+            assert "my name is ilir, i am 37 years old" in summary_reply.lower()
             assert orchestrator.cognitive_router._execute_tool.await_count == 1
             assert orchestrator._run_graph_loop.await_count == 0
             stored_profile = await orchestrator._get_user_profile("test_user")
@@ -1328,6 +1331,9 @@ class TestTranscriptRegressionFixes:
         ]
         orchestrator.cognitive_router.registry.get_schemas.return_value = []
         orchestrator.cognitive_router.route_to_system_1 = AsyncMock()
+        orchestrator._route_to_system_1 = AsyncMock(
+            return_value=RouterResult(status="ok", content='{"intent":"capability_query"}')
+        )
 
         result = await Orchestrator._try_fast_path_response(
             orchestrator,
@@ -1341,6 +1347,7 @@ class TestTranscriptRegressionFixes:
         assert "registered tool repository" in result
         assert "web_search" in result
         orchestrator.cognitive_router.route_to_system_1.assert_not_awaited()
+        orchestrator._route_to_system_1.assert_awaited_once()
 
     @pytest.mark.asyncio
     async def test_process_message_handles_name_time_and_weather_followups(self):

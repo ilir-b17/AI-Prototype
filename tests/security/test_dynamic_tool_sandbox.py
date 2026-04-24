@@ -1,9 +1,10 @@
 import re
 from typing import Callable
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
+from src.core.dynamic_tool_worker import _register_tool
 from src.core.llm_router import CognitiveRouter
 
 
@@ -18,6 +19,8 @@ def _schema_json(tool_name: str) -> str:
 def _router_with_mock_registry() -> CognitiveRouter:
     router = CognitiveRouter.__new__(CognitiveRouter)
     router.registry = MagicMock()
+    router._dynamic_tool_worker = MagicMock()
+    router._dynamic_tool_worker.register_tool = AsyncMock(return_value={"ok": True, "result": {}})
     return router
 
 
@@ -26,13 +29,6 @@ def _disable_ast_validation(monkeypatch: pytest.MonkeyPatch) -> None:
         return None
 
     monkeypatch.setattr(CognitiveRouter, "_validate_tool_code_ast", staticmethod(_noop))
-
-
-def _disable_runtime_token_scan(monkeypatch: pytest.MonkeyPatch) -> None:
-    def _noop(_code: str, _tool_name: str) -> None:
-        return None
-
-    monkeypatch.setattr(CognitiveRouter, "_validate_dynamic_tool_token_scan", staticmethod(_noop))
 
 
 @pytest.mark.parametrize(
@@ -109,7 +105,8 @@ def test_pytest_ast_gate_blocks_blocked_module_string_literal() -> None:
         ("    return sys.modules\n", "sys.modules"),
     ],
 )
-def test_register_dynamic_tool_token_scan_blocks_non_comment_tokens(
+@pytest.mark.asyncio
+async def test_register_dynamic_tool_token_scan_blocks_non_comment_tokens(
     monkeypatch: pytest.MonkeyPatch,
     source_line: str,
     blocked_token: str,
@@ -119,10 +116,11 @@ def test_register_dynamic_tool_token_scan_blocks_non_comment_tokens(
     code = "async def scan_tool() -> object:\n" + source_line
 
     with pytest.raises(ValueError, match=re.escape(blocked_token)):
-        router.register_dynamic_tool("scan_tool", code, _schema_json("scan_tool"))
+        await router.register_dynamic_tool("scan_tool", code, _schema_json("scan_tool"))
 
 
-def test_register_dynamic_tool_token_scan_ignores_comments(monkeypatch: pytest.MonkeyPatch) -> None:
+@pytest.mark.asyncio
+async def test_register_dynamic_tool_token_scan_ignores_comments(monkeypatch: pytest.MonkeyPatch) -> None:
     _disable_ast_validation(monkeypatch)
     router = _router_with_mock_registry()
     code = (
@@ -131,7 +129,7 @@ def test_register_dynamic_tool_token_scan_ignores_comments(monkeypatch: pytest.M
         "    return 'ok'\n"
     )
 
-    router.register_dynamic_tool("scan_tool", code, _schema_json("scan_tool"))
+    await router.register_dynamic_tool("scan_tool", code, _schema_json("scan_tool"))
 
     router.registry.register_dynamic.assert_called_once()
 
@@ -146,15 +144,20 @@ def test_register_dynamic_tool_token_scan_ignores_comments(monkeypatch: pytest.M
         ("dir", lambda: "VALUE = dir('abc')\n"),
     ],
 )
-def test_register_dynamic_tool_safe_builtins_omit_reflection_helpers(
+def test_worker_register_safe_builtins_omit_reflection_helpers(
     monkeypatch: pytest.MonkeyPatch,
     helper_name: str,
     source_factory: Callable[[], str],
 ) -> None:
-    _disable_ast_validation(monkeypatch)
-    _disable_runtime_token_scan(monkeypatch)
-    router = _router_with_mock_registry()
+    _ = monkeypatch
     code = source_factory() + "async def builtin_tool() -> str:\n    return 'ok'\n"
 
-    with pytest.raises(NameError, match=helper_name):
-        router.register_dynamic_tool("builtin_tool", code, _schema_json("builtin_tool"))
+    with pytest.raises((NameError, ValueError), match=helper_name):
+        _register_tool(
+            {
+                "op": "register",
+                "tool_name": "builtin_tool",
+                "code": code,
+                "schema": {"name": "builtin_tool", "description": "Security test tool."},
+            }
+        )

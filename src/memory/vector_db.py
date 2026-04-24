@@ -8,6 +8,7 @@ contextual awareness in agent decision-making.
 
 import os
 import logging
+import re
 import threading
 import uuid
 from datetime import datetime, timedelta
@@ -21,6 +22,10 @@ logger = logging.getLogger(__name__)
 _HNSW_SPACE = "cosine"
 _COLLECTION_METADATA = {"hnsw:space": _HNSW_SPACE}
 _CLOSED_COLLECTION_ERROR = "VectorMemory has been closed"
+_CANONICAL_TIMESTAMP_FORMAT = "%Y-%m-%dT%H:%M:%S"
+_CANONICAL_TIMESTAMP_RE = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}$")
+_LEGACY_TIMESTAMP_FORMATS = ("%Y-%m-%d %H:%M:%S", "%Y/%m/%d %H:%M:%S", "%Y-%m-%d")
+_TIMESTAMP_MIGRATION_BATCH_SIZE = 500
 
 
 class VectorMemory:
@@ -82,10 +87,96 @@ class VectorMemory:
                 )
                 logger.info("Created fresh collection after recovery")
 
+            self._normalize_legacy_timestamps()
             logger.info(f"VectorMemory initialized with persistence at {self.persist_dir}")
         except Exception as e:
             logger.error(f"Failed to initialize VectorMemory: {e}")
             raise
+
+    @staticmethod
+    def _format_canonical_timestamp(parsed: datetime) -> str:
+        if parsed.tzinfo is not None:
+            parsed = parsed.astimezone(timezone.utc).replace(tzinfo=None)
+        else:
+            parsed = parsed.replace(tzinfo=None)
+        return parsed.strftime(_CANONICAL_TIMESTAMP_FORMAT)
+
+    @staticmethod
+    def _parse_timestamp_text(raw: str) -> Optional[datetime]:
+        candidate = raw[:-1] + "+00:00" if raw.endswith("Z") else raw
+        try:
+            return datetime.fromisoformat(candidate)
+        except ValueError:
+            pass
+
+        for fmt in _LEGACY_TIMESTAMP_FORMATS:
+            try:
+                return datetime.strptime(raw, fmt)
+            except ValueError:
+                continue
+        return None
+
+    @classmethod
+    def _canonicalize_timestamp(cls, value: Any) -> Optional[str]:
+        if value is None:
+            return None
+        if isinstance(value, (int, float)):
+            try:
+                return cls._format_canonical_timestamp(datetime.fromtimestamp(float(value), tz=timezone.utc))
+            except (OSError, OverflowError, ValueError):
+                return None
+
+        raw = str(value).strip()
+        if _CANONICAL_TIMESTAMP_RE.fullmatch(raw):
+            return raw
+        if not raw:
+            return None
+
+        parsed = cls._parse_timestamp_text(raw)
+        return cls._format_canonical_timestamp(parsed) if parsed is not None else None
+
+    def _update_timestamp_batch(self, ids: List[str], metadatas: List[Dict[str, Any]]) -> None:
+        if ids:
+            self.collection.update(ids=ids, metadatas=metadatas)
+
+    def _normalize_legacy_timestamps(self) -> int:
+        migrated = 0
+        try:
+            with self._collection_lock:
+                if self.collection is None:
+                    raise RuntimeError(_CLOSED_COLLECTION_ERROR)
+                results = self.collection.get(include=["metadatas"])
+                ids = results.get("ids", []) or []
+                metadatas = results.get("metadatas", []) or []
+                pending_ids: List[str] = []
+                pending_metadatas: List[Dict[str, Any]] = []
+
+                for memory_id, metadata in zip(ids, metadatas):
+                    if not isinstance(metadata, dict) or "timestamp" not in metadata:
+                        continue
+                    normalized = self._canonicalize_timestamp(metadata.get("timestamp"))
+                    if not normalized or normalized == metadata.get("timestamp"):
+                        continue
+
+                    updated_metadata = dict(metadata)
+                    updated_metadata["timestamp"] = normalized
+                    pending_ids.append(memory_id)
+                    pending_metadatas.append(updated_metadata)
+                    migrated += 1
+
+                    if len(pending_ids) >= _TIMESTAMP_MIGRATION_BATCH_SIZE:
+                        self._update_timestamp_batch(pending_ids, pending_metadatas)
+                        pending_ids = []
+                        pending_metadatas = []
+
+                self._update_timestamp_batch(pending_ids, pending_metadatas)
+
+            if migrated:
+                logger.info("Normalized %d vector memory timestamps to canonical UTC format.", migrated)
+            return migrated
+        except Exception as e:
+            logger.warning("Vector timestamp normalization failed: %s", e)
+            return 0
 
     def add_memory(
         self,
@@ -140,7 +231,7 @@ class VectorMemory:
             metadata = dict(metadata)
             # Use a consistent UTC-naive format so lexical comparison remains stable.
             # Existing records with legacy timestamp formats are not rewritten here.
-            metadata["timestamp"] = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S")
+            metadata["timestamp"] = datetime.now(timezone.utc).strftime(_CANONICAL_TIMESTAMP_FORMAT)
 
         # Generate ID if not provided
         if not memory_id:
@@ -325,7 +416,7 @@ class VectorMemory:
         """Delete memories whose metadata timestamp is older than *days* days."""
         # Keep cutoff format aligned with newly-stamped UTC timestamps.
         # Existing DB rows with legacy/mixed timestamp formats are not retroactively fixed.
-        cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).strftime("%Y-%m-%dT%H:%M:%S")
+        cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).strftime(_CANONICAL_TIMESTAMP_FORMAT)
         try:
             with self._collection_lock:
                 if self.collection is None:

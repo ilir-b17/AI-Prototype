@@ -4,6 +4,9 @@ Orchestrator Module - Implements State Graph Architecture (Sprint 6)
 State Graph with Energy Budget, Proactive Heartbeat, and Charter enforcement.
 Passes a State Dictionary between specialized nodes until task is complete,
 exhausted (energy = 0), or blocked (HITL required).
+
+HITL retry contract: Maximum 3 critic rejections per HITL cycle,
+maximum 3 HITL cycles per task, after which the task is abandoned.
 """
 
 import os
@@ -17,6 +20,8 @@ import re
 import sys
 import tempfile
 import time
+import weakref
+import xml.etree.ElementTree as ET
 from datetime import datetime
 from typing import Dict, Any, List, Optional
 
@@ -31,8 +36,8 @@ from src.memory.ledger_db import LedgerMemory
 from src.memory.core_memory import CoreMemory
 from src.core.agent_definition import AgentDefinition
 from src.core.agent_registry import AgentRegistry
-from src.core.llm_router import CognitiveRouter, RouterResult, RequiresHITLError
-from src.core.prompt_config import load_prompt_config, build_supervisor_prompt
+from src.core.llm_router import CognitiveRouter, RouterResult, RequiresHITLError, RequiresMFAError
+from src.core.prompt_config import load_prompt_config, build_supervisor_prompt, build_supervisor_turn_context
 from src.core.runtime_context import set_runtime_context
 from src.core.state_model import AgentState, normalize_state
 from src.core.workflow_graph import build_orchestrator_graph
@@ -58,6 +63,42 @@ except ImportError:
     ResourceExhausted = Exception
 
 logger = logging.getLogger(__name__)
+
+
+class _UserLockSlot:
+    def __init__(self) -> None:
+        self.lock: asyncio.Lock = asyncio.Lock()
+        self.in_flight: int = 0
+
+
+class _UserLockLease:
+    def __init__(self, owner: "Orchestrator", user_id: str, slot: _UserLockSlot) -> None:
+        self._owner = owner
+        self._user_id = user_id
+        self._slot = slot
+        self._acquired = False
+        self._released = False
+
+    async def __aenter__(self) -> asyncio.Lock:
+        try:
+            await self._slot.lock.acquire()
+        except BaseException:
+            await self.aclose()
+            raise
+        self._acquired = True
+        return self._slot.lock
+
+    async def __aexit__(self, exc_type: object, exc: object, tb: object) -> None:
+        if self._acquired:
+            self._slot.lock.release()
+            self._acquired = False
+        await self.aclose()
+
+    async def aclose(self) -> None:
+        if self._released:
+            return
+        self._released = True
+        await self._owner._release_user_lock_lease(self._user_id, self._slot)
 
 # Energy costs per operation
 ENERGY_COST_SUPERVISOR = 10
@@ -85,7 +126,7 @@ _ROUTING_STOPWORDS = {
     "want", "need", "also", "just", "did", "how",
     # Common discourse words that appear in tool descriptions but carry no routing signal
     "that", "which", "where", "when", "there", "then", "them", "they",
-    "these", "those", "with", "been", "will", "from", "use", "not",
+    "these", "those", "with", "been", "will", "use", "not",
 }
 _NON_UTILITY_TOOL_PREFIXES = ("update_", "request_", "spawn_", "run_", "execute_")
 _NON_UTILITY_TOOL_NAMES = {
@@ -105,6 +146,7 @@ _SINGLE_TOOL_MIN_MARGIN = 0.75
 _FAST_PATH_DIRECT_MAX_TOKENS = 12
 _FAST_PATH_SINGLE_TOOL_MAX_TOKENS = 14
 _FAST_PATH_SINGLE_TOOL_ALLOWLIST = frozenset({"get_system_info", "get_stock_price", "web_search"})
+_FINANCE_INTENT_RE = re.compile(r"\b(?:prices?|quotes?|stocks?|tickers?|shares?|markets?|trading)\b", re.IGNORECASE)
 _MORAL_TRIVIALITY_READ_ONLY_HINTS = (
     "time",
     "date",
@@ -138,31 +180,33 @@ _SYSTEM_2_EMPTY_PREFIX = "[System 2 - No Response]"
 _GOAL_PLANNER_COMPLEXITY_THRESHOLD = int(os.getenv("GOAL_PLANNER_COMPLEXITY_THRESHOLD", "4"))
 _HEARTBEAT_FAILURE_STRIKES = int(os.getenv("HEARTBEAT_FAILURE_STRIKES", "3"))
 _HEARTBEAT_FAILURE_STATE_KEY = "heartbeat_task_failure_counts"
-_ERROR_RESPONSE_PREFIXES = (
-    "Supervisor encountered an error",
-    "Both local and cloud reasoning failed",
-    "I was unable to process this request locally",
-    "Planning timed out",
-    "Unable to fulfill this request",
-    "No valid response could be generated",
-    "An internal error occurred",
+HEARTBEAT_TASK_PREFIX_FMT = "[HEARTBEAT TASK #{task_id}]"
+_INTENT_CLASSIFIER_CACHE_TTL_SECONDS = 300.0
+_INTENT_CLASSIFIER_TIMEOUT_SECONDS = 10.0
+_INTENT_CLASSIFIER_MAX_OUTPUT_TOKENS = 60
+_USER_INTENTS = frozenset({"capability_query", "task", "profile_update", "casual"})
+_EXPLICIT_MEMORY_REQUEST_RE = re.compile(
+    r"\b(?:remember\s+that|remember\s+my|don'?t\s+forget|please\s+remember|save\s+that|note\s+that)\b",
+    flags=re.IGNORECASE,
 )
 _VOICE_INPUT_PLACEHOLDER = "[Voice note]"
+_REDACTED_CONTEXT_BLOCK = "[REDACTED_CONTEXT_BLOCK]"
+_REDACTED_SENSORY_STATE = "[REDACTED_SENSORY_STATE]"
+_REDACTED_EMPTY_PAYLOAD = "[REDACTED_EMPTY_PAYLOAD]"
 _CLOUD_REDACTION_BLOCK_PATTERNS = (
-    r"<context_and_memory>.*?</context_and_memory>",
     r"<Core_Working_Memory>.*?</Core_Working_Memory>",
     r"<Archival_Memory>.*?</Archival_Memory>",
     r"<chat_history>.*?</chat_history>",
 )
 _CLOUD_REDACTION_LINE_PATTERNS = (
-    (r"\[Machine Context[^\]]*\].*?(?=\n\s*\n|$)", "[REDACTED_SENSORY_STATE]"),
+    (r"\[Machine Context[^\]]*\].*?(?=\n\s*\n|$)", _REDACTED_SENSORY_STATE),
     (
         r"^\s*(Host[_ ]?OS|OS|CPU(?:[_ ]?usage)?|CWD|Platform|Memory Usage|Disk Usage)\s*[:=].*$",
-        "[REDACTED_SENSORY_STATE]",
+        _REDACTED_SENSORY_STATE,
     ),
     (
         r"<\s*(host_os|os|cpu_usage|cwd|machine|platform)\s*>.*?<\s*/\s*(host_os|os|cpu_usage|cwd|machine|platform)\s*>",
-        "[REDACTED_SENSORY_STATE]",
+        _REDACTED_SENSORY_STATE,
     ),
 )
 _CLOUD_REDACTION_PII_PATTERNS = (
@@ -176,10 +220,6 @@ _CLOUD_REDACTION_PII_PATTERNS = (
     (r"\b(?:i live in|located in|from)\s+[A-Za-z][A-Za-z'\-]+(?:[\s,]+[A-Za-z][A-Za-z'\-]+){0,2}\b", "[REDACTED_LOCATION]"),
     (r"\b(?:user[_ ]?id|ssn|social security|passport|account number)\b[^\n]*", "[REDACTED_PII_FIELD]"),
     (r"[A-Za-z]:\\[^\n]*", "[REDACTED_PATH]"),
-)
-_SENSITIVE_CONTEXT_HINT_RE = re.compile(
-    r"\b(use|include|review|analy[sz]e|consider|reference)\b.{0,120}\b(chat[_\s-]*history|sensory[_\s-]*state|core[_\s-]*memory|user\s+profile|full\s+name|location|email|phone|pii)\b",
-    flags=re.IGNORECASE | re.DOTALL,
 )
 
 # Key used in the state dict to signal a blocked (non-ok) router result
@@ -279,7 +319,7 @@ class Orchestrator:
             # Background task registry — holds strong references to prevent GC (ISSUE-002)
             self._background_tasks: set = set()
             # Per-user async locks to serialise concurrent messages (ISSUE-012)
-            self._user_locks: Dict[str, asyncio.Lock] = {}
+            self._user_locks: Dict[str, weakref.ReferenceType[_UserLockSlot]] = {}
             self._user_locks_lock: asyncio.Lock = asyncio.Lock()
             self._compiled_graph = None
             self._heartbeat_failure_counts: Dict[int, int] = {}
@@ -297,10 +337,16 @@ class Orchestrator:
         reloads previously approved dynamic tools.
         """
         await self.ledger_memory.initialize()
+        self.cognitive_router.set_dynamic_tool_restart_callback(
+            self._reload_dynamic_tools_after_worker_restart
+        )
+        await self.cognitive_router.start_dynamic_tool_worker()
 
         # Register Groq cooldown persistence callback and reload any saved cooldown
-        async def _save_groq_cooldown(expiry: float) -> None:
-            await self.ledger_memory.set_system_state("groq_cooldown_until", str(expiry))
+        def _save_groq_cooldown(expiry: float) -> None:
+            self._fire_and_forget(
+                self.ledger_memory.set_system_state("groq_cooldown_until", str(expiry))
+            )
 
         self.cognitive_router._persist_cooldown_cb = _save_groq_cooldown
         await self._restore_persisted_groq_cooldown()
@@ -340,7 +386,7 @@ class Orchestrator:
         try:
             saved_cooldown = await self.ledger_memory.get_system_state("groq_cooldown_until")
         except Exception as _ce:
-            logger.warning("Failed to restore Groq cooldown from DB: %s", _ce)
+            await self._warn_groq_cooldown_restore_failed(f"DB read failed: {_ce}")
             return
 
         if not saved_cooldown:
@@ -351,7 +397,9 @@ class Orchestrator:
             now = time.time()
             max_expiry = now + 7200.0
             if not math.isfinite(expiry):
-                logger.warning("Invalid groq_cooldown_until value in DB: non-finite (%r)", saved_cooldown)
+                await self._warn_groq_cooldown_restore_failed(
+                    f"Invalid non-finite groq_cooldown_until value: {saved_cooldown!r}"
+                )
             elif now < expiry <= max_expiry:
                 self.cognitive_router._system2_cooldown_until = expiry
                 logger.info(
@@ -359,9 +407,21 @@ class Orchestrator:
                     expiry - now,
                 )
             elif expiry > max_expiry:
-                logger.warning("Persisted Groq cooldown exceeded 2-hour cap; ignoring.")
+                await self._warn_groq_cooldown_restore_failed(
+                    "Persisted Groq cooldown exceeded 2-hour cap; ignoring."
+                )
         except (TypeError, ValueError) as e:
-            logger.warning("Invalid groq_cooldown_until value in DB: %s", e)
+            await self._warn_groq_cooldown_restore_failed(
+                f"Invalid groq_cooldown_until value in DB: {e}"
+            )
+
+    async def _warn_groq_cooldown_restore_failed(self, reason: str) -> None:
+        message = f"WARNING: Groq cooldown restoration failed during startup: {reason}"
+        logger.warning(message)
+        try:
+            await self._notify_admin(message)
+        except Exception as notify_error:
+            logger.warning("Failed to notify admin about Groq cooldown restoration failure: %s", notify_error)
 
     def _enforce_charter_policy(self) -> None:
         validate_mfa_configuration()
@@ -493,10 +553,21 @@ class Orchestrator:
     @staticmethod
     def _extract_multiple_tickers(user_message: str) -> List[str]:
         """Return all valid uppercase ticker symbols found in the message (2+ expected for multi-ticker path)."""
-        return [
-            tok for tok in re.findall(r'\b([A-Z]{1,5})\b', user_message)
+        text = str(user_message or "")
+        if not _FINANCE_INTENT_RE.search(text):
+            return []
+
+        candidates = [
+            tok for tok in re.findall(r'\b([A-Z]{1,5})\b', text)
             if tok not in Orchestrator._TICKER_STOPWORDS
         ]
+        if len(candidates) < 2:
+            return []
+
+        lowercase_tokens = set(re.findall(r"\b([a-z]{1,5})\b", text))
+        if any(candidate.lower() in lowercase_tokens for candidate in candidates):
+            return []
+        return candidates
 
     @staticmethod
     def _strip_optional_tool_fallback_clause(user_message: str) -> str:
@@ -823,7 +894,7 @@ class Orchestrator:
             if raw_name:
                 updates["name"] = raw_name
 
-        age_match = re.search(r"\b(\d{1,3})\s*years?\s*old\b", lowered)
+        age_match = re.search(r"\b(?:i am|i'm)\s+(\d{1,3})\s*years?\s*old\b", lowered)
         if age_match:
             updates["age"] = int(age_match.group(1))
 
@@ -961,6 +1032,123 @@ class Orchestrator:
         return bool(informative_tokens)
 
     @staticmethod
+    def _should_use_intent_classifier(user_message: str) -> bool:
+        lowered = str(user_message or "").lower()
+        classifier_hints = (
+            "capability",
+            "capabilities",
+            "do you have",
+            "have access",
+            "can you access",
+            "access the internet",
+            "browse the internet",
+            "can you browse",
+            "are you able to",
+            "ability to",
+        )
+        return any(hint in lowered for hint in classifier_hints)
+
+    @staticmethod
+    def _intent_cache_key(user_message: str) -> str:
+        normalized = re.sub(r"\s+", " ", str(user_message or "").strip())
+        return hashlib.sha256(normalized.encode("utf-8")).hexdigest()
+
+    @staticmethod
+    def _parse_intent_classifier_response(content: str) -> Optional[str]:
+        raw = str(content or "").strip()
+        if raw.startswith("```"):
+            raw = re.sub(r"^```(?:json)?\s*", "", raw, flags=re.IGNORECASE)
+            raw = re.sub(r"\s*```$", "", raw).strip()
+        try:
+            payload = json.loads(raw)
+        except json.JSONDecodeError:
+            match = re.search(r"\{[^{}]*\}", raw, flags=re.DOTALL)
+            if not match:
+                return None
+            try:
+                payload = json.loads(match.group(0))
+            except json.JSONDecodeError:
+                return None
+
+        intent = str(payload.get("intent") or "").strip().lower()
+        return intent if intent in _USER_INTENTS else None
+
+    @staticmethod
+    def _fallback_classify_user_intent(user_message: str) -> str:
+        lowered = str(user_message or "").lower()
+        if Orchestrator._is_capability_question(user_message):
+            return "capability_query"
+        if Orchestrator._extract_user_profile_updates(user_message) or Orchestrator._extract_assistant_identity_update(user_message):
+            return "profile_update"
+        if Orchestrator._is_trivial_direct_intent(user_message):
+            return "casual"
+        if Orchestrator._looks_like_task_request(lowered):
+            return "task"
+        return "casual"
+
+    def _get_cached_user_intent(self, cache_key: str) -> Optional[str]:
+        cache = getattr(self, "_intent_classification_cache", None)
+        if not isinstance(cache, dict):
+            self._intent_classification_cache = {}
+            return None
+        cached = cache.get(cache_key)
+        if not cached:
+            return None
+        expires_at, intent = cached
+        if float(expires_at) <= time.time():
+            cache.pop(cache_key, None)
+            return None
+        return str(intent)
+
+    def _cache_user_intent(self, cache_key: str, intent: str) -> None:
+        cache = getattr(self, "_intent_classification_cache", None)
+        if not isinstance(cache, dict):
+            cache = {}
+            self._intent_classification_cache = cache
+        cache[cache_key] = (time.time() + _INTENT_CLASSIFIER_CACHE_TTL_SECONDS, intent)
+
+    @staticmethod
+    def _build_intent_classifier_messages(user_message: str) -> List[Dict[str, str]]:
+        return [
+            {
+                "role": "system",
+                "content": (
+                    "Classify the user's intent. Return ONLY strict JSON matching this schema: "
+                    '{"intent":"capability_query|task|profile_update|casual"}. '
+                    "Use capability_query for questions about what tools, access, skills, or capabilities are available. "
+                    "Use task when the user asks you to do or find something."
+                ),
+            },
+            {"role": "user", "content": str(user_message or "")},
+        ]
+
+    async def _classify_user_intent(self, user_message: str) -> str:
+        cache_key = self._intent_cache_key(user_message)
+        cached_intent = self._get_cached_user_intent(cache_key)
+        if cached_intent in _USER_INTENTS:
+            return cached_intent
+
+        fallback_intent = self._fallback_classify_user_intent(user_message)
+        try:
+            result = await self._route_to_system_1(
+                self._build_intent_classifier_messages(user_message),
+                allowed_tools=[],
+                deadline_seconds=_INTENT_CLASSIFIER_TIMEOUT_SECONDS,
+                context="intent_classifier",
+                max_output_tokens=_INTENT_CLASSIFIER_MAX_OUTPUT_TOKENS,
+            )
+            if result.status == "ok" and result.content and not result.content.startswith(_SYSTEM_1_ERROR_PREFIX):
+                classified_intent = self._parse_intent_classifier_response(result.content)
+                if classified_intent in _USER_INTENTS:
+                    self._cache_user_intent(cache_key, classified_intent)
+                    return classified_intent
+        except Exception as e:
+            logger.debug("Intent classifier failed; falling back to heuristic: %s", e)
+
+        self._cache_user_intent(cache_key, fallback_intent)
+        return fallback_intent
+
+    @staticmethod
     def _is_capability_question(user_message: str) -> bool:
         lowered = (user_message or "").lower()
         capability_markers = ("tool", "tools", "skill", "skills", "capabil", "internet", "browse", "web", "repository")
@@ -987,8 +1175,8 @@ class Orchestrator:
             return False
         return True
 
-    def _build_capability_response(self, user_message: str) -> Optional[str]:
-        if not self._is_capability_question(user_message):
+    def _build_capability_response(self, user_message: str, *, classified_intent: Optional[str] = None) -> Optional[str]:
+        if classified_intent != "capability_query" and not self._is_capability_question(user_message):
             return None
 
         skill_names = self._get_registry_skill_names()
@@ -1194,10 +1382,6 @@ class Orchestrator:
         user_message = state.get("user_input", "")
         chat_history = list(state.get("chat_history", []) or [])
 
-        capability_response = self._build_capability_response(user_message)
-        if capability_response:
-            return capability_response
-
         profile_response = await self._build_profile_response(state)
         if profile_response:
             return profile_response
@@ -1214,6 +1398,16 @@ class Orchestrator:
 
         if self._is_summary_request(user_message):
             return self._summarize_chat_history(chat_history)
+
+        if self._should_use_intent_classifier(user_message):
+            intent = await self._classify_user_intent(user_message)
+            if intent == "capability_query":
+                capability_response = self._build_capability_response(
+                    user_message,
+                    classified_intent=intent,
+                )
+                if capability_response:
+                    return capability_response
 
         return None
 
@@ -1624,11 +1818,53 @@ class Orchestrator:
         )
 
     @staticmethod
-    def _requires_sensitive_cloud_context(*segments: str) -> bool:
-        combined = "\n".join(str(segment or "") for segment in segments)
-        if not combined.strip():
-            return False
-        return bool(_SENSITIVE_CONTEXT_HINT_RE.search(combined))
+    def _is_safe_redacted_context_line(line: str) -> bool:
+        stripped = line.strip()
+        if not stripped:
+            return True
+        if re.fullmatch(r"---\s*(Sensory Context|Core Memory|Archival Memory)\s*---", stripped, flags=re.IGNORECASE):
+            return True
+        return bool(re.fullmatch(r"\[REDACTED_[A-Z_]+\]", stripped))
+
+    @staticmethod
+    def _redact_context_and_memory_contents(text: str) -> str:
+        def _replace(match: re.Match) -> str:
+            opening, inner, closing = match.group(1), match.group(2), match.group(3)
+            redacted_inner = inner
+            for pattern in _CLOUD_REDACTION_BLOCK_PATTERNS:
+                redacted_inner = re.sub(
+                    pattern,
+                    _REDACTED_CONTEXT_BLOCK,
+                    redacted_inner,
+                    flags=re.IGNORECASE | re.DOTALL,
+                )
+            for pattern, replacement in _CLOUD_REDACTION_LINE_PATTERNS:
+                redacted_inner = re.sub(
+                    pattern,
+                    replacement,
+                    redacted_inner,
+                    flags=re.IGNORECASE | re.DOTALL | re.MULTILINE,
+                )
+
+            kept_lines = []
+            dropped_content = False
+            for line in redacted_inner.splitlines():
+                if Orchestrator._is_safe_redacted_context_line(line):
+                    kept_lines.append(line)
+                else:
+                    dropped_content = True
+
+            if dropped_content:
+                kept_lines.append(_REDACTED_CONTEXT_BLOCK)
+            safe_inner = "\n".join(kept_lines).strip()
+            return f"{opening}\n{safe_inner}\n{closing}"
+
+        return re.sub(
+            r"(<context_and_memory>)(.*?)(</context_and_memory>)",
+            _replace,
+            text,
+            flags=re.IGNORECASE | re.DOTALL,
+        )
 
     @staticmethod
     def _redact_text_for_cloud(
@@ -1647,9 +1883,9 @@ class Orchestrator:
                 return compact[:max_chars].rstrip() + "\n[TRUNCATED_FOR_SIZE]"
             return compact
 
-        redacted = raw_text
+        redacted = Orchestrator._redact_context_and_memory_contents(raw_text)
         for pattern in _CLOUD_REDACTION_BLOCK_PATTERNS:
-            redacted = re.sub(pattern, "[REDACTED_CONTEXT_BLOCK]", redacted, flags=re.IGNORECASE | re.DOTALL)
+            redacted = re.sub(pattern, _REDACTED_CONTEXT_BLOCK, redacted, flags=re.IGNORECASE | re.DOTALL)
 
         for pattern, replacement in _CLOUD_REDACTION_LINE_PATTERNS:
             redacted = re.sub(pattern, replacement, redacted, flags=re.IGNORECASE | re.DOTALL | re.MULTILINE)
@@ -1659,7 +1895,7 @@ class Orchestrator:
 
         redacted = re.sub(r"\n{3,}", "\n\n", redacted).strip()
         if not redacted:
-            return "[REDACTED_EMPTY_PAYLOAD]"
+            return _REDACTED_EMPTY_PAYLOAD
         if len(redacted) > max_chars:
             return redacted[:max_chars].rstrip() + "\n[TRUNCATED_FOR_PRIVACY]"
         return redacted
@@ -1671,7 +1907,7 @@ class Orchestrator:
         allow_sensitive_context: bool = False,
     ) -> List[Dict[str, str]]:
         if not messages:
-            return [{"role": "user", "content": "[REDACTED_EMPTY_PAYLOAD]"}]
+            return [{"role": "user", "content": _REDACTED_EMPTY_PAYLOAD}]
 
         source_messages: List[Dict[str, Any]]
         if allow_sensitive_context:
@@ -1706,7 +1942,43 @@ class Orchestrator:
             seen.add(key)
             sanitized.append({"role": role, "content": content})
 
-        return sanitized or [{"role": "user", "content": "[REDACTED_EMPTY_PAYLOAD]"}]
+        return sanitized or [{"role": "user", "content": _REDACTED_EMPTY_PAYLOAD}]
+
+    @staticmethod
+    def _cloud_payload_audit_sha256(
+        messages: List[Dict[str, str]],
+        allowed_tools: Optional[List[str]],
+    ) -> str:
+        payload = {
+            "messages": list(messages or []),
+            "allowed_tools": list(allowed_tools or []),
+        }
+        serialized = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        return hashlib.sha256(serialized.encode("utf-8")).hexdigest()
+
+    async def _append_cloud_payload_audit_if_supported(
+        self,
+        *,
+        purpose: str,
+        message_count_before: int,
+        message_count_after: int,
+        allow_sensitive_context: bool,
+        payload_sha256: str,
+    ) -> None:
+        ledger = getattr(self, "ledger_memory", None)
+        append_fn = getattr(ledger, "append_cloud_payload_audit", None)
+        if not callable(append_fn):
+            return
+        try:
+            await append_fn(
+                purpose=purpose,
+                message_count_before=message_count_before,
+                message_count_after=message_count_after,
+                allow_sensitive_context=allow_sensitive_context,
+                payload_sha256=payload_sha256,
+            )
+        except Exception as e:
+            logger.warning("Failed to append cloud payload audit entry for %s: %s", purpose, e)
 
     async def _route_to_system_2_redacted(
         self,
@@ -1725,6 +1997,13 @@ class Orchestrator:
             purpose,
             len(messages),
             len(minimized_messages),
+        )
+        await self._append_cloud_payload_audit_if_supported(
+            purpose=purpose,
+            message_count_before=len(messages),
+            message_count_after=len(minimized_messages),
+            allow_sensitive_context=allow_sensitive_context,
+            payload_sha256=self._cloud_payload_audit_sha256(minimized_messages, allowed_tools),
         )
         return await self.cognitive_router.route_to_system_2(
             minimized_messages,
@@ -1778,9 +2057,13 @@ class Orchestrator:
         *,
         deadline_seconds: Optional[float] = None,
         context: str = "orchestrator",
+        max_output_tokens: Optional[int] = None,
     ) -> RouterResult:
         before_metrics = self._get_system_1_gate_metrics()
-        route_call = self.cognitive_router.route_to_system_1(messages, allowed_tools=allowed_tools)
+        route_kwargs: Dict[str, Any] = {"allowed_tools": allowed_tools}
+        if max_output_tokens is not None:
+            route_kwargs["max_output_tokens"] = max_output_tokens
+        route_call = self.cognitive_router.route_to_system_1(messages, **route_kwargs)
         try:
             if deadline_seconds is None:
                 return await route_call
@@ -1828,6 +2111,26 @@ class Orchestrator:
             return max(0, int(os.getenv("INITIAL_ENERGY_BUDGET", "100")))
         async with self._predictive_energy_budget_lock:
             return max(0, int(self._predictive_energy_budget_remaining))
+
+    def _predictive_budget_tracking_available(self) -> bool:
+        return (
+            getattr(self, "_predictive_energy_budget_lock", None) is not None
+            and hasattr(self, "_predictive_energy_budget_remaining")
+        )
+
+    async def _refund_predictive_energy_budget(self, amount: int, reason: str) -> None:
+        if amount <= 0 or not self._predictive_budget_tracking_available():
+            return
+        cap = max(0, int(os.getenv("INITIAL_ENERGY_BUDGET", "100")))
+        async with self._predictive_energy_budget_lock:
+            remaining = max(0, int(self._predictive_energy_budget_remaining))
+            self._predictive_energy_budget_remaining = min(cap, remaining + int(amount))
+            logger.info(
+                "Predictive energy budget refunded: +%s (%s). Remaining=%s",
+                amount,
+                reason,
+                self._predictive_energy_budget_remaining,
+            )
 
     async def _try_reserve_predictive_energy_budget(
         self,
@@ -2143,17 +2446,13 @@ class Orchestrator:
             return None
 
         planning_context = self._build_goal_planning_context(state)
-        allow_sensitive_context = self._requires_sensitive_cloud_context(
-            user_message,
-            planning_context,
-        )
 
         async def _route(messages: List[Dict[str, str]]) -> RouterResult:
             return await self._route_to_system_2_redacted(
                 messages,
                 allowed_tools=[],
                 purpose="goal_planner",
-                allow_sensitive_context=allow_sensitive_context,
+                allow_sensitive_context=False,
             )
 
         try:
@@ -2548,14 +2847,11 @@ class Orchestrator:
 
         try:
             logger.info("Escalating Supervisor to System 2")
-            allow_sensitive_context = self._requires_sensitive_cloud_context(
-                messages[-1].get("content", "") if messages else "",
-            )
             router_result = await asyncio.wait_for(
                 self._route_to_system_2_redacted(
                     messages,
                     purpose="supervisor_fallback",
-                    allow_sensitive_context=allow_sensitive_context,
+                    allow_sensitive_context=False,
                 ),
                 timeout=60.0,
             )
@@ -2848,6 +3144,60 @@ class Orchestrator:
         snapshot["worker_outputs"] = dict(state.get("worker_outputs", {}) or {})
         return snapshot
 
+    @staticmethod
+    def _raise_parallel_blocking_exception(results: List[Any]) -> None:
+        for result in results:
+            if isinstance(result, (RequiresHITLError, RequiresMFAError)):
+                raise result
+
+    @staticmethod
+    def _find_parallel_blocked_result(
+        batch: List[tuple[AgentDefinition, Dict[str, Any]]],
+        results: List[Any],
+    ) -> tuple[Optional[RouterResult], set[str]]:
+        blocked_result = None
+        blocked_agent_names: set[str] = set()
+        for (agent_def, _task_packet), result in zip(batch, results):
+            if isinstance(result, Exception):
+                continue
+            if result.get(_BLOCKED_KEY):
+                blocked_result = blocked_result or result[_BLOCKED_KEY]
+                blocked_agent_names.add(agent_def.name)
+        return blocked_result, blocked_agent_names
+
+    async def _refund_blocked_parallel_batch_energy(
+        self,
+        batch: List[tuple[AgentDefinition, Dict[str, Any]]],
+        state: Dict[str, Any],
+        blocked_agent_names: set[str],
+    ) -> Dict[str, Any]:
+        unused_energy = sum(
+            agent_def.energy_cost
+            for agent_def, _task_packet in batch
+            if agent_def.name not in blocked_agent_names
+        )
+        state = self._refund_energy(state, unused_energy, "parallel_agents_blocked_unused")
+        if state.get("_energy_gate_cleared"):
+            await self._refund_predictive_energy_budget(unused_energy, "parallel_agents_blocked_unused")
+        return state
+
+    @staticmethod
+    def _merge_parallel_agent_results(
+        batch: List[tuple[AgentDefinition, Dict[str, Any]]],
+        results: List[Any],
+        state: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        for (agent_def, _task_packet), result in zip(batch, results):
+            if isinstance(result, Exception):
+                logger.error("Parallel agent %s failed with exception: %s", agent_def.name, result, exc_info=True)
+                state["worker_outputs"][agent_def.name] = f"Error: {agent_def.name} failed with exception: {result}"
+                continue
+
+            agent_output = dict(result.get("worker_outputs", {}) or {}).get(agent_def.name)
+            if agent_output is not None:
+                state["worker_outputs"][agent_def.name] = agent_output
+        return state
+
     async def _run_parallel_agent_batch(
         self,
         batch: List[tuple[AgentDefinition, Dict[str, Any]]],
@@ -2869,24 +3219,15 @@ class Orchestrator:
             return_exceptions=True,
         )
 
-        blocked_result = None
-        for (agent_def, _task_packet), result in zip(batch, results):
-            if isinstance(result, Exception):
-                logger.error("Parallel agent %s failed with exception: %s", agent_def.name, result, exc_info=True)
-                state["worker_outputs"][agent_def.name] = f"Error: {agent_def.name} failed with exception: {result}"
-                continue
-
-            agent_output = dict(result.get("worker_outputs", {}) or {}).get(agent_def.name)
-            if agent_output is not None:
-                state["worker_outputs"][agent_def.name] = agent_output
-
-            if blocked_result is None and result.get(_BLOCKED_KEY):
-                blocked_result = result[_BLOCKED_KEY]
+        self._raise_parallel_blocking_exception(results)
+        blocked_result, blocked_agent_names = self._find_parallel_blocked_result(batch, results)
 
         if blocked_result is not None:
+            state = await self._refund_blocked_parallel_batch_energy(batch, state, blocked_agent_names)
             state[_BLOCKED_KEY] = blocked_result
+            return state
 
-        return state
+        return self._merge_parallel_agent_results(batch, results, state)
 
     async def _try_route_agent_system_1(
         self,
@@ -2918,18 +3259,14 @@ class Orchestrator:
         if not self.cognitive_router.get_system_2_available():
             return None
 
+        _ = (task_packet, state)
         try:
-            allow_sensitive_context = self._requires_sensitive_cloud_context(
-                (task_packet or {}).get("task", ""),
-                (task_packet or {}).get("reason", ""),
-                (state or {}).get("user_input", ""),
-            )
             router_result = await asyncio.wait_for(
                 self._route_to_system_2_redacted(
                     messages,
                     allowed_tools=agent_def.allowed_tools,
                     purpose=f"{agent_def.name}_fallback",
-                    allow_sensitive_context=allow_sensitive_context,
+                    allow_sensitive_context=False,
                 ),
                 timeout=60.0,
             )
@@ -3059,8 +3396,9 @@ class Orchestrator:
 
     @staticmethod
     def _build_heartbeat_execution_prompt(task: Dict[str, Any]) -> str:
+        prefix = HEARTBEAT_TASK_PREFIX_FMT.format(task_id=task["id"])
         return (
-            f"[HEARTBEAT TASK #{task['id']}]: {task['title']}\n"
+            f"{prefix}: {task['title']}\n"
             f"You MUST execute this task right now by calling the appropriate tools. "
             f"Do NOT describe what you plan to do — use your tools and report the actual results. "
             f"If the task requires storing data, call update_core_memory or update_ledger explicitly. "
@@ -3093,7 +3431,7 @@ class Orchestrator:
 
         active_nodes = await self.ledger_memory.get_active_objective_tree()
         unresolved_rows = await self.ledger_memory.get_tasks_with_unresolved_dependencies(
-            statuses=["pending", "deferred_due_to_energy"],
+            statuses=["pending", "active", "deferred_due_to_energy"],
         )
         unresolved_task_ids = {int(row["id"]) for row in unresolved_rows}
         parent_ids = {
@@ -3399,16 +3737,13 @@ class Orchestrator:
                 logger.warning(f"Memory consolidation loop error: {e}", exc_info=True)
 
     async def _score_nocturnal_candidates(self, messages: List[Dict[str, str]]) -> RouterResult:
-        allow_sensitive_context = self._requires_sensitive_cloud_context(
-            *(message.get("content", "") for message in messages),
-        )
         if self.cognitive_router.get_system_2_available():
             return await asyncio.wait_for(
                 self._route_to_system_2_redacted(
                     messages,
                     allowed_tools=[],
                     purpose="nocturnal_scoring",
-                    allow_sensitive_context=allow_sensitive_context,
+                    allow_sensitive_context=False,
                 ),
                 timeout=45.0,
             )
@@ -3438,13 +3773,32 @@ class Orchestrator:
         except Exception as e:
             logger.warning(f"Async memory save failed: {e}")
 
+    @staticmethod
+    def _has_explicit_memory_intent(text: str) -> bool:
+        return bool(_EXPLICIT_MEMORY_REQUEST_RE.search(str(text or "")))
+
+    async def _save_explicit_memory_request(self, text: str) -> None:
+        try:
+            await self.vector_memory.add_memory_async(
+                text=text,
+                metadata={"type": "explicit_memory", "source": "user_request"},
+            )
+        except Exception as e:
+            logger.warning(f"Explicit memory save failed: {e}")
+
+    async def _apply_text_memory_hooks(self, user_id: str, user_message: str) -> None:
+        profile_updated = await self._remember_user_profile(user_id, user_message)
+        await self._remember_assistant_identity(user_message)
+        if not profile_updated and self._has_explicit_memory_intent(user_message):
+            await self._save_explicit_memory_request(user_message)
+
     async def _load_approved_tools(self) -> None:
         """Re-register all previously approved dynamic tools from the DB at startup."""
         try:
             approved = await self.ledger_memory.get_approved_tools()
             for tool in approved:
                 try:
-                    self.cognitive_router.register_dynamic_tool(
+                    await self.cognitive_router.register_dynamic_tool(
                         tool["name"], tool["code"], tool["schema_json"]
                     )
                     logger.info(f"Restored dynamic tool '{tool['name']}' from registry")
@@ -3453,6 +3807,11 @@ class Orchestrator:
             self._invalidate_capabilities_cache()
         except Exception as e:
             logger.warning(f"_load_approved_tools failed: {e}")
+
+    async def _reload_dynamic_tools_after_worker_restart(self) -> None:
+        """Rehydrate the isolated worker from approved dynamic tools after a crash."""
+        logger.critical("Dynamic tool worker restarted; re-registering approved tools from ledger.")
+        await self._load_approved_tools()
 
     async def _load_pending_approvals(self) -> None:
         """Reload any tool synthesis proposals that were pending when the bot last stopped."""
@@ -3576,30 +3935,54 @@ class Orchestrator:
         task.add_done_callback(_on_done)
         return task
 
-    async def _get_user_lock(self, user_id: str) -> asyncio.Lock:
-        """Return the per-user asyncio.Lock with LRU eviction to bound memory usage."""
+    @staticmethod
+    def _coerce_user_lock_slot(raw_ref: Any) -> Optional[_UserLockSlot]:
+        if isinstance(raw_ref, weakref.ReferenceType):
+            slot = raw_ref()
+            return slot if isinstance(slot, _UserLockSlot) else None
+        return None
+
+    def _evict_idle_user_lock_refs(self, max_size: int) -> None:
+        for lock_key in tuple(self._user_locks.keys()):
+            if self._coerce_user_lock_slot(self._user_locks[lock_key]) is None:
+                self._user_locks.pop(lock_key, None)
+
+        while len(self._user_locks) > max_size:
+            evicted = False
+            for lock_key, raw_ref in tuple(self._user_locks.items()):
+                slot = self._coerce_user_lock_slot(raw_ref)
+                if slot is None or slot.in_flight == 0:
+                    self._user_locks.pop(lock_key, None)
+                    evicted = True
+                    break
+            if not evicted:
+                break
+
+    async def _get_user_lock(self, user_id: str) -> _UserLockLease:
+        """Return a per-user lock lease with LRU eviction that ignores in-flight entries."""
         _max = int(os.getenv("USER_LOCKS_MAX_SIZE", "500"))
         async with self._user_locks_lock:
-            if user_id in self._user_locks:
-                # Move to end (most-recently-used)
-                self._user_locks[user_id] = self._user_locks.pop(user_id)
-                return self._user_locks[user_id]
-            lock = asyncio.Lock()
-            self._user_locks[user_id] = lock
-            # Evict oldest UNLOCKED entry when over the cap.
-            # If all candidates are currently locked, keep them to avoid
-            # creating duplicate locks for an in-flight user.
-            if len(self._user_locks) > _max:
-                evict_key_to_remove = None
-                for evict_key, candidate in self._user_locks.items():
-                    if evict_key == user_id:
-                        continue
-                    if not candidate.locked():
-                        evict_key_to_remove = evict_key
-                        break
-                if evict_key_to_remove is not None:
-                    del self._user_locks[evict_key_to_remove]
-            return lock
+            if not isinstance(getattr(self, "_user_locks", None), dict):
+                self._user_locks = {}
+
+            raw_ref = self._user_locks.pop(user_id, None)
+            slot = self._coerce_user_lock_slot(raw_ref) if raw_ref is not None else None
+            if slot is None:
+                slot = _UserLockSlot()
+
+            slot.in_flight += 1
+            self._user_locks[user_id] = weakref.ref(slot)
+            self._evict_idle_user_lock_refs(_max)
+            return _UserLockLease(self, user_id, slot)
+
+    async def _release_user_lock_lease(self, user_id: str, slot: _UserLockSlot) -> None:
+        _max = int(os.getenv("USER_LOCKS_MAX_SIZE", "500"))
+        async with self._user_locks_lock:
+            slot.in_flight = max(0, slot.in_flight - 1)
+            current_ref = self._user_locks.get(user_id)
+            if current_ref is None or current_ref() is slot:
+                self._user_locks[user_id] = weakref.ref(slot)
+            self._evict_idle_user_lock_refs(_max)
 
     @staticmethod
     def _get_synthesis_self_test_timeout_seconds() -> float:
@@ -4143,13 +4526,14 @@ class Orchestrator:
         self,
         state: Dict[str, Any],
         router_result: RouterResult,
-    ) -> str:
+    ) -> Any:
         """
         Cognitive handoff: router flagged a gap → System 2 synthesises a tool
         → Admin approves via HITL → tool registered → original query retried.
 
-        Returns a HITL prompt string for the Admin; the orchestrator stores the
-        synthesis payload in pending_tool_approval until the Admin replies.
+        Returns a HITL prompt string, or an outbound payload dict when the code
+        must be attached as a document. The orchestrator stores the synthesis
+        payload in pending_tool_approval until the Admin replies.
         """
         user_id = state["user_id"]
         gap_description = router_result.gap_description
@@ -4222,7 +4606,43 @@ class Orchestrator:
             f"─────────────────────────────\n"
             f"Reply YES to approve and deploy, or NO to reject."
         )
+        if len(hitl_msg) > 3500:
+            attachment_path = self._write_synthesis_code_attachment(synthesis)
+            attachment_name = os.path.basename(attachment_path)
+            metadata_msg = (
+                "TOOL SYNTHESIS REQUEST\n\n"
+                f"System 1 could not answer: \"{state['user_input']}\"\n"
+                f"Gap identified: {gap_description}\n\n"
+                f"Name: {synthesis['tool_name']}\n"
+                f"Description: {synthesis['description']}\n\n"
+                f"Sandboxed self-test: {test_summary}\n"
+                f"Cryptographic proof (SHA-256 tool+tests): {proof_sha256}\n"
+                f"Audit run id: {synthesis_run_id if synthesis_run_id is not None else 'n/a'}\n"
+                f"Repair attempt: {attempts_used}/{max_retries}\n\n"
+                f"Code attached as Telegram document: {attachment_name}\n"
+                "Reply YES to approve and deploy, or NO to reject."
+            )
+            return {
+                "text": metadata_msg[:3500],
+                "document_path": attachment_path,
+                "document_filename": attachment_name,
+                "delete_after_send": True,
+            }
         return hitl_msg
+
+    @staticmethod
+    def _write_synthesis_code_attachment(synthesis: Dict[str, Any]) -> str:
+        tool_name = re.sub(r"[^A-Za-z0-9_.-]+", "_", str(synthesis.get("tool_name") or "tool"))
+        with tempfile.NamedTemporaryFile(
+            "w",
+            encoding="utf-8",
+            suffix=f"_{tool_name}.py",
+            prefix="aiden_synth_",
+            delete=False,
+        ) as temp_file:
+            temp_file.write(str(synthesis.get("code") or ""))
+            temp_file.write("\n")
+            return temp_file.name
 
     def _extract_router_content(self, result: RouterResult) -> Optional[str]:
         """
@@ -4266,13 +4686,27 @@ class Orchestrator:
             os_name=self.sensory_state.get("os", platform.system()),
             downloads_dir=self.prompt_config.downloads_dir,
         )
+        logger.info(
+            "Supervisor system prompt sha256=%s bytes=%d",
+            hashlib.sha256(system_prompt.encode("utf-8")).hexdigest(),
+            len(system_prompt.encode("utf-8")),
+        )
+
+        turn_context = build_supervisor_turn_context(
+            sensory_context=self._get_sensory_context(),
+            archival_block=archival_block,
+        )
+        user_prompt_message = self._build_user_prompt_message(state)
+        if turn_context:
+            user_prompt_message = dict(user_prompt_message)
+            user_prompt_message["content"] = f"{turn_context}\n\n{user_prompt_message['content']}"
 
         messages = [{"role": "system", "content": system_prompt}]
         for turn in state.get("chat_history", []):
             messages.append({"role": turn["role"], "content": turn["content"]})
         if state.get("critic_instructions"):
             messages.append({"role": "system", "content": state["critic_instructions"]})
-        messages.append(self._build_user_prompt_message(state))
+        messages.append(user_prompt_message)
 
         try:
             router_result = await self._route_supervisor_request(messages)
@@ -4294,6 +4728,7 @@ class Orchestrator:
                 logger.warning(f"Supervisor received error or no response: {response!r}")
                 state["current_plan"] = []
                 if not self.cognitive_router.get_system_2_available():
+                    state["_turn_failed"] = True
                     state["final_response"] = (
                         "I was unable to process this request locally. This task likely requires "
                         "capabilities beyond my local model (e.g. internet access or complex reasoning). "
@@ -4301,6 +4736,7 @@ class Orchestrator:
                         "Groq offers a free tier at console.groq.com."
                     )
                 else:
+                    state["_turn_failed"] = True
                     state["final_response"] = "Both local and cloud reasoning failed on this request. Please try rephrasing or simplifying the task."
                 return state
 
@@ -4310,6 +4746,7 @@ class Orchestrator:
             logger.error("Supervisor node timeout (60s)")
             state = self._refund_energy(state, ENERGY_COST_SUPERVISOR, "supervisor_timeout")
             state["current_plan"] = []
+            state["_turn_failed"] = True
             state["final_response"] = "Planning timed out. Please try again."
         except RequiresHITLError:
             raise
@@ -4317,6 +4754,7 @@ class Orchestrator:
             logger.error(f"Supervisor Node failed: {e}", exc_info=True)
             state = self._refund_energy(state, ENERGY_COST_SUPERVISOR, "supervisor_error")
             state["current_plan"] = []
+            state["_turn_failed"] = True
             state["final_response"] = "Supervisor encountered an error. Please try again."
 
         return state
@@ -4380,11 +4818,39 @@ class Orchestrator:
 
     @staticmethod
     def _extract_charter_tier_block(charter_text: str, tier_tag: str) -> str:
-        pattern = rf"<{re.escape(tier_tag)}[^>]*>(.*?)</{re.escape(tier_tag)}>"
-        match = re.search(pattern, str(charter_text or ""), flags=re.IGNORECASE | re.DOTALL)
-        if not match:
-            return ""
-        return re.sub(r"\n{3,}", "\n\n", match.group(1).strip())
+        raw_charter = str(charter_text or "").strip()
+        if not raw_charter:
+            return "[MALFORMED_CHARTER_XML: empty charter]"
+        try:
+            root = ET.fromstring(raw_charter)
+        except ET.ParseError as exc:
+            return f"[MALFORMED_CHARTER_XML: {exc}]"
+
+        target = Orchestrator._find_xml_element(root, tier_tag)
+        if target is None:
+            return f"[MISSING_CHARTER_TIER: {tier_tag}]"
+        return Orchestrator._serialize_xml_inner(target)
+
+    @staticmethod
+    def _strip_xml_namespace(tag: str) -> str:
+        return str(tag or "").rsplit("}", 1)[-1]
+
+    @staticmethod
+    def _find_xml_element(root: ET.Element, tag_name: str) -> Optional[ET.Element]:
+        expected = str(tag_name or "").strip().lower()
+        for element in root.iter():
+            if Orchestrator._strip_xml_namespace(element.tag).lower() == expected:
+                return element
+        return None
+
+    @staticmethod
+    def _serialize_xml_inner(element: ET.Element) -> str:
+        parts: List[str] = []
+        if element.text and element.text.strip():
+            parts.append(element.text.strip())
+        for child in element:
+            parts.append(ET.tostring(child, encoding="unicode").strip())
+        return re.sub(r"\n{3,}", "\n\n", "\n".join(part for part in parts if part).strip())
 
     @staticmethod
     def _summarize_plan_for_moral_audit(state: Dict[str, Any]) -> str:
@@ -4585,7 +5051,8 @@ class Orchestrator:
 
     @staticmethod
     def _extract_heartbeat_task_id(user_input: str) -> Optional[int]:
-        match = re.search(r"\[HEARTBEAT TASK #(\d+)\]", str(user_input or ""))
+        prefix_pattern = re.escape(HEARTBEAT_TASK_PREFIX_FMT).replace(r"\{task_id\}", r"(\d+)")
+        match = re.search(prefix_pattern, str(user_input or ""))
         if not match:
             return None
         try:
@@ -4661,10 +5128,29 @@ class Orchestrator:
             return state
         return self._finalize_critic_pass(state, output_to_eval)
 
-    async def critic_node(self, state: Dict[str, Any]) -> Dict[str, Any]:
-        """Checks worker output against the charter. Skipped for direct supervisor responses."""
-        state = normalize_state(state)
-        output_to_eval = self._get_output_to_evaluate(state)
+    @staticmethod
+    def _apply_fallback_charter_critic_skip(state: Dict[str, Any], output_to_eval: str) -> Dict[str, Any]:
+        state["critic_feedback"] = "PASS"
+        state["moral_audit_mode"] = "disabled_fallback_charter"
+        state["moral_audit_trace"] = "fallback charter active"
+        state["moral_audit_bypassed"] = True
+        state["moral_remediation_constraints"] = []
+        state["moral_halt_required"] = False
+        state["moral_halt_summary"] = ""
+        if output_to_eval and not state.get("final_response"):
+            state["final_response"] = output_to_eval
+        return state
+
+    async def _try_pre_review_critic_skip(  # NOSONAR
+        self,
+        state: Dict[str, Any],
+        output_to_eval: str,
+    ) -> Optional[Dict[str, Any]]:
+        if self._is_fallback_charter_active():
+            logger.warning(
+                "Critic disabled because fallback charter is active; skipping critic and moral audit for this turn."
+            )
+            return self._apply_fallback_charter_critic_skip(state, output_to_eval)
 
         if not output_to_eval:
             self._store_moral_decision_trace(
@@ -4674,6 +5160,17 @@ class Orchestrator:
             state["critic_feedback"] = "PASS"
             await self._persist_moral_audit_log(state, output_to_eval)
             return state
+
+        return None
+
+    async def critic_node(self, state: Dict[str, Any]) -> Dict[str, Any]:
+        """Checks worker output against the charter. Skipped for direct supervisor responses."""
+        state = normalize_state(state)
+        output_to_eval = self._get_output_to_evaluate(state)
+
+        pre_review_skip = await self._try_pre_review_critic_skip(state, output_to_eval)
+        if pre_review_skip is not None:
+            return pre_review_skip
 
         bypass_decision = self._try_triviality_bypass_decision(state, output_to_eval)
         if bypass_decision is not None:
@@ -4737,6 +5234,9 @@ class Orchestrator:
             )
 
         return state
+
+    def _is_fallback_charter_active(self) -> bool:
+        return str(getattr(self, "charter_text", "") or "").strip() == self._CHARTER_FALLBACK
 
     async def _consolidate_memory(self, user_id: str) -> None:
         """Run deep nocturnal consolidation pipeline (extract -> filter -> score -> write-back)."""
@@ -4902,7 +5402,7 @@ class Orchestrator:
         attempts_used: int,
         original_state: Dict[str, Any],
     ) -> str:
-        self.cognitive_router.register_dynamic_tool(tool_name, synthesis["code"], synthesis["schema_json"])
+        await self.cognitive_router.register_dynamic_tool(tool_name, synthesis["code"], synthesis["schema_json"])
         self._invalidate_capabilities_cache()
         await self.ledger_memory.register_tool(
             name=tool_name,
@@ -5026,7 +5526,6 @@ class Orchestrator:
                 state["admin_guidance"] = user_message
                 state["user_input"] += f"\n[ADMIN GUIDANCE: {user_message}]"
                 state["user_prompt"] = dict(user_prompt or {})
-                state["iteration_count"] = 0
                 state["current_plan"] = []
                 state["_energy_gate_cleared"] = False
                 # Track how many HITL cycles have been spent on this task (ISSUE-005)
@@ -5035,17 +5534,7 @@ class Orchestrator:
                 # ensures a perpetually failing task eventually becomes unrecoverable
                 # rather than cycling indefinitely at full energy (ISSUE-005).
                 state["energy_remaining"] = min(state.get("energy_remaining", 0) + 50, 75)
-                # If the admin has guided this task 3+ times without success, abandon it
-                if state["hitl_count"] >= 3:
-                    logger.warning(
-                        f"HITL cycle limit (3) reached for user {user_id}. "
-                        f"Abandoning task: {state.get('user_input', '')[:80]}"
-                    )
-                    state["final_response"] = (
-                        "This task has been attempted 3 times with admin guidance and "
-                        "could not be completed. The request has been abandoned to prevent "
-                        "an infinite loop. Please rephrase or break it into smaller steps."
-                    )
+                self._apply_hitl_resume_limits(state, user_id)
                 return normalize_state(state)
         state = self._new_state(user_id, user_message, user_prompt=user_prompt)
         state["user_prompt"] = dict(user_prompt or {})
@@ -5058,6 +5547,24 @@ class Orchestrator:
             except Exception as e:
                 logger.warning(f"Failed to load chat history for {user_id}: {e}")
         return normalize_state(state)
+
+    @staticmethod
+    def _apply_hitl_resume_limits(state: Dict[str, Any], user_id: str) -> None:
+        if int(state.get("iteration_count") or 0) >= 3:
+            state["final_response"] = (
+                "This task reached the critic rejection limit and has been abandoned "
+                "to prevent repeated unsafe retries. Please rephrase or break it into smaller steps."
+            )
+        if state["hitl_count"] >= 3:
+            logger.warning(
+                f"HITL cycle limit (3) reached for user {user_id}. "
+                f"Abandoning task: {state.get('user_input', '')[:80]}"
+            )
+            state["final_response"] = (
+                "This task has been attempted 3 times with admin guidance and "
+                "could not be completed. The request has been abandoned to prevent "
+                "an infinite loop. Please rephrase or break it into smaller steps."
+            )
 
     @staticmethod
     def _has_ready_final_response(state: Dict[str, Any]) -> bool:
@@ -5117,16 +5624,20 @@ class Orchestrator:
     @staticmethod
     def _ensure_final_response(state: Dict[str, Any], max_iterations: int) -> None:
         if state["iteration_count"] >= max_iterations and state.get("critic_feedback") != "PASS":
+            state["_turn_failed"] = True
             state["final_response"] = "Unable to fulfill this request — output repeatedly failed internal safety checks."
         if not state.get("final_response"):
+            state["_turn_failed"] = True
             state["final_response"] = "No valid response could be generated."
 
-    @staticmethod
-    def _is_error_response(response: str) -> bool:
-        return any(response.startswith(prefix) for prefix in _ERROR_RESPONSE_PREFIXES)
-
-    async def _persist_chat_turns(self, user_id: str, user_message: str, final_resp: str) -> None:
-        if user_id == "heartbeat" or self._is_error_response(final_resp):
+    async def _persist_chat_turns(
+        self,
+        user_id: str,
+        user_message: str,
+        final_resp: str,
+        turn_failed: bool = False,
+    ) -> None:
+        if user_id == "heartbeat" or turn_failed:
             return
         try:
             await self.ledger_memory.save_chat_turn(user_id, "user", user_message)
@@ -5148,9 +5659,23 @@ class Orchestrator:
             self._save_memory_async(f"User: {user_message}\nAssistant: {final_resp}")
         )
 
-    async def _finalize_user_response(self, user_id: str, user_message: str, response: str) -> str:
+    async def _finalize_user_response(
+        self,
+        user_id: str,
+        user_message: str,
+        response: str,
+        state: Optional[Dict[str, Any]] = None,
+    ) -> str:
         final_resp = self.cognitive_router.sanitize_response(response)
-        await self._persist_chat_turns(user_id, user_message, final_resp)
+        turn_failed = bool((state or {}).get("_turn_failed", False))
+        if state is None:
+            turn_failed = bool(getattr(self, "_finalizing_turn_failed", False))
+        await self._persist_chat_turns(
+            user_id,
+            user_message,
+            final_resp,
+            turn_failed=turn_failed,
+        )
         self._schedule_response_memory_save(user_message, final_resp)
         return final_resp
 
@@ -5183,7 +5708,11 @@ class Orchestrator:
             self._reset_after_critic_rejection(state)
 
         self._ensure_final_response(state, max_iterations)
-        return await self._finalize_user_response(user_id, user_message, state["final_response"])
+        self._finalizing_turn_failed = bool(state.get("_turn_failed", False))
+        try:
+            return await self._finalize_user_response(user_id, user_message, state["final_response"])
+        finally:
+            self._finalizing_turn_failed = False
 
     async def process_message(self, user_message: Any, user_id: str) -> str:
         """Main entry point: State Graph execution with Energy Budget."""
@@ -5245,8 +5774,7 @@ class Orchestrator:
                 return self.cognitive_router.sanitize_response(state["final_response"])
 
             if not has_audio_prompt:
-                await self._remember_user_profile(user_id, normalized_user_message)
-                await self._remember_assistant_identity(normalized_user_message)
+                await self._apply_text_memory_hooks(user_id, normalized_user_message)
             else:
                 logger.info("Audio prompt detected for %s; bypassing text-only fast-path memory hooks.", user_id)
 
@@ -5271,6 +5799,7 @@ class Orchestrator:
                 return str(hitl_err)
             except Exception as e:
                 logger.error(f"Graph execution failed: {e}", exc_info=True)
+                state["_turn_failed"] = True
                 return "An internal error occurred."
 
     async def _handle_blocked_result(
@@ -5347,18 +5876,14 @@ class Orchestrator:
         Extracts the solution and blueprint, saves blueprint to memory async,
         and returns the solution string.
         """
-        allow_sensitive_context = self._requires_sensitive_cloud_context(
-            router_result.escalation_problem,
-            router_result.escalation_context,
-            state.get("user_input", ""),
-        )
+        _ = state
         escalation_problem = self._redact_text_for_cloud(
             router_result.escalation_problem,
-            allow_sensitive_context=allow_sensitive_context,
+            allow_sensitive_context=False,
         )
         escalation_context = self._redact_text_for_cloud(
             router_result.escalation_context,
-            allow_sensitive_context=allow_sensitive_context,
+            allow_sensitive_context=False,
         )
 
         prompt = (
@@ -5376,7 +5901,7 @@ class Orchestrator:
         sys2_result = await self._route_to_system_2_redacted(
             messages,
             purpose="cognitive_escalation",
-            allow_sensitive_context=allow_sensitive_context,
+            allow_sensitive_context=False,
         )
 
         content = sys2_result.content if sys2_result.status == "ok" else "[System 2 - Error]: Escalation failed."
