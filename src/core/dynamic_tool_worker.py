@@ -76,6 +76,7 @@ _WORKER_TEMP_ROOT = os.path.realpath(
     os.environ.get("AIDEN_DYNAMIC_TOOL_TMPDIR") or tempfile.mkdtemp(prefix="aiden_dynamic_worker_")
 )
 _WORKER_TOOLS: Dict[str, Dict[str, Any]] = {}
+_EXEC_USER_PYTHON_TOOL_NAME = "__exec_user_python__"
 
 
 class DynamicToolWorkerProcessError(RuntimeError):
@@ -332,6 +333,65 @@ def _response_error(error: Any) -> Dict[str, Any]:
     return {"ok": False, "error": str(error)}
 
 
+def _format_execution_output(stdout_text: str, stderr_text: str) -> str:
+    output = ""
+    if stdout_text:
+        output += f"--- STDOUT ---\n{stdout_text}\n"
+    if stderr_text:
+        output += f"--- STDERR ---\n{stderr_text}\n"
+    return output or "Script executed successfully with no output."
+
+
+async def __exec_user_python__(code_string: str) -> str:
+    code = str(code_string or "")
+    if not code.strip():
+        raise ValueError("execute_python_sandbox requires a non-empty code_string")
+
+    validate_tool_code_ast(code, _EXEC_USER_PYTHON_TOOL_NAME)
+    validate_dynamic_tool_token_scan(code, _EXEC_USER_PYTHON_TOOL_NAME)
+
+    stdout_buffer = io.StringIO()
+    stderr_buffer = io.StringIO()
+    sandbox_globals: Dict[str, Any] = {
+        "__builtins__": _safe_builtins(),
+        "__name__": "__main__",
+    }
+
+    try:
+        with contextlib.redirect_stdout(stdout_buffer), contextlib.redirect_stderr(stderr_buffer):
+            exec(compile(code, "<user_python>", "exec"), sandbox_globals, sandbox_globals)
+    except Exception as exc:
+        raise RuntimeError(traceback.format_exc()) from exc
+
+    return _format_execution_output(stdout_buffer.getvalue(), stderr_buffer.getvalue())
+
+
+def _register_builtin_tools() -> None:
+    _WORKER_TOOLS.setdefault(
+        _EXEC_USER_PYTHON_TOOL_NAME,
+        {
+            "fn": __exec_user_python__,
+            "schema": {
+                "name": _EXEC_USER_PYTHON_TOOL_NAME,
+                "description": (
+                    "Builtin worker-only Python execution helper with AST validation, "
+                    "blocked imports, and worker temp-dir confinement."
+                ),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "code_string": {
+                            "type": "string",
+                            "description": "Python source code to execute inside the worker sandbox.",
+                        }
+                    },
+                    "required": ["code_string"],
+                },
+            },
+        },
+    )
+
+
 def _apply_posix_start_limits() -> None:
     if resource is None:
         return
@@ -384,6 +444,8 @@ def _validate_register_payload(message: Dict[str, Any]) -> tuple[str, str, Dict[
 
 def _register_tool(message: Dict[str, Any]) -> Dict[str, Any]:
     tool_name, code, schema = _validate_register_payload(message)
+    if tool_name == _EXEC_USER_PYTHON_TOOL_NAME:
+        raise ValueError(f"Tool name '{tool_name}' is reserved")
     validate_tool_code_ast(code, tool_name)
     validate_dynamic_tool_token_scan(code, tool_name)
 
@@ -445,6 +507,7 @@ def _run_worker_loop() -> int:
     os.makedirs(_WORKER_TEMP_ROOT, exist_ok=True)
     os.chdir(_WORKER_TEMP_ROOT)
     _apply_posix_start_limits()
+    _register_builtin_tools()
 
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)

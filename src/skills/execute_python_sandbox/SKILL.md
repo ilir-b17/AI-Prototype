@@ -7,7 +7,7 @@ Executes isolated Python code locally via a temporary subprocess.
 ```json
 {
   "name": "execute_python_sandbox",
-  "description": "Executes Python code locally in a secure subprocess. Excellent for data processing, complex calculations, analyzing local repository code, or testing API calls. Will timeout if it hangs. The python environment has access to the installed packages in the main bot environment.",
+  "description": "Executes Python code by dispatching to the dynamic tool worker builtin (__exec_user_python__). Execution inherits worker sandbox controls: AST validation, blocked-module/import checks, POSIX resource limits where supported, and worker-confined /tmp file access. Returns script output on success or structured JSON errors when blocked.",
   "parameters": {
     "type": "object",
     "properties": {

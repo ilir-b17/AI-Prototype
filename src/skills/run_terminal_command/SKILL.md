@@ -8,7 +8,7 @@ Outputs standard STDOUT and STDERR or returns detailed JSON error messages upon 
 ```json
 {
   "name": "run_terminal_command",
-  "description": "Executes a string command in the underlying system terminal. Useful for running shell utilities, git commands, checking processes, etc. Destructive commands (rm, mv, shutdown) will be blocked. Includes a configurable execution timeout to prevent hanging. Returns standard output/error, or JSON error details if execution fails.",
+  "description": "Executes terminal commands without a shell (create_subprocess_exec). Rejects shell metacharacters outside quotes and enforces a first-token allowlist from AIDEN_TERMINAL_ALLOWLIST (default: git status, ls, dir, wc, echo, cat, type, pwd, hostname). Returns STDOUT/STDERR on success, or structured JSON errors when blocked or invalid.",
   "parameters": {
     "type": "object",
     "properties": {
