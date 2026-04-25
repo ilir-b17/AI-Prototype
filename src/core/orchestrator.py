@@ -114,6 +114,7 @@ _SYNTHESIS_SELF_TEST_TIMEOUT_DEFAULT_SECONDS = 12.0
 _MAX_SYNTHESIS_RETRIES = int(os.getenv("MAX_SYNTHESIS_RETRIES", "3"))
 _CONSOLIDATION_TRIGGER_TURNS = int(os.getenv("CONSOLIDATION_TRIGGER_TURNS", "10"))
 _SAFE_ENV_KEYS = {"PATH", "PYTHONPATH", "SYSTEMROOT", "TEMP", "TMP", "HOME", "USER", "LANG", "LC_ALL"}
+_SYNTHESIS_LOCKOUT_TTL_SECONDS = int(os.getenv("SYNTHESIS_LOCKOUT_TTL_SECONDS", "600"))
 _BLOCKED_ENV_PREFIXES = ("TELEGRAM_", "GROQ_", "GEMINI_", "ANTHROPIC_", "OPENAI_", "OLLAMA_CLOUD_", "ADMIN_")
 _SYSTEM_1_ERROR_PREFIX = "[System 1 - Error]"
 _ROUTING_STOPWORDS = {
@@ -317,7 +318,7 @@ class Orchestrator:
             self.pending_hitl_state: Dict[str, dict] = {}
             self.pending_tool_approval: Dict[str, dict] = {}
             self._admin_user_id = str(os.getenv("ADMIN_USER_ID", "")).strip()
-            self._synthesis_in_progress: set[str] = set()
+            self._synthesis_in_progress: Dict[str, float] = {}
             self._consolidation_turn_counts: Dict[str, int] = {}
             self.outbound_queue: Optional[asyncio.Queue] = None
             self.sensory_state: Dict[str, str] = {}
@@ -6085,18 +6086,29 @@ class Orchestrator:
                 return local_resolution
 
             in_progress = getattr(self, "_synthesis_in_progress", None)
-            if in_progress is None:
-                in_progress = set()
+            if not isinstance(in_progress, dict):
+                in_progress = {}
                 self._synthesis_in_progress = in_progress
 
-            if user_id in in_progress:
-                return (
-                    "A capability synthesis is already in progress for your "
-                    "request. Please wait for it to complete before sending "
-                    "a new request that requires tool synthesis."
-                )
+            now = time.time()
+            started_at = in_progress.get(user_id)
+            if started_at is not None:
+                elapsed_seconds = max(0, int(now - float(started_at)))
+                if elapsed_seconds > _SYNTHESIS_LOCKOUT_TTL_SECONDS:
+                    logger.warning(
+                        "Synthesis run for %s timed out at registry level after %ds; allowing new run",
+                        user_id,
+                        elapsed_seconds,
+                    )
+                    in_progress.pop(user_id, None)
+                else:
+                    return (
+                        "A capability synthesis is already in progress for your "
+                        "request. Please wait for it to complete before sending "
+                        "a new request that requires tool synthesis."
+                    )
 
-            in_progress.add(user_id)
+            in_progress[user_id] = now
 
             # Run synthesis in the background via _fire_and_forget which holds
             # a strong GC-safe reference (ISSUE-002).
@@ -6184,15 +6196,34 @@ class Orchestrator:
     ) -> None:
         """Background task: run tool synthesis and send the HITL prompt to admin."""
         try:
-            hitl_prompt = await self.tool_synthesis_node(state, result)
-            if self.outbound_queue is not None:
-                await self.outbound_queue.put(hitl_prompt)
+            async def _run_synthesis() -> None:
+                hitl_prompt = await self.tool_synthesis_node(state, result)
+                if self.outbound_queue is not None:
+                    await self.outbound_queue.put(hitl_prompt)
+
+            await asyncio.wait_for(
+                _run_synthesis(),
+                timeout=float(_SYNTHESIS_LOCKOUT_TTL_SECONDS),
+            )
+        except asyncio.TimeoutError:
+            logger.critical(
+                "Background tool synthesis timed out for user %s after %ss.",
+                user_id,
+                _SYNTHESIS_LOCKOUT_TTL_SECONDS,
+            )
+            try:
+                await self._notify_admin(
+                    "CRITICAL: Tool synthesis timed out and was aborted. "
+                    f"User: {user_id}. Timeout: {_SYNTHESIS_LOCKOUT_TTL_SECONDS}s."
+                )
+            except Exception as notify_error:
+                logger.error("Failed to notify admin about synthesis timeout: %s", notify_error)
         except Exception as e:
             logger.error(f"Background tool synthesis failed: {e}", exc_info=True)
         finally:
             in_progress = getattr(self, "_synthesis_in_progress", None)
-            if in_progress is not None:
-                in_progress.discard(user_id)
+            if isinstance(in_progress, dict):
+                in_progress.pop(user_id, None)
 
     def close(self) -> None:
         try:
