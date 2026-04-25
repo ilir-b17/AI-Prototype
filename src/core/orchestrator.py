@@ -22,6 +22,7 @@ import tempfile
 import time
 import weakref
 import xml.etree.ElementTree as ET
+from dataclasses import dataclass
 from datetime import datetime
 from typing import Dict, Any, List, Optional
 
@@ -99,6 +100,12 @@ class _UserLockLease:
             return
         self._released = True
         await self._owner._release_user_lock_lease(self._user_id, self._slot)
+
+
+@dataclass
+class _ApprovalOutcome:
+    reply_text: str
+    follow_up_input: Optional[Any] = None
 
 # Energy costs per operation
 ENERGY_COST_SUPERVISOR = 10
@@ -5650,7 +5657,7 @@ class Orchestrator:
         synthesis_run_id: Optional[int],
         attempts_used: int,
         original_state: Dict[str, Any],
-    ) -> str:
+    ) -> _ApprovalOutcome:
         await self.cognitive_router.register_dynamic_tool(tool_name, synthesis["code"], synthesis["schema_json"])
         self._invalidate_capabilities_cache()
         await self.ledger_memory.register_tool(
@@ -5689,12 +5696,10 @@ class Orchestrator:
             retry_message = str(original_state.get("user_input") or "").strip()
             retry_payload["text"] = retry_message
 
-        retry = await self._run_user_turn_locked(
-            user_id=user_id,
-            user_message=retry_message,
-            user_prompt=retry_payload,
+        return _ApprovalOutcome(
+            reply_text=f"✅ Tool '{tool_name}' deployed.",
+            follow_up_input=retry_payload,
         )
-        return f"✅ Tool '{tool_name}' deployed.\n\n{retry}"
 
     async def _handle_synthesized_tool_deploy_failure(
         self,
@@ -5718,8 +5723,8 @@ class Orchestrator:
         logger.error("Tool registration failed: %s", error, exc_info=True)
         return f"Error deploying tool '{tool_name}': {error}"
 
-    async def _try_resume_tool_approval(self, user_id: str, user_message: str) -> Optional[str]:
-        """Handle YES/NO tool synthesis approval. Returns a reply string, or None if not pending."""
+    async def _try_resume_tool_approval(self, user_id: str, user_message: str) -> Optional[_ApprovalOutcome]:
+        """Handle YES/NO tool synthesis approval. Returns approval outcome, or None if not pending."""
         payload = await self._pop_pending_tool_approval_payload(user_id)
         if payload is None:
             return None
@@ -5731,11 +5736,13 @@ class Orchestrator:
         tool_name = str(synthesis.get("tool_name") or "")
 
         if not user_message.strip().upper().startswith("YES"):
-            return await self._reject_synthesized_tool(
-                user_id=user_id,
-                synthesis_run_id=synthesis_run_id,
-                attempts_used=attempts_used,
-                synthesis=synthesis,
+            return _ApprovalOutcome(
+                reply_text=await self._reject_synthesized_tool(
+                    user_id=user_id,
+                    synthesis_run_id=synthesis_run_id,
+                    attempts_used=attempts_used,
+                    synthesis=synthesis,
+                )
             )
 
         mismatch = await self._verify_synthesis_payload_digest(
@@ -5745,7 +5752,7 @@ class Orchestrator:
             tool_name=tool_name,
         )
         if mismatch:
-            return mismatch
+            return _ApprovalOutcome(reply_text=mismatch)
 
         try:
             return await self._deploy_approved_synthesized_tool(
@@ -5757,12 +5764,14 @@ class Orchestrator:
                 original_state=original_state,
             )
         except Exception as e:
-            return await self._handle_synthesized_tool_deploy_failure(
-                tool_name=tool_name,
-                synthesis=synthesis,
-                synthesis_run_id=synthesis_run_id,
-                attempts_used=attempts_used,
-                error=e,
+            return _ApprovalOutcome(
+                reply_text=await self._handle_synthesized_tool_deploy_failure(
+                    tool_name=tool_name,
+                    synthesis=synthesis,
+                    synthesis_run_id=synthesis_run_id,
+                    attempts_used=attempts_used,
+                    error=e,
+                )
             )
 
     async def _load_state(
@@ -6053,6 +6062,7 @@ class Orchestrator:
         user_prompt = self._coerce_user_prompt_payload(user_message)
         normalized_user_message = str(user_prompt.get("text") or "").strip()
         has_audio_prompt = bool(self._extract_audio_bytes(user_prompt))
+        approval_outcome: Optional[_ApprovalOutcome] = None
 
         if not normalized_user_message and has_audio_prompt:
             normalized_user_message = _format_voice_placeholder(
@@ -6104,13 +6114,26 @@ class Orchestrator:
 
             reply = await self._try_resume_tool_approval(user_id, normalized_user_message)
             if reply is not None:
-                return reply
+                approval_outcome = reply
+            else:
+                return await self._run_user_turn_locked(
+                    user_id=user_id,
+                    user_message=normalized_user_message,
+                    user_prompt=user_prompt,
+                )
 
-            return await self._run_user_turn_locked(
-                user_id=user_id,
-                user_message=normalized_user_message,
-                user_prompt=user_prompt,
-            )
+        if approval_outcome is None:
+            return "An internal error occurred."
+
+        follow_up_input = approval_outcome.follow_up_input
+        if follow_up_input is None:
+            return approval_outcome.reply_text
+
+        follow_up_response = await self.process_message(follow_up_input, user_id)
+        reply_text = str(approval_outcome.reply_text or "").strip()
+        if not reply_text:
+            return follow_up_response
+        return f"{reply_text}\n\n{follow_up_response}"
 
     async def _handle_blocked_result(
         self,
