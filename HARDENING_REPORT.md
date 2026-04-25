@@ -64,3 +64,46 @@ This report summarizes hardening work completed across Slice 1, Slice 2, and Sli
 ## Backward compatibility notes
 - `ENERGY_REPLENISH_PER_TURN` remains readable from environment for backward compatibility but is now deprecated and treated as a no-op.
 - Operators should use `ENERGY_REPLENISH_PER_HOUR` (default `30`) for predictive energy replenishment tuning.
+
+## Round 2 (Slices 4-7)
+### Slice 4 summary
+- Fix: Added SQL-level TTL filtering and stale-row pruning during pending-state reload for MFA, HITL, and tool approvals.
+- Files touched:
+  - src/memory/ledger_db.py
+  - tests/test_pending_state_ttl_reload.py
+- Tests added: 4
+
+### Slice 5 summary
+- Fix: Bounded synthesis lockout using TTL timestamps and added outer timeout guard for hung synthesis runs with admin critical notification.
+- Files touched:
+  - src/core/orchestrator.py
+  - tests/test_synthesis_lockout_timeout.py
+- Tests added: 3
+
+### Slice 6 summary
+- Fix: Enforced Groq cooldown checks across direct and fallback entry paths, and prevented cooldown window shrink on subsequent 429 parsing.
+- Files touched:
+  - src/core/llm_router.py
+  - tests/test_groq_cooldown_fallback.py
+- Tests added: 4
+
+### Slice 7 summary
+- Fix: Switched Telegram logging to rotating files, persisted consolidation counters across restarts, and enriched/filter voice placeholders from summaries and consolidation candidates.
+- Files touched:
+  - src/interfaces/telegram_bot.py
+  - src/core/orchestrator.py
+  - src/memory/ledger_db.py
+  - src/core/nocturnal_consolidation.py
+  - tests/test_slice7_operability.py
+- Tests added: 6
+
+### Adjacent issues deferred
+- No additional adjacent issues were identified in Round 2, so `HARDENING_NOTES.md` was not updated.
+
+### Public API compatibility
+- No public API signatures changed for `Orchestrator`, `CognitiveRouter`, `LedgerMemory`, or skill interfaces.
+
+### New env vars introduced in Round 2
+- `SYNTHESIS_LOCKOUT_TTL_SECONDS` (default `600`)
+- `LOG_MAX_BYTES` (default `10485760`)
+- `LOG_BACKUP_COUNT` (default `5`)

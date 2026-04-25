@@ -11,7 +11,7 @@ import asyncio
 import logging
 import json
 from datetime import datetime
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Tuple
 from enum import Enum
 
 import aiosqlite
@@ -2120,6 +2120,20 @@ class LedgerMemory:
             )
             row = await cursor.fetchone()
         return row["value"] if row else None
+
+    async def get_system_state_keys_by_prefix(self, prefix: str) -> List[Tuple[str, str]]:
+        """Return all (key, value) pairs in system_state whose key starts with prefix."""
+        key_prefix = str(prefix or "")
+        async with self._lock:
+            cursor = await self._db.execute(
+                "SELECT key, value FROM system_state WHERE key LIKE ? ORDER BY key ASC",
+                (f"{key_prefix}%",),
+            )
+            rows = await cursor.fetchall()
+        return [
+            (str(row["key"]), str(row["value"]))
+            for row in rows
+        ]
 
     # ─────────────────────────────────────────────────────────────
     # MFA State  (persisted so bot restarts don't lose pending MFA)

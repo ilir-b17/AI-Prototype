@@ -22,6 +22,7 @@ _TRANSIENT_LOG_MARKERS = (
     "system 2 response received",
     "heartbeat:",
 )
+_VOICE_NOTE_PLACEHOLDER_RE = re.compile(r"^\[Voice note · \d+ bytes · [^\]]+\]$")
 _SEMANTIC_STOPWORDS = {
     "a", "an", "and", "are", "as", "at", "be", "by", "for", "from", "has", "have",
     "i", "in", "is", "it", "its", "of", "on", "or", "that", "the", "their", "then",
@@ -173,6 +174,8 @@ class NocturnalConsolidationSlice1:
                 continue
             content = self._clean_text(str(turn.get("content") or ""))
             if not content:
+                continue
+            if _VOICE_NOTE_PLACEHOLDER_RE.match(content):
                 continue
             candidates.append(
                 ConsolidationCandidate(

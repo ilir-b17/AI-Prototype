@@ -190,7 +190,7 @@ _EXPLICIT_MEMORY_REQUEST_RE = re.compile(
     r"\b(?:remember\s+that|remember\s+my|don'?t\s+forget|please\s+remember|save\s+that|note\s+that)\b",
     flags=re.IGNORECASE,
 )
-_VOICE_INPUT_PLACEHOLDER = "[Voice note]"
+_VOICE_NOTE_PLACEHOLDER_RE = re.compile(r"^\[Voice note · \d+ bytes · [^\]]+\]$")
 _REDACTED_CONTEXT_BLOCK = "[REDACTED_CONTEXT_BLOCK]"
 _REDACTED_SENSORY_STATE = "[REDACTED_SENSORY_STATE]"
 _REDACTED_EMPTY_PAYLOAD = "[REDACTED_EMPTY_PAYLOAD]"
@@ -238,6 +238,15 @@ _CATALOG_META_TOOL_NAMES = {
     "ask_admin_for_guidance",
     "escalate_to_system_2",
 }
+
+
+def _format_voice_placeholder(audio_bytes: bytes, mime_type: str) -> str:
+    safe_mime_type = str(mime_type or "audio/ogg").strip() or "audio/ogg"
+    return f"[Voice note · {len(audio_bytes)} bytes · {safe_mime_type}]"
+
+
+def _is_voice_placeholder_text(text: str) -> bool:
+    return bool(_VOICE_NOTE_PLACEHOLDER_RE.fullmatch(str(text or "").strip()))
 
 
 def _build_safe_subprocess_env() -> Dict[str, str]:
@@ -369,6 +378,7 @@ class Orchestrator:
             except Exception as _preload_err:
                 logger.warning("System 1 preload skipped: %s", _preload_err)
         self._compiled_graph = build_orchestrator_graph(self)
+        await self._restore_consolidation_turn_counts()
         set_runtime_context(self.ledger_memory, self.core_memory, self.vector_memory, self)
         # Record the host OS now that we're in an async context
         await self.core_memory.update("host_os", platform.system())
@@ -811,13 +821,14 @@ class Orchestrator:
                 or ""
             ).strip()
             audio_bytes = cls._extract_audio_bytes(payload)
+            audio_mime_type = str(payload.get("audio_mime_type") or "audio/ogg")
             if not text and audio_bytes:
-                text = _VOICE_INPUT_PLACEHOLDER
+                text = _format_voice_placeholder(audio_bytes, audio_mime_type)
 
             normalized: Dict[str, Any] = {
                 "text": text,
                 "audio_bytes": audio_bytes,
-                "audio_mime_type": str(payload.get("audio_mime_type") or "audio/ogg"),
+                "audio_mime_type": audio_mime_type,
                 "audio_source": str(payload.get("audio_source") or ""),
                 "audio_file_id": str(payload.get("audio_file_id") or ""),
             }
@@ -1228,6 +1239,8 @@ class Orchestrator:
                 continue
             content = re.sub(r"\s+", " ", (turn.get("content") or "").strip())
             if not content:
+                continue
+            if _is_voice_placeholder_text(content):
                 continue
             if len(content) > 90:
                 content = f"{content[:87]}..."
@@ -3945,6 +3958,42 @@ class Orchestrator:
             logger.warning("Failed to restore heartbeat failure counts: %s", e)
             self._heartbeat_failure_counts = {}
 
+    async def _restore_consolidation_turn_counts(self) -> None:
+        prefix = "consolidation_turn_count:"
+        restored: Dict[str, int] = {}
+        if not hasattr(self, "_consolidation_turn_counts"):
+            self._consolidation_turn_counts = {}
+
+        getter = getattr(self.ledger_memory, "get_system_state_keys_by_prefix", None)
+        if not callable(getter):
+            self._consolidation_turn_counts = restored
+            return
+
+        try:
+            rows = await getter(prefix)
+            for key, value in rows:
+                key_text = str(key or "")
+                if not key_text.startswith(prefix):
+                    continue
+
+                user_id = key_text[len(prefix):].strip()
+                if not user_id:
+                    continue
+
+                try:
+                    count = int(str(value).strip())
+                except (TypeError, ValueError):
+                    continue
+
+                restored[user_id] = max(0, count)
+
+            self._consolidation_turn_counts = restored
+            if restored:
+                logger.info("Restored %d consolidation turn counter(s) from DB", len(restored))
+        except Exception as e:
+            logger.warning("Failed to restore consolidation turn counts: %s", e)
+            self._consolidation_turn_counts = {}
+
     async def _persist_heartbeat_failure_counts(self) -> None:
         payload = {
             str(task_id): int(count)
@@ -3966,6 +4015,26 @@ class Orchestrator:
         if task_id in self._heartbeat_failure_counts:
             self._heartbeat_failure_counts.pop(task_id, None)
             await self._persist_heartbeat_failure_counts()
+
+    def _persist_consolidation_turn_count_async(self, user_id: str, count: int) -> None:
+        ledger = getattr(self, "ledger_memory", None)
+        scheduler = getattr(self, "_fire_and_forget", None)
+        if ledger is None or not callable(scheduler):
+            return
+
+        setter = getattr(ledger, "set_system_state", None)
+        if not callable(setter):
+            return
+
+        key = f"consolidation_turn_count:{user_id}"
+        try:
+            persistence_coro = setter(key, str(max(0, int(count))))
+        except Exception as e:
+            logger.warning("Failed to schedule consolidation turn count persistence for %s: %s", user_id, e)
+            return
+
+        if asyncio.iscoroutine(persistence_coro):
+            scheduler(persistence_coro)
 
     def _fire_and_forget(self, coro) -> asyncio.Task:
         """Schedule a coroutine as a background task with a strong GC-safe reference (ISSUE-002).
@@ -5611,7 +5680,10 @@ class Orchestrator:
         )
         retry_message = str(retry_payload.get("text") or "").strip()
         if not retry_message and bool(self._extract_audio_bytes(retry_payload)):
-            retry_message = _VOICE_INPUT_PLACEHOLDER
+            retry_message = _format_voice_placeholder(
+                self._extract_audio_bytes(retry_payload),
+                str(retry_payload.get("audio_mime_type") or "audio/ogg"),
+            )
             retry_payload["text"] = retry_message
         elif not retry_message:
             retry_message = str(original_state.get("user_input") or "").strip()
@@ -5849,9 +5921,13 @@ class Orchestrator:
             self._consolidation_turn_counts = {}
 
         trigger_turns = max(1, _CONSOLIDATION_TRIGGER_TURNS)
-        self._consolidation_turn_counts[user_id] = self._consolidation_turn_counts.get(user_id, 0) + 1
-        if self._consolidation_turn_counts[user_id] >= trigger_turns:
+        new_count = self._consolidation_turn_counts.get(user_id, 0) + 1
+        self._consolidation_turn_counts[user_id] = new_count
+        self._persist_consolidation_turn_count_async(user_id, new_count)
+
+        if new_count >= trigger_turns:
             self._consolidation_turn_counts[user_id] = 0
+            self._persist_consolidation_turn_count_async(user_id, 0)
             self._fire_and_forget(self._consolidate_memory(user_id))
 
     def _schedule_response_memory_save(self, user_message: str, final_resp: str) -> None:
@@ -5979,7 +6055,10 @@ class Orchestrator:
         has_audio_prompt = bool(self._extract_audio_bytes(user_prompt))
 
         if not normalized_user_message and has_audio_prompt:
-            normalized_user_message = _VOICE_INPUT_PLACEHOLDER
+            normalized_user_message = _format_voice_placeholder(
+                self._extract_audio_bytes(user_prompt),
+                str(user_prompt.get("audio_mime_type") or "audio/ogg"),
+            )
             user_prompt["text"] = normalized_user_message
 
         if not normalized_user_message and not has_audio_prompt:
