@@ -6,6 +6,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
+import src.core.orchestrator as orchestrator_module
 from src.core.llm_router import CognitiveRouter
 from src.core.orchestrator import HEARTBEAT_TASK_PREFIX_FMT, Orchestrator
 from src.core.skill_manager import SkillRegistry
@@ -105,9 +106,62 @@ async def test_deferred_heartbeat_task_with_unmet_dependency_is_not_selected(tmp
 def test_charter_tier_extraction_reports_malformed_xml() -> None:
     malformed = "<Identity_Charter><Tier_1_Axioms><Directive>broken</Tier_1_Axioms>"
 
-    result = Orchestrator._extract_charter_tier_block(malformed, "Tier_1_Axioms")
+    result = Orchestrator._extract_charter_tier_block_from_text(malformed, "Tier_1_Axioms")
 
     assert result.startswith("[MALFORMED_CHARTER_XML:")
+
+
+def test_charter_tier_extraction_uses_cached_parse_after_init(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    class _StubVectorMemory:
+        def __init__(self, persist_dir: str):
+            self.persist_dir = persist_dir
+
+        def close(self) -> None:
+            return None
+
+    monkeypatch.setattr(orchestrator_module, "VectorMemory", _StubVectorMemory)
+
+    orchestrator = Orchestrator(
+        vector_db_path=str(tmp_path / "chroma"),
+        ledger_db_path=str(tmp_path / "ledger.db"),
+        core_memory_path=str(tmp_path / "core_memory.json"),
+    )
+    try:
+        baseline_tier = orchestrator._extract_charter_tier_block("Tier_1_Axioms")
+        assert "Do No Harm" in baseline_tier
+
+        def _unexpected_parse(*args, **kwargs):
+            raise AssertionError("ET.fromstring must not be called after Orchestrator.__init__")
+
+        monkeypatch.setattr(orchestrator_module.ET, "fromstring", _unexpected_parse)
+
+        cached_tier = orchestrator._extract_charter_tier_block("Tier_1_Axioms")
+        assert cached_tier == baseline_tier
+    finally:
+        orchestrator.close()
+
+
+def test_malformed_charter_fails_closed_without_override(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("MFA_PASSPHRASE", "correct horse battery staple")
+    monkeypatch.delenv("MFA_TOTP_SECRET", raising=False)
+    monkeypatch.delenv("ALLOW_MISSING_CHARTER", raising=False)
+    orchestrator = Orchestrator.__new__(Orchestrator)
+    orchestrator.charter_text = "<Identity_Charter><Tier_1_Axioms><Directive>broken</Tier_1_Axioms>"
+
+    with pytest.raises(RuntimeError, match="malformed"):
+        Orchestrator._enforce_charter_policy(orchestrator)
+
+
+def test_malformed_charter_allowed_with_override(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("MFA_PASSPHRASE", "correct horse battery staple")
+    monkeypatch.delenv("MFA_TOTP_SECRET", raising=False)
+    monkeypatch.setenv("ALLOW_MISSING_CHARTER", "true")
+    orchestrator = Orchestrator.__new__(Orchestrator)
+    orchestrator.charter_text = "<Identity_Charter><Tier_1_Axioms><Directive>broken</Tier_1_Axioms>"
+
+    Orchestrator._enforce_charter_policy(orchestrator)
+
+    assert orchestrator.charter_text == Orchestrator._CHARTER_FALLBACK
 
 
 def test_heartbeat_prefix_round_trips_task_id() -> None:

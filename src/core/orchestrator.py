@@ -252,6 +252,30 @@ _CLOUD_REDACTION_PII_PATTERNS = (
     (r"\b(?:user[_ ]?id|ssn|social security|passport|account number)\b[^\n]*", "[REDACTED_PII_FIELD]"),
     (r"[A-Za-z]:\\[^\n]*", "[REDACTED_PATH]"),
 )
+_CHARTER_TIER_TAGS = ("Tier_1_Axioms", "Tier_2_Strategic", "Tier_3_Operational")
+_CHARTER_PARSE_ERROR_KEY = "__charter_parse_error__"
+_CLOUD_CONTEXT_AND_MEMORY_BLOCK_RE = re.compile(
+    r"(<context_and_memory>)(.*?)(</context_and_memory>)",
+    flags=re.IGNORECASE | re.DOTALL,
+)
+_SAFE_REDACTED_CONTEXT_HEADER_RE = re.compile(
+    r"---\s*(Sensory Context|Core Memory|Archival Memory)\s*---",
+    flags=re.IGNORECASE,
+)
+_SAFE_REDACTED_MARKER_RE = re.compile(r"\[REDACTED_[A-Z_]+\]")
+_CLOUD_REDACTION_BLOCK_REGEXES = tuple(
+    re.compile(pattern, flags=re.IGNORECASE | re.DOTALL)
+    for pattern in _CLOUD_REDACTION_BLOCK_PATTERNS
+)
+_CLOUD_REDACTION_LINE_REGEXES = tuple(
+    (re.compile(pattern, flags=re.IGNORECASE | re.DOTALL | re.MULTILINE), replacement)
+    for pattern, replacement in _CLOUD_REDACTION_LINE_PATTERNS
+)
+_CLOUD_REDACTION_PII_REGEXES = tuple(
+    (re.compile(pattern, flags=re.IGNORECASE), replacement)
+    for pattern, replacement in _CLOUD_REDACTION_PII_PATTERNS
+)
+_MULTI_BLANK_LINES_RE = re.compile(r"\n{3,}")
 
 # Key used in the state dict to signal a blocked (non-ok) router result
 _BLOCKED_KEY = "_blocked_result"
@@ -352,6 +376,7 @@ class Orchestrator:
             self._warn_deprecated_energy_replenish_turn_env_once()
 
             self.charter_text = self._load_charter()
+            self._charter_tier_blocks = self._build_charter_tier_cache(self.charter_text)
             self._ready: asyncio.Event = asyncio.Event()
             self.pending_mfa: Dict[str, dict] = {}
             self.pending_hitl_state: Dict[str, dict] = {}
@@ -473,6 +498,24 @@ class Orchestrator:
     def _enforce_charter_policy(self) -> None:
         validate_mfa_configuration()
         allow_missing = os.getenv("ALLOW_MISSING_CHARTER", "false").strip().lower() in {"1", "true", "yes"}
+        charter_cache = self._ensure_charter_tier_cache()
+        parse_error = str(charter_cache.get(_CHARTER_PARSE_ERROR_KEY) or "").strip()
+
+        if parse_error and self.charter_text != self._CHARTER_FALLBACK:
+            if not allow_missing:
+                raise RuntimeError(
+                    "FATAL: charter.md is malformed. The moral evaluation framework cannot operate. "
+                    "Fix the charter XML (Tier_1_Axioms/Tier_2_Strategic/Tier_3_Operational) or set "
+                    "ALLOW_MISSING_CHARTER=true to explicitly permit degraded operation."
+                )
+            logger.warning(
+                "SECURITY: charter.md is malformed (%s). Falling back to minimal charter due to "
+                "ALLOW_MISSING_CHARTER=true.",
+                parse_error,
+            )
+            self.charter_text = self._CHARTER_FALLBACK
+            self._charter_tier_blocks = self._build_charter_tier_cache(self.charter_text)
+
         if self.charter_text == self._CHARTER_FALLBACK:
             if not allow_missing:
                 raise RuntimeError(
@@ -1707,6 +1750,34 @@ class Orchestrator:
             logger.error("Failed to read charter at '%s': %s", resolved, e)
         return self._CHARTER_FALLBACK
 
+    @staticmethod
+    def _build_charter_tier_cache(charter_text: str) -> Dict[str, str]:
+        raw_charter = str(charter_text or "").strip()
+        if not raw_charter:
+            return {_CHARTER_PARSE_ERROR_KEY: "[MALFORMED_CHARTER_XML: empty charter]"}
+
+        try:
+            root = ET.fromstring(raw_charter)
+        except ET.ParseError as exc:
+            return {_CHARTER_PARSE_ERROR_KEY: f"[MALFORMED_CHARTER_XML: {exc}]"}
+
+        cache: Dict[str, str] = {}
+        for tier_tag in _CHARTER_TIER_TAGS:
+            target = Orchestrator._find_xml_element(root, tier_tag)
+            if target is None:
+                cache[tier_tag] = f"[MISSING_CHARTER_TIER: {tier_tag}]"
+            else:
+                cache[tier_tag] = Orchestrator._serialize_xml_inner(target)
+        return cache
+
+    def _ensure_charter_tier_cache(self) -> Dict[str, str]:
+        cached = getattr(self, "_charter_tier_blocks", None)
+        if isinstance(cached, dict) and cached:
+            return cached
+        rebuilt = self._build_charter_tier_cache(getattr(self, "charter_text", ""))
+        self._charter_tier_blocks = rebuilt
+        return rebuilt
+
     def _get_capabilities_string(self) -> str:
         cached_value = getattr(self, "_capabilities_string_cache", None)
         if cached_value is not None:
@@ -1924,29 +1995,19 @@ class Orchestrator:
         stripped = line.strip()
         if not stripped:
             return True
-        if re.fullmatch(r"---\s*(Sensory Context|Core Memory|Archival Memory)\s*---", stripped, flags=re.IGNORECASE):
+        if _SAFE_REDACTED_CONTEXT_HEADER_RE.fullmatch(stripped):
             return True
-        return bool(re.fullmatch(r"\[REDACTED_[A-Z_]+\]", stripped))
+        return bool(_SAFE_REDACTED_MARKER_RE.fullmatch(stripped))
 
     @staticmethod
     def _redact_context_and_memory_contents(text: str) -> str:
         def _replace(match: re.Match) -> str:
             opening, inner, closing = match.group(1), match.group(2), match.group(3)
             redacted_inner = inner
-            for pattern in _CLOUD_REDACTION_BLOCK_PATTERNS:
-                redacted_inner = re.sub(
-                    pattern,
-                    _REDACTED_CONTEXT_BLOCK,
-                    redacted_inner,
-                    flags=re.IGNORECASE | re.DOTALL,
-                )
-            for pattern, replacement in _CLOUD_REDACTION_LINE_PATTERNS:
-                redacted_inner = re.sub(
-                    pattern,
-                    replacement,
-                    redacted_inner,
-                    flags=re.IGNORECASE | re.DOTALL | re.MULTILINE,
-                )
+            for pattern in _CLOUD_REDACTION_BLOCK_REGEXES:
+                redacted_inner = pattern.sub(_REDACTED_CONTEXT_BLOCK, redacted_inner)
+            for pattern, replacement in _CLOUD_REDACTION_LINE_REGEXES:
+                redacted_inner = pattern.sub(replacement, redacted_inner)
 
             kept_lines = []
             dropped_content = False
@@ -1961,12 +2022,7 @@ class Orchestrator:
             safe_inner = "\n".join(kept_lines).strip()
             return f"{opening}\n{safe_inner}\n{closing}"
 
-        return re.sub(
-            r"(<context_and_memory>)(.*?)(</context_and_memory>)",
-            _replace,
-            text,
-            flags=re.IGNORECASE | re.DOTALL,
-        )
+        return _CLOUD_CONTEXT_AND_MEMORY_BLOCK_RE.sub(_replace, text)
 
     @staticmethod
     def _redact_text_for_cloud(
@@ -1986,16 +2042,16 @@ class Orchestrator:
             return compact
 
         redacted = Orchestrator._redact_context_and_memory_contents(raw_text)
-        for pattern in _CLOUD_REDACTION_BLOCK_PATTERNS:
-            redacted = re.sub(pattern, _REDACTED_CONTEXT_BLOCK, redacted, flags=re.IGNORECASE | re.DOTALL)
+        for pattern in _CLOUD_REDACTION_BLOCK_REGEXES:
+            redacted = pattern.sub(_REDACTED_CONTEXT_BLOCK, redacted)
 
-        for pattern, replacement in _CLOUD_REDACTION_LINE_PATTERNS:
-            redacted = re.sub(pattern, replacement, redacted, flags=re.IGNORECASE | re.DOTALL | re.MULTILINE)
+        for pattern, replacement in _CLOUD_REDACTION_LINE_REGEXES:
+            redacted = pattern.sub(replacement, redacted)
 
-        for pattern, replacement in _CLOUD_REDACTION_PII_PATTERNS:
-            redacted = re.sub(pattern, replacement, redacted, flags=re.IGNORECASE)
+        for pattern, replacement in _CLOUD_REDACTION_PII_REGEXES:
+            redacted = pattern.sub(replacement, redacted)
 
-        redacted = re.sub(r"\n{3,}", "\n\n", redacted).strip()
+        redacted = _MULTI_BLANK_LINES_RE.sub("\n\n", redacted).strip()
         if not redacted:
             return _REDACTED_EMPTY_PAYLOAD
         if len(redacted) > max_chars:
@@ -5268,19 +5324,19 @@ class Orchestrator:
         return state
 
     @staticmethod
-    def _extract_charter_tier_block(charter_text: str, tier_tag: str) -> str:
-        raw_charter = str(charter_text or "").strip()
-        if not raw_charter:
-            return "[MALFORMED_CHARTER_XML: empty charter]"
-        try:
-            root = ET.fromstring(raw_charter)
-        except ET.ParseError as exc:
-            return f"[MALFORMED_CHARTER_XML: {exc}]"
+    def _extract_charter_tier_block_from_text(charter_text: str, tier_tag: str) -> str:
+        cache = Orchestrator._build_charter_tier_cache(charter_text)
+        parse_error = str(cache.get(_CHARTER_PARSE_ERROR_KEY) or "").strip()
+        if parse_error:
+            return parse_error
+        return str(cache.get(tier_tag) or f"[MISSING_CHARTER_TIER: {tier_tag}]")
 
-        target = Orchestrator._find_xml_element(root, tier_tag)
-        if target is None:
-            return f"[MISSING_CHARTER_TIER: {tier_tag}]"
-        return Orchestrator._serialize_xml_inner(target)
+    def _extract_charter_tier_block(self, tier_tag: str) -> str:
+        cache = self._ensure_charter_tier_cache()
+        parse_error = str(cache.get(_CHARTER_PARSE_ERROR_KEY) or "").strip()
+        if parse_error:
+            return parse_error
+        return str(cache.get(tier_tag) or f"[MISSING_CHARTER_TIER: {tier_tag}]")
 
     @staticmethod
     def _strip_xml_namespace(tag: str) -> str:
@@ -5301,7 +5357,7 @@ class Orchestrator:
             parts.append(element.text.strip())
         for child in element:
             parts.append(ET.tostring(child, encoding="unicode").strip())
-        return re.sub(r"\n{3,}", "\n\n", "\n".join(part for part in parts if part).strip())
+        return _MULTI_BLANK_LINES_RE.sub("\n\n", "\n".join(part for part in parts if part).strip())
 
     @staticmethod
     def _summarize_plan_for_moral_audit(state: Dict[str, Any]) -> str:
@@ -5337,9 +5393,9 @@ class Orchestrator:
         }
 
     def _build_critic_messages(self, state: Dict[str, Any], output_to_eval: str) -> List[Dict[str, str]]:
-        tier_1 = self._extract_charter_tier_block(self.charter_text, "Tier_1_Axioms")
-        tier_2 = self._extract_charter_tier_block(self.charter_text, "Tier_2_Strategic")
-        tier_3 = self._extract_charter_tier_block(self.charter_text, "Tier_3_Operational")
+        tier_1 = self._extract_charter_tier_block("Tier_1_Axioms")
+        tier_2 = self._extract_charter_tier_block("Tier_2_Strategic")
+        tier_3 = self._extract_charter_tier_block("Tier_3_Operational")
 
         redacted_user_input = self._redact_text_for_cloud(
             str(state.get("user_input") or ""),

@@ -204,6 +204,22 @@ _CAPABILITY_META_TOOL_NAMES = {
     "ask_admin_for_guidance",
     "escalate_to_system_2",
 }
+_SANITIZE_THINK_BLOCK_RE = re.compile(r"<think>.*?</think>", flags=re.DOTALL | re.IGNORECASE)
+_SANITIZE_REASONING_BLOCK_RE = re.compile(r"<reasoning>.*?</reasoning>", flags=re.DOTALL | re.IGNORECASE)
+_SANITIZE_CRITIC_FEEDBACK_RE = re.compile(r"\[CRITIC FEEDBACK[^\n]*\n?", flags=re.IGNORECASE)
+_SANITIZE_ADMIN_GUIDANCE_RE = re.compile(r"\[ADMIN GUIDANCE[^\n]*\n?", flags=re.IGNORECASE)
+_SANITIZE_HEARTBEAT_TAG_RE = re.compile(r"\[HEARTBEAT TASK[^\n]*\n?", flags=re.IGNORECASE)
+_SANITIZE_WORKERS_TAG_RE = re.compile(r"WORKERS:\s*\[.*?\]\s*\n?", flags=re.IGNORECASE)
+_SANITIZE_STANDALONE_TOOL_JSON_RE = re.compile(
+    r'(?m)^\s*\{[^{}]*"(?:tool_call|tool_name|function_call|function|name)"[^{}]*\}\s*$',
+    flags=re.IGNORECASE,
+)
+_SANITIZE_MARKDOWN_HEADER_RE = re.compile(r"^#{1,3}\s.*$", flags=re.MULTILINE)
+_SANITIZE_OUTPUT_DRAFT_RE = re.compile(r"\[Output Draft\][^\[]*", flags=re.DOTALL | re.IGNORECASE)
+_SANITIZE_INTERNAL_CRITIQUE_RE = re.compile(r"\[Internal Critique\][^\[]*", flags=re.DOTALL | re.IGNORECASE)
+_SANITIZE_FINALIZED_DELIVERABLE_RE = re.compile(r"\[Finalized Deliverable\]\s*", flags=re.IGNORECASE)
+_SANITIZE_HORIZONTAL_RULE_RE = re.compile(r"---+\s*\n")
+_SANITIZE_MULTI_BLANK_LINES_RE = re.compile(r"\n{3,}")
 
 
 class CognitiveRouter:
@@ -357,36 +373,31 @@ class CognitiveRouter:
             return text
 
         # Chain-of-thought blocks produced by some local models
-        text = re.sub(r'<think>.*?</think>', '', text, flags=re.DOTALL | re.IGNORECASE)
-        text = re.sub(r'<reasoning>.*?</reasoning>', '', text, flags=re.DOTALL | re.IGNORECASE)
+        text = _SANITIZE_THINK_BLOCK_RE.sub('', text)
+        text = _SANITIZE_REASONING_BLOCK_RE.sub('', text)
 
         # Internal annotation tags injected by the orchestrator loop
-        text = re.sub(r'\[CRITIC FEEDBACK[^\n]*\n?', '', text, flags=re.IGNORECASE)
-        text = re.sub(r'\[ADMIN GUIDANCE[^\n]*\n?', '', text, flags=re.IGNORECASE)
-        text = re.sub(r'\[HEARTBEAT TASK[^\n]*\n?', '', text, flags=re.IGNORECASE)
+        text = _SANITIZE_CRITIC_FEEDBACK_RE.sub('', text)
+        text = _SANITIZE_ADMIN_GUIDANCE_RE.sub('', text)
+        text = _SANITIZE_HEARTBEAT_TAG_RE.sub('', text)
 
         # Supervisor planning tag
-        text = re.sub(r'WORKERS:\s*\[.*?\]\s*\n?', '', text, flags=re.IGNORECASE)
+        text = _SANITIZE_WORKERS_TAG_RE.sub('', text)
 
         # Standalone JSON blobs that look like tool-call payloads
         # Matches a top-level {...} block containing known internal keys
-        text = re.sub(
-            r'(?m)^\s*\{[^{}]*"(?:tool_call|tool_name|function_call|function|name)"[^{}]*\}\s*$',
-            '',
-            text,
-            flags=re.IGNORECASE,
-        )
+        text = _SANITIZE_STANDALONE_TOOL_JSON_RE.sub('', text)
 
         # Internal planning/scratchpad sections the model sometimes generates
         # Strips: ## ⚙️ Section Title, [Output Draft], [Internal Critique], [Finalized Deliverable]
-        text = re.sub(r'^#{1,3}\s.*$', '', text, flags=re.MULTILINE)
-        text = re.sub(r'\[Output Draft\][^\[]*', '', text, flags=re.DOTALL | re.IGNORECASE)
-        text = re.sub(r'\[Internal Critique\][^\[]*', '', text, flags=re.DOTALL | re.IGNORECASE)
-        text = re.sub(r'\[Finalized Deliverable\]\s*', '', text, flags=re.IGNORECASE)
-        text = re.sub(r'---+\s*\n', '', text)  # horizontal rule separators
+        text = _SANITIZE_MARKDOWN_HEADER_RE.sub('', text)
+        text = _SANITIZE_OUTPUT_DRAFT_RE.sub('', text)
+        text = _SANITIZE_INTERNAL_CRITIQUE_RE.sub('', text)
+        text = _SANITIZE_FINALIZED_DELIVERABLE_RE.sub('', text)
+        text = _SANITIZE_HORIZONTAL_RULE_RE.sub('', text)
 
         # Collapse leftover blank lines
-        text = re.sub(r'\n{3,}', '\n\n', text)
+        text = _SANITIZE_MULTI_BLANK_LINES_RE.sub('\n\n', text)
 
         logged = text[:120].replace('\n', ' ')
         logger.debug(f"sanitize_response output preview: {logged!r}")

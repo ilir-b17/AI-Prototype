@@ -10,7 +10,13 @@ from src.core.security import verify_mfa_challenge
 
 def _policy_test_orchestrator() -> Orchestrator:
     orchestrator = Orchestrator.__new__(Orchestrator)
-    orchestrator.charter_text = "Full charter for MFA configuration tests."
+    orchestrator.charter_text = (
+        "<Identity_Charter>"
+        "<Tier_1_Axioms><Directive id='1.1'>Do no harm.</Directive></Tier_1_Axioms>"
+        "<Tier_2_Strategic><Objective id='2.1'>Stay aligned.</Objective></Tier_2_Strategic>"
+        "<Tier_3_Operational><Preference id='3.1'>Be concise.</Preference></Tier_3_Operational>"
+        "</Identity_Charter>"
+    )
     return orchestrator
 
 

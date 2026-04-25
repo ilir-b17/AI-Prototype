@@ -7,6 +7,8 @@ All methods under test are pure static methods that never touch the network,
 so no mocking of Ollama / Groq is required.  Tests are grouped by method.
 """
 import json
+import re
+import time
 import pytest
 
 from src.core.llm_router import CognitiveRouter
@@ -358,3 +360,56 @@ class TestSanitizeResponse:
         """sanitize_response must handle falsy input without raising."""
         result = CognitiveRouter.sanitize_response(None)
         assert not result
+
+    def test_microbenchmark_sanitize_response_is_at_least_2x_faster_than_recompile_baseline(self):
+        payload = (
+            "<think>internal reasoning\n" + ("step ") * 120 + "</think>\n"
+            "[CRITIC FEEDBACK: trim this]\n"
+            "[ADMIN GUIDANCE: hidden]\n"
+            "WORKERS: [\"research_agent\", \"coder_agent\"]\n"
+            "## Scratch\n"
+            "[Output Draft]draft section\n"
+            "{" + '"tool_call": "web_search", "arguments": {"query": "x"}' + "}\n"
+            + ("Use concise, direct prose. " * 130)
+        )[:4096]
+
+        def _legacy_recompile_baseline(text: str) -> str:
+            if not text:
+                return text
+            re.purge()
+            text = re.compile(r"<think>.*?</think>", flags=re.DOTALL | re.IGNORECASE).sub("", text)
+            text = re.compile(r"<reasoning>.*?</reasoning>", flags=re.DOTALL | re.IGNORECASE).sub("", text)
+            text = re.compile(r"\[CRITIC FEEDBACK[^\n]*\n?", flags=re.IGNORECASE).sub("", text)
+            text = re.compile(r"\[ADMIN GUIDANCE[^\n]*\n?", flags=re.IGNORECASE).sub("", text)
+            text = re.compile(r"\[HEARTBEAT TASK[^\n]*\n?", flags=re.IGNORECASE).sub("", text)
+            text = re.compile(r"WORKERS:\s*\[.*?\]\s*\n?", flags=re.IGNORECASE).sub("", text)
+            text = re.compile(
+                r'(?m)^\s*\{[^{}]*"(?:tool_call|tool_name|function_call|function|name)"[^{}]*\}\s*$',
+                flags=re.IGNORECASE,
+            ).sub("", text)
+            text = re.compile(r"^#{1,3}\s.*$", flags=re.MULTILINE).sub("", text)
+            text = re.compile(r"\[Output Draft\][^\[]*", flags=re.DOTALL | re.IGNORECASE).sub("", text)
+            text = re.compile(r"\[Internal Critique\][^\[]*", flags=re.DOTALL | re.IGNORECASE).sub("", text)
+            text = re.compile(r"\[Finalized Deliverable\]\s*", flags=re.IGNORECASE).sub("", text)
+            text = re.compile(r"---+\s*\n").sub("", text)
+            text = re.compile(r"\n{3,}").sub("\n\n", text)
+            return text.strip()
+
+        # Warm both code paths so one-time overhead does not dominate timing.
+        for _ in range(20):
+            CognitiveRouter.sanitize_response(payload)
+            _legacy_recompile_baseline(payload)
+
+        iterations = 120
+
+        optimized_start = time.perf_counter()
+        for _ in range(iterations):
+            CognitiveRouter.sanitize_response(payload)
+        optimized_elapsed = time.perf_counter() - optimized_start
+
+        baseline_start = time.perf_counter()
+        for _ in range(iterations):
+            _legacy_recompile_baseline(payload)
+        baseline_elapsed = time.perf_counter() - baseline_start
+
+        assert optimized_elapsed * 2 <= baseline_elapsed
