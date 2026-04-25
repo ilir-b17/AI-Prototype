@@ -13,6 +13,7 @@ import logging
 import asyncio
 import sys
 import socket
+import time
 from io import BytesIO
 from dotenv import load_dotenv
 
@@ -52,8 +53,12 @@ logger = logging.getLogger(__name__)
 # Load configuration from environment
 _UNAUTHORIZED_MSG = "Unauthorized."
 _ORCHESTRATOR_NOT_INITIALIZED = "Orchestrator not initialized"
+_ORCHESTRATOR_NOT_AVAILABLE_MSG = "System error: Orchestrator not available."
+_LEDGER_NOT_AVAILABLE_MSG = "System error: Ledger not available."
 _SERVICE_UNAVAILABLE_MSG = "System error: Service temporarily unavailable."
 _TIMEOUT_MSG = "Request timed out. Please try again."
+_PENDING_RETIRE_UNUSED_KEY = "pending_retire_unused_tools"
+_RETIRE_CONFIRM_ALIASES = {"confirm", "yes", "y"}
 TELEGRAM_BOT_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN')
 ADMIN_USER_ID = int(os.getenv('ADMIN_USER_ID', 0))
 AGENT_TIMEOUT_SECONDS = float(os.getenv('AGENT_TIMEOUT_SECONDS', 300.0))
@@ -231,7 +236,7 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
     orchestrator_inst = context.bot_data.get("orchestrator") or orchestrator
     if orchestrator_inst is None:
-        await update.message.reply_text("System error: Orchestrator not available.")
+        await update.message.reply_text(_ORCHESTRATOR_NOT_AVAILABLE_MSG)
         return
 
     router = getattr(orchestrator_inst, "cognitive_router", None)
@@ -266,6 +271,99 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         f"Predictive energy budget: {predictive_budget}",
     ]
     await update.message.reply_text("\n".join(lines))
+
+
+def _retire_confirmation_requested(args) -> bool:
+    if not args:
+        return False
+    return str(args[0] or "").strip().lower() in _RETIRE_CONFIRM_ALIASES
+
+
+def _ensure_bot_data_dict(context: ContextTypes.DEFAULT_TYPE) -> dict:
+    bot_data = getattr(context, "bot_data", None)
+    if isinstance(bot_data, dict):
+        return bot_data
+    bot_data = {}
+    context.bot_data = bot_data
+    return bot_data
+
+
+def _normalize_tool_name_list(raw_values) -> list:
+    return [
+        str(name).strip()
+        for name in (raw_values or [])
+        if str(name).strip()
+    ]
+
+
+def _format_retire_candidates_message(candidates) -> str:
+    lines = ["Unused approved tools (30+ days):"]
+    for item in candidates:
+        name = str(item.get("name") or "").strip()
+        last_used = str(item.get("last_used_at") or "never")
+        lines.append(f"- {name} (last_used_at={last_used})")
+    lines.append("")
+    lines.append("Run /retire_unused_tools confirm to retire these tools.")
+    return "\n".join(lines)
+
+
+async def _confirm_retire_unused_tools(update: Update, ledger, pending: dict, pending_key: str) -> None:
+    pending_payload = dict(pending.get(pending_key) or {})
+    tool_names = _normalize_tool_name_list(pending_payload.get("tool_names"))
+    if not tool_names:
+        await update.message.reply_text(
+            "No pending retirement list found. Run /retire_unused_tools first."
+        )
+        return
+
+    retired_count = await ledger.retire_tools(tool_names)
+    pending.pop(pending_key, None)
+    await update.message.reply_text(
+        f"Retired {retired_count} tool(s): {', '.join(tool_names)}"
+    )
+
+
+async def _start_retire_unused_tools_flow(update: Update, ledger, pending: dict, pending_key: str) -> None:
+    candidates = await ledger.get_unused_approved_tools(days=30)
+    if not candidates:
+        pending.pop(pending_key, None)
+        await update.message.reply_text("No approved tools are currently unused for 30+ days.")
+        return
+
+    tool_names = _normalize_tool_name_list(item.get("name") for item in candidates)
+    pending[pending_key] = {
+        "tool_names": tool_names,
+        "created_at": time.time(),
+    }
+    await update.message.reply_text(_format_retire_candidates_message(candidates))
+
+
+async def retire_unused_tools(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/retire_unused_tools [confirm] — retire approved dynamic tools unused for 30+ days."""
+    if not is_authorized(update.effective_user.id):
+        await update.message.reply_text(_UNAUTHORIZED_MSG)
+        return
+
+    bot_data = _ensure_bot_data_dict(context)
+
+    orchestrator_inst = bot_data.get("orchestrator") or orchestrator
+    if orchestrator_inst is None:
+        await update.message.reply_text(_ORCHESTRATOR_NOT_AVAILABLE_MSG)
+        return
+
+    ledger = bot_data.get("ledger") or getattr(orchestrator_inst, "ledger_memory", None)
+    if ledger is None:
+        await update.message.reply_text(_LEDGER_NOT_AVAILABLE_MSG)
+        return
+
+    pending = bot_data.setdefault(_PENDING_RETIRE_UNUSED_KEY, {})
+    pending_key = str(update.effective_user.id)
+
+    if _retire_confirmation_requested(getattr(context, "args", [])):
+        await _confirm_retire_unused_tools(update, ledger, pending, pending_key)
+        return
+
+    await _start_retire_unused_tools_flow(update, ledger, pending, pending_key)
 
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -461,7 +559,7 @@ async def goals(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         # "database is locked" errors under concurrent access.
         ledger = context.bot_data.get("ledger")
         if ledger is None:
-            await update.message.reply_text("System error: Ledger not available.")
+            await update.message.reply_text(_LEDGER_NOT_AVAILABLE_MSG)
             return
         items = await ledger.get_all_active_goals()
 
@@ -516,7 +614,7 @@ async def addgoal(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         # Re-use the orchestrator's existing LedgerMemory connection (ISSUE-003).
         ledger = context.bot_data.get("ledger")
         if ledger is None:
-            await update.message.reply_text("System error: Ledger not available.")
+            await update.message.reply_text(_LEDGER_NOT_AVAILABLE_MSG)
             return
         obj_id = await ledger.add_objective(tier=tier, title=title, estimated_energy=energy, origin="Admin")
         decomposition_note = ""
@@ -808,6 +906,7 @@ def main() -> None:
         # Register handlers
         application.add_handler(CommandHandler("start", start))
         application.add_handler(CommandHandler("status", status))
+        application.add_handler(CommandHandler("retire_unused_tools", retire_unused_tools))
         application.add_handler(CommandHandler("goals", goals))
         application.add_handler(CommandHandler("addgoal", addgoal))
         application.add_handler(CommandHandler("shutdown", shutdown))

@@ -1,8 +1,17 @@
 # AIDEN → Claude Dispatch Model: Alignment Roadmap
 
-**Status**: Planning  
+**Status**: Active maintenance — Phases 1-5 delivered, Phase 6 optional/deferred, Slice 8 self-reflection loop in progress.
 **Reference architecture**: Anthropic Claude Agent SDK (claude-agent-sdk)  
 **Goal**: Evolve AIDEN's static two-worker orchestration into a fully dynamic, context-isolated, parallel subagent dispatch system — while preserving the Charter, local-first directive, and MFA/HITL safety rails, and without overrunning local hardware.
+
+## Phase Status Snapshot
+
+- Phase 1 — Dynamic Agent Registry: completed.
+- Phase 2 — Context Isolation: completed.
+- Phase 3 — Parallel Worker Execution with local concurrency gate: completed.
+- Phase 4 — Selective Critic: completed.
+- Phase 5 — Model-per-Agent + audit-oriented persistence: completed.
+- Phase 6 — MCP Integration: optional future work (not active in current slice).
 
 ---
 

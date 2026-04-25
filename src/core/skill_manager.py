@@ -339,11 +339,24 @@ class SkillRegistry:
         skill = self._skills.get(name)
         return skill["fn"] if skill else None
 
+    @staticmethod
+    async def _touch_dynamic_tool_usage(tool_name: str) -> None:
+        try:
+            from src.core.runtime_context import get_ledger
+
+            ledger = get_ledger()
+            touch_fn = getattr(ledger, "touch_tool_last_used", None)
+            if callable(touch_fn):
+                await touch_fn(tool_name)
+        except Exception as exc:
+            logger.debug("Could not update last_used_at for dynamic tool %s: %s", tool_name, exc)
+
     async def _execute_dynamic_tool(self, tool_name: str, arguments: Dict[str, Any]) -> str:
         worker = self._dynamic_tool_worker
         if worker is None:
             return f"Error: Dynamic tool worker is not available for '{tool_name}'."
         response = await worker.call_tool(tool_name, arguments or {})
+        await self._touch_dynamic_tool_usage(tool_name)
         if not response.get("ok"):
             return f"Error: Dynamic tool '{tool_name}' failed — {response.get('error', 'unknown worker error')}"
         return str(response.get("result", ""))

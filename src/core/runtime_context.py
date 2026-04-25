@@ -7,22 +7,26 @@ from src.memory.ledger_db import LedgerMemory
 
 if TYPE_CHECKING:
     from src.memory.vector_db import VectorMemory
+    from src.core.orchestrator import Orchestrator
 
 
 _ledger: Optional[LedgerMemory] = None
 _core: Optional[CoreMemory] = None
 _vector: Optional["VectorMemory"] = None
+_orchestrator: Optional["Orchestrator"] = None
 
 
 def set_runtime_context(
     ledger: Optional[LedgerMemory],
     core: Optional[CoreMemory],
     vector: Optional["VectorMemory"] = None,
+    orchestrator: Optional["Orchestrator"] = None,
 ) -> None:
-    global _ledger, _core, _vector
+    global _ledger, _core, _vector, _orchestrator
     _ledger = ledger
     _core = core
     _vector = vector
+    _orchestrator = orchestrator
 
 
 def get_ledger() -> Optional[LedgerMemory]:
@@ -35,3 +39,7 @@ def get_core_memory() -> Optional[CoreMemory]:
 
 def get_vector_memory() -> Optional["VectorMemory"]:
     return _vector
+
+
+def get_orchestrator() -> Optional["Orchestrator"]:
+    return _orchestrator

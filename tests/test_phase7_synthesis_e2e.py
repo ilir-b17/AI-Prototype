@@ -209,3 +209,74 @@ async def test_phase7_synthesis_schema_migration_is_idempotent(tmp_path: Path):
         assert "synthesis_json" in attempt_columns
     finally:
         await ledger.close()
+
+
+@pytest.mark.asyncio
+async def test_phase7_repeated_synthesis_failures_require_manual_intervention(tmp_path: Path):
+    ledger = LedgerMemory(db_path=str(tmp_path / "phase7_repeated_failures.db"))
+    await ledger.initialize()
+    try:
+        run_id_1 = await ledger.create_synthesis_run(
+            user_id="phase7-user",
+            gap_description="Need helper",
+            suggested_tool_name="demo_tool",
+            original_input="Please add helper",
+            max_retries=3,
+        )
+        await ledger.update_synthesis_run_status(run_id_1, status="blocked")
+
+        run_id_2 = await ledger.create_synthesis_run(
+            user_id="phase7-user",
+            gap_description="Need helper",
+            suggested_tool_name="demo_tool",
+            original_input="Please add helper again",
+            max_retries=3,
+        )
+        await ledger.update_synthesis_run_status(run_id_2, status="rejected")
+
+        orchestrator = Orchestrator.__new__(Orchestrator)
+        orchestrator.ledger_memory = ledger
+        orchestrator.pending_tool_approval = {}
+
+        router = MagicMock()
+        router.get_system_2_available.return_value = True
+        orchestrator.cognitive_router = router
+        orchestrator._execute_synthesis_repair_loop = AsyncMock(return_value={"status": "passed"})
+
+        state = {"user_id": "phase7-user", "user_input": "Please add a deterministic helper."}
+        router_result = RouterResult(
+            status="capability_gap",
+            gap_description="Need a deterministic helper tool.",
+            suggested_tool_name="demo_tool",
+        )
+
+        message = await Orchestrator.tool_synthesis_node(orchestrator, state, router_result)
+
+        assert "This capability has been attempted 2 times without success. Manual intervention needed." in message
+        orchestrator._execute_synthesis_repair_loop.assert_not_awaited()
+    finally:
+        await ledger.close()
+
+
+@pytest.mark.asyncio
+async def test_retired_tools_are_excluded_from_approved_load_list(tmp_path: Path):
+    ledger = LedgerMemory(db_path=str(tmp_path / "phase8_tool_retirement.db"))
+    await ledger.initialize()
+    try:
+        schema = '{"name":"tool_alpha","description":"alpha","parameters":{"type":"object","properties":{},"required":[]}}'
+        await ledger.register_tool("tool_alpha", "alpha", "async def tool_alpha():\n    return 'ok'\n", schema)
+        await ledger.approve_tool("tool_alpha")
+
+        schema_beta = '{"name":"tool_beta","description":"beta","parameters":{"type":"object","properties":{},"required":[]}}'
+        await ledger.register_tool("tool_beta", "beta", "async def tool_beta():\n    return 'ok'\n", schema_beta)
+        await ledger.approve_tool("tool_beta")
+
+        retired = await ledger.retire_tools(["tool_alpha"])
+        assert retired == 1
+
+        approved = await ledger.get_approved_tools()
+        names = {item["name"] for item in approved}
+        assert "tool_alpha" not in names
+        assert "tool_beta" in names
+    finally:
+        await ledger.close()

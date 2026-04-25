@@ -363,7 +363,7 @@ class Orchestrator:
             except Exception as _preload_err:
                 logger.warning("System 1 preload skipped: %s", _preload_err)
         self._compiled_graph = build_orchestrator_graph(self)
-        set_runtime_context(self.ledger_memory, self.core_memory, self.vector_memory)
+        set_runtime_context(self.ledger_memory, self.core_memory, self.vector_memory, self)
         # Record the host OS now that we're in an async context
         await self.core_memory.update("host_os", platform.system())
         # Startup pruning: remove stale chat_history rows
@@ -4522,6 +4522,19 @@ class Orchestrator:
             last_test_result=last_test_result,
         )
 
+    async def _count_prior_failed_synthesis_runs(self, suggested_tool_name: str) -> int:
+        counter = getattr(self.ledger_memory, "count_synthesis_runs_by_tool_status", None)
+        if not callable(counter):
+            return 0
+        try:
+            return await counter(
+                suggested_tool_name=str(suggested_tool_name or ""),
+                statuses=["blocked", "rejected"],
+            )
+        except Exception as exc:
+            logger.warning("Could not query prior synthesis failures for %s: %s", suggested_tool_name, exc)
+            return 0
+
     async def tool_synthesis_node(
         self,
         state: Dict[str, Any],
@@ -4544,6 +4557,13 @@ class Orchestrator:
             return (
                 "System 1 identified a capability gap but System 2 is offline — "
                 "cannot synthesise a new tool right now. Please configure GROQ_API_KEY."
+            )
+
+        prior_failed_runs = await self._count_prior_failed_synthesis_runs(suggested_tool_name)
+        if prior_failed_runs >= 2:
+            return (
+                "HITL REQUIRED: This capability has been attempted "
+                f"{prior_failed_runs} times without success. Manual intervention needed."
             )
 
         loop_result = await self._execute_synthesis_repair_loop(
@@ -4654,6 +4674,16 @@ class Orchestrator:
             return result.content
         return None
 
+    async def _get_recent_moral_rejections_for_supervisor(self, user_id: str) -> List[Dict[str, Any]]:
+        getter = getattr(self.ledger_memory, "get_recent_moral_rejections", None)
+        if not callable(getter):
+            return []
+        try:
+            return await getter(str(user_id or ""), limit=3)
+        except Exception as exc:
+            logger.warning("Could not fetch recent moral rejections for supervisor context: %s", exc)
+            return []
+
     async def supervisor_node(self, state: Dict[str, Any]) -> Dict[str, Any]:
         """Plans execution. Tries System 1 (local) first per Directive 1.3; escalates to System 2 only on failure."""
         state = normalize_state(state)
@@ -4675,6 +4705,9 @@ class Orchestrator:
         archival_context = await self._get_archival_context(user_input)
         capabilities_str = self._get_capabilities_string()
         archival_block = f"{archival_context}\n\n" if archival_context else ""
+        recent_rejections = await self._get_recent_moral_rejections_for_supervisor(
+            str(state.get("user_id") or "")
+        )
 
         system_prompt = build_supervisor_prompt(
             charter_text=self.charter_text,
@@ -4685,6 +4718,7 @@ class Orchestrator:
             sensory_context=self._get_sensory_context(),
             os_name=self.sensory_state.get("os", platform.system()),
             downloads_dir=self.prompt_config.downloads_dir,
+            recent_rejections=recent_rejections,
         )
         logger.info(
             "Supervisor system prompt sha256=%s bytes=%d",
@@ -5953,7 +5987,7 @@ class Orchestrator:
 
     def close(self) -> None:
         try:
-            set_runtime_context(None, None, None)
+            set_runtime_context(None, None, None, None)
             if hasattr(self, 'vector_memory') and self.vector_memory:
                 self.vector_memory.close()
             # cognitive_router and ledger_memory are async resources.

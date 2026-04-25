@@ -9,7 +9,9 @@ import pytest
 from src.core.energy_judge import EnergyEvaluation
 from src.core.energy_roi_engine import EnergyPolicy, EnergyROIEngine
 from src.core.orchestrator import Orchestrator
+from src.core.runtime_context import set_runtime_context
 from src.memory.ledger_db import LedgerMemory
+from src.skills.update_objective_status import update_objective_status as update_objective_status_skill
 
 
 async def _fetch_task_row(ledger: LedgerMemory, task_id: int):
@@ -154,4 +156,40 @@ async def test_heartbeat_fairness_policy_eventually_executes_after_multiple_defe
         assert "max defer bypass" in str(eval_payload["reason"]).lower()
         assert float(eval_payload["base_roi"]) < float(eval_payload["roi_threshold"])
     finally:
+        await ledger.close()
+
+
+@pytest.mark.asyncio
+async def test_completion_updates_refund_predictive_budget_after_success_streak(tmp_path: Path, monkeypatch):
+    ledger = LedgerMemory(db_path=str(tmp_path / "phase8_completion_refund.db"))
+    await ledger.initialize()
+    monkeypatch.setenv("INITIAL_ENERGY_BUDGET", "40")
+    try:
+        epic_id = await ledger.add_objective(tier="Epic", title="Refund Epic")
+        story_id = await ledger.add_objective(tier="Story", title="Refund Story", parent_id=epic_id)
+        task_ids = [
+            await ledger.add_objective(
+                tier="Task",
+                title=f"Refund Task #{index}",
+                parent_id=story_id,
+                estimated_energy=25,
+            )
+            for index in range(1, 5)
+        ]
+
+        orchestrator = Orchestrator.__new__(Orchestrator)
+        orchestrator._predictive_energy_budget_lock = asyncio.Lock()
+        orchestrator._predictive_energy_budget_remaining = 20
+
+        set_runtime_context(ledger, None, None, orchestrator)
+        observed_budgets = []
+        for task_id in task_ids:
+            payload = json.loads(await update_objective_status_skill(task_id, "completed"))
+            assert payload["status"] == "success"
+            observed_budgets.append(orchestrator._predictive_energy_budget_remaining)
+
+        assert observed_budgets[0] == 25
+        assert observed_budgets[-1] == 40
+    finally:
+        set_runtime_context(None, None, None, None)
         await ledger.close()

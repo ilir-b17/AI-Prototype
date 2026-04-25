@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass
 import textwrap
+from typing import Any, Dict, List, Optional
 
 
 @dataclass(frozen=True)
@@ -15,6 +16,54 @@ def load_prompt_config() -> PromptConfig:
     return PromptConfig(downloads_dir=downloads_dir)
 
 
+def _normalize_string_list(raw_value: Any) -> List[str]:
+    if isinstance(raw_value, list):
+        values = raw_value
+    elif raw_value is None:
+        values = []
+    else:
+        values = [raw_value]
+    return [str(item).strip() for item in values if str(item).strip()]
+
+
+def _render_single_rejection_line(item: Any, index: int) -> str:
+    if not isinstance(item, dict):
+        return ""
+
+    tiers = ", ".join(_normalize_string_list(item.get("violated_tiers"))) or "unspecified"
+    constraints = "; ".join(_normalize_string_list(item.get("remediation_constraints")))
+    if not constraints:
+        constraints = "follow charter-safe fallback"
+
+    reasoning = str(item.get("reasoning") or "").strip()
+    line = f"{index}) tiers={tiers}; constraints={constraints}"
+    if reasoning:
+        line += f"; reason={reasoning}"
+    return line
+
+
+def _render_recent_rejections_block(
+    recent_rejections: Optional[List[Dict[str, Any]]],
+    *,
+    max_chars: int = 500,
+) -> str:
+    if not recent_rejections:
+        return ""
+
+    lines = [
+        _render_single_rejection_line(item, idx)
+        for idx, item in enumerate(list(recent_rejections)[:3], start=1)
+    ]
+    lines = [line for line in lines if line]
+
+    body = "\n".join(lines).strip()
+    if len(body) > max_chars:
+        body = body[: max_chars - 3].rstrip() + "..."
+    if not body:
+        return ""
+    return f"\n<recent_rejections>\n{body}\n</recent_rejections>"
+
+
 def build_supervisor_prompt(
     *,
     charter_text: str,
@@ -25,8 +74,10 @@ def build_supervisor_prompt(
     sensory_context: str,
     os_name: str,
     downloads_dir: str,
+    recent_rejections: Optional[List[Dict[str, Any]]] = None,
 ) -> str:
     _ = (archival_block, sensory_context)
+    recent_rejections_block = _render_recent_rejections_block(recent_rejections)
     # textwrap.dedent removes the leading whitespace, keeping the code clean 
     # while ensuring the LLM gets perfectly flush text.
     return textwrap.dedent(f"""\
@@ -61,6 +112,7 @@ def build_supervisor_prompt(
         <context_and_memory>
         --- Core Memory ---
         {core_mem_str}
+        {recent_rejections_block}
         </context_and_memory>
 
         <available_capabilities>

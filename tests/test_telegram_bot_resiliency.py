@@ -25,7 +25,13 @@ os.environ['TELEGRAM_BOT_TOKEN'] = 'mock_token'
 os.environ['ADMIN_USER_ID'] = '12345'
 
 from src.interfaces import telegram_bot
-from src.interfaces.telegram_bot import handle_document_message, handle_message, handle_voice_message, status
+from src.interfaces.telegram_bot import (
+    handle_document_message,
+    handle_message,
+    handle_voice_message,
+    retire_unused_tools,
+    status,
+)
 from telegram import Update, Message, Chat, User
 from unittest.mock import AsyncMock
 
@@ -164,6 +170,49 @@ async def test_document_message_uses_caption_as_tool_approval_context():
     assert "long_tool.py" in args[0]
     assert args[1] == "12345"
     mock_update.message.reply_text.assert_called_with("approved")
+
+
+@pytest.mark.asyncio
+async def test_retire_unused_tools_requires_confirmation_then_retires():
+    mock_update = MagicMock(spec=Update)
+    mock_message = AsyncMock(spec=Message)
+    mock_update.message = mock_message
+    mock_update.effective_user = MagicMock(spec=User)
+    mock_update.effective_user.id = 12345
+
+    mock_ledger = MagicMock()
+    mock_ledger.get_unused_approved_tools = AsyncMock(
+        return_value=[
+            {"name": "alpha_tool", "last_used_at": "2025-01-01 00:00:00"},
+            {"name": "beta_tool", "last_used_at": None},
+        ]
+    )
+    mock_ledger.retire_tools = AsyncMock(return_value=2)
+
+    mock_context = MagicMock()
+    mock_context.bot_data = {
+        "ledger": mock_ledger,
+        "orchestrator": MagicMock(),
+    }
+    mock_context.args = []
+
+    await retire_unused_tools(mock_update, mock_context)
+
+    first_message = mock_update.message.reply_text.await_args.args[0]
+    assert "Unused approved tools" in first_message
+    assert "alpha_tool" in first_message
+    assert "beta_tool" in first_message
+    assert "/retire_unused_tools confirm" in first_message
+    pending = mock_context.bot_data.get("pending_retire_unused_tools", {})
+    assert pending.get("12345", {}).get("tool_names") == ["alpha_tool", "beta_tool"]
+
+    mock_context.args = ["confirm"]
+    mock_update.message.reply_text.reset_mock()
+
+    await retire_unused_tools(mock_update, mock_context)
+
+    mock_ledger.retire_tools.assert_awaited_once_with(["alpha_tool", "beta_tool"])
+    mock_update.message.reply_text.assert_called_with("Retired 2 tool(s): alpha_tool, beta_tool")
 
 
 @pytest.mark.asyncio

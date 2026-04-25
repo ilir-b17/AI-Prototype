@@ -46,6 +46,14 @@
 - Replaced charter tier regex extraction with XML parsing, added malformed-charter diagnostics, and disabled critic/moral audits when only the fallback charter is active.
 - Added a shared heartbeat task prefix constant and moved long synthesized tool code into temporary Telegram document attachments when approval text would exceed the safe message limit.
 
+## Slice 8: Self-Reflection Loop
+
+- Added `LedgerMemory.get_recent_moral_rejections(user_id, limit=3)` so recent non-approved moral decisions are queryable and reused in planning.
+- Extended supervisor prompt composition with a capped `<recent_rejections>` reminder block (max 500 chars) to carry forward remediation constraints and violated tiers.
+- Added pre-synthesis failure backoff: repeated blocked/rejected runs for the same suggested tool name now halt synthesis and emit a HITL-required manual-intervention message.
+- Added dynamic-tool lifecycle governance: `tool_registry.last_used_at`, usage touch on every dynamic call, and `/retire_unused_tools` admin workflow to retire long-unused approved tools.
+- Added completion-based predictive energy refund when `update_objective_status` marks a Task completed: refunds 20% of estimated energy via existing capped budget logic.
+
 ## Issues Identified
 
 ### 1. **Timeout Errors** (Critical)

@@ -1,5 +1,6 @@
 import asyncio
 import json
+import re
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
@@ -8,6 +9,7 @@ import pytest
 from src.core.llm_router import RequiresHITLError, RouterResult
 from src.core.moral_ledger import MORAL_DIMENSIONS, MORAL_RUBRIC_VERSION
 from src.core.orchestrator import Orchestrator
+from src.core.prompt_config import build_supervisor_prompt
 from src.core.state_model import AgentState
 from src.memory.ledger_db import LedgerMemory
 
@@ -82,6 +84,7 @@ async def test_phase6_scenario_a_benign_trivial_bypass_logs_bypass_mode(tmp_path
         assert logs[0]["audit_mode"] == "triviality_bypass"
     finally:
         await ledger.close()
+
 
 
 @pytest.mark.asyncio
@@ -259,5 +262,97 @@ async def test_phase6_scenario_c_severe_risk_triggers_immediate_hitl_halt(tmp_pa
         assert len(logs) == 1
         assert logs[0]["moral_decision"].get("is_approved") is False
         assert logs[0]["moral_decision"].get("security_conflict") is True
+    finally:
+        await ledger.close()
+
+
+@pytest.mark.asyncio
+async def test_recent_moral_rejections_are_rendered_for_supervisor_context(tmp_path: Path):
+    ledger = LedgerMemory(db_path=str(tmp_path / "phase6_recent_rejections.db"))
+    await ledger.initialize()
+    try:
+        user_id = "phase6-user-rejections"
+        long_reason = "Tier conflict. " + ("constraint-heavy reasoning " * 80)
+        await ledger.append_moral_audit_log(
+            user_id=user_id,
+            audit_mode="system2_audit",
+            audit_trace="trace-a",
+            critic_feedback="FAIL",
+            moral_decision={
+                "is_approved": False,
+                "reasoning": long_reason,
+                "remediation_constraints": [
+                    "Keep response read-only.",
+                    "Do not perform write operations without MFA.",
+                ],
+                "violated_tiers": ["tier_1", "tier_2"],
+            },
+            request_redacted="req",
+            output_redacted="out",
+        )
+        await ledger.append_moral_audit_log(
+            user_id=user_id,
+            audit_mode="system2_audit",
+            audit_trace="trace-b",
+            critic_feedback="FAIL",
+            moral_decision={
+                "is_approved": False,
+                "reasoning": "Second rejection.",
+                "remediation_constraints": ["Require explicit approval before escalation."],
+                "violated_tiers": ["tier_2"],
+            },
+            request_redacted="req",
+            output_redacted="out",
+        )
+        await ledger.append_moral_audit_log(
+            user_id=user_id,
+            audit_mode="system2_audit",
+            audit_trace="trace-c",
+            critic_feedback="PASS",
+            moral_decision={
+                "is_approved": True,
+                "reasoning": "Approved response.",
+                "remediation_constraints": [],
+                "violated_tiers": [],
+            },
+            request_redacted="req",
+            output_redacted="out",
+        )
+        await ledger.append_moral_audit_log(
+            user_id=user_id,
+            audit_mode="system2_audit",
+            audit_trace="trace-d",
+            critic_feedback="FAIL",
+            moral_decision={
+                "is_approved": False,
+                "reasoning": "Third rejection.",
+                "remediation_constraints": ["Avoid exfiltration patterns."],
+                "violated_tiers": ["tier_1"],
+            },
+            request_redacted="req",
+            output_redacted="out",
+        )
+
+        rejections = await ledger.get_recent_moral_rejections(user_id, limit=3)
+        assert len(rejections) == 3
+        assert all(isinstance(item.get("remediation_constraints"), list) for item in rejections)
+        assert all(isinstance(item.get("violated_tiers"), list) for item in rejections)
+
+        prompt = build_supervisor_prompt(
+            charter_text="Charter",
+            core_mem_str="Core memory",
+            archival_block="",
+            capabilities_str="- web_search",
+            agent_descriptions="- research_agent",
+            sensory_context="",
+            os_name="Windows",
+            downloads_dir="downloads",
+            recent_rejections=rejections,
+        )
+
+        assert "<recent_rejections>" in prompt
+        block_match = re.search(r"<recent_rejections>\n(.*?)\n</recent_rejections>", prompt, flags=re.DOTALL)
+        assert block_match is not None
+        assert len(block_match.group(1)) <= 500
     finally:
         await ledger.close()

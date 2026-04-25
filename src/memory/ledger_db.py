@@ -200,6 +200,15 @@ class LedgerMemory:
                     approved_at TIMESTAMP
                 )
             """)
+            await self._ensure_table_column(
+                "tool_registry",
+                "last_used_at",
+                "TIMESTAMP",
+            )
+            await self._db.execute("""
+                CREATE INDEX IF NOT EXISTS idx_tool_registry_status_last_used_approved
+                ON tool_registry(status, last_used_at, approved_at)
+            """)
             await self._db.execute("""
                 CREATE TABLE IF NOT EXISTS pending_tool_approvals (
                     user_id TEXT NOT NULL PRIMARY KEY,
@@ -250,6 +259,11 @@ class LedgerMemory:
             await self._db.execute("""
                 CREATE INDEX IF NOT EXISTS idx_moral_audit_created_at
                 ON moral_audit_log(created_at DESC)
+            """)
+            await self._db.execute("""
+                CREATE INDEX IF NOT EXISTS idx_moral_audit_user_rejections_created
+                ON moral_audit_log(user_id, created_at DESC)
+                WHERE json_extract(moral_decision_json, '$.is_approved') = 0
             """)
             await self._db.execute("""
                 CREATE TRIGGER IF NOT EXISTS trg_moral_audit_log_no_update
@@ -337,6 +351,10 @@ class LedgerMemory:
             await self._db.execute("""
                 CREATE INDEX IF NOT EXISTS idx_synthesis_runs_status_created
                 ON synthesis_runs(status, created_at DESC)
+            """)
+            await self._db.execute("""
+                CREATE INDEX IF NOT EXISTS idx_synthesis_runs_tool_status_created
+                ON synthesis_runs(suggested_tool_name, status, created_at DESC)
             """)
             await self._db.execute("""
                 CREATE TABLE IF NOT EXISTS synthesis_attempts (
@@ -510,6 +528,40 @@ class LedgerMemory:
         # Fallback for legacy comma-separated values.
         parts = [part.strip() for part in raw_text.split(",") if part.strip()]
         return LedgerMemory._deserialize_depends_on_ids(parts)
+
+    @staticmethod
+    def _parse_json_dict(raw_value: Any) -> Dict[str, Any]:
+        if isinstance(raw_value, dict):
+            return raw_value
+        try:
+            decoded = json.loads(str(raw_value or "{}"))
+        except Exception:
+            return {}
+        if isinstance(decoded, dict):
+            return decoded
+        return {}
+
+    @staticmethod
+    def _normalize_string_list(raw_value: Any) -> List[str]:
+        if isinstance(raw_value, list):
+            values = raw_value
+        elif raw_value is None:
+            values = []
+        else:
+            values = [raw_value]
+        return [str(item).strip() for item in values if str(item).strip()]
+
+    @classmethod
+    def _normalize_moral_rejection_row(cls, row: aiosqlite.Row) -> Dict[str, Any]:
+        decision = cls._parse_json_dict(row["moral_decision_json"])
+        return {
+            "created_at": row["created_at"],
+            "reasoning": str(decision.get("reasoning") or ""),
+            "remediation_constraints": cls._normalize_string_list(
+                decision.get("remediation_constraints")
+            ),
+            "violated_tiers": cls._normalize_string_list(decision.get("violated_tiers")),
+        }
 
     @classmethod
     def _normalize_objective_row(cls, row: aiosqlite.Row) -> Dict[str, Any]:
@@ -932,6 +984,28 @@ class LedgerMemory:
                 item["moral_decision"] = {}
             logs.append(item)
         return logs
+
+    async def get_recent_moral_rejections(
+        self,
+        user_id: str,
+        limit: int = 3,
+    ) -> List[Dict[str, Any]]:
+        """Return recent non-approved moral decisions with remediation metadata."""
+        normalized_user_id = str(user_id or "").strip()
+        if not normalized_user_id:
+            return []
+
+        async with self._lock:
+            cursor = await self._db.execute(
+                "SELECT id, moral_decision_json, created_at "
+                "FROM moral_audit_log "
+                "WHERE user_id = ? "
+                "AND json_extract(moral_decision_json, '$.is_approved') = 0 "
+                "ORDER BY created_at DESC, id DESC LIMIT ?",
+                (normalized_user_id, max(1, int(limit))),
+            )
+            rows = await cursor.fetchall()
+        return [self._normalize_moral_rejection_row(row) for row in rows]
 
     # ─────────────────────────────────────────────────────────────
     # Objective Backlog  (3-tier: Epic > Story > Task)
@@ -1538,11 +1612,23 @@ class LedgerMemory:
                 "VALUES (?, ?, ?, ?, 'pending_approval') "
                 "ON CONFLICT(name) DO UPDATE SET "
                 "description=excluded.description, code=excluded.code, "
-                "schema_json=excluded.schema_json, status='pending_approval', approved_at=NULL",
+                "schema_json=excluded.schema_json, status='pending_approval', approved_at=NULL, last_used_at=NULL",
                 (name, description, code, schema_json),
             )
             await self._db.commit()
             return cursor.lastrowid
+
+    async def touch_tool_last_used(self, name: str) -> None:
+        """Record tool usage by updating last_used_at."""
+        normalized_name = str(name or "").strip()
+        if not normalized_name:
+            return
+        async with self._lock:
+            await self._db.execute(
+                "UPDATE tool_registry SET last_used_at=CURRENT_TIMESTAMP WHERE name=?",
+                (normalized_name,),
+            )
+            await self._db.commit()
 
     async def approve_tool(self, name: str) -> None:
         """Mark a tool as approved and record the approval timestamp."""
@@ -1563,6 +1649,39 @@ class LedgerMemory:
             )
             rows = await cursor.fetchall()
         return [dict(r) for r in rows]
+
+    async def get_unused_approved_tools(self, days: int = 30) -> List[Dict[str, Any]]:
+        """Return approved tools that have not been used within the day window."""
+        cutoff_days = max(0, int(days))
+        cutoff_sql = f"-{cutoff_days} days"
+        async with self._lock:
+            cursor = await self._db.execute(
+                "SELECT name, description, approved_at, last_used_at "
+                "FROM tool_registry "
+                "WHERE status='approved' AND ("
+                "(last_used_at IS NOT NULL AND datetime(last_used_at) <= datetime('now', ?)) OR "
+                "(last_used_at IS NULL AND approved_at IS NOT NULL AND datetime(approved_at) <= datetime('now', ?))"
+                ") "
+                "ORDER BY COALESCE(last_used_at, approved_at, created_at) ASC, name ASC",
+                (cutoff_sql, cutoff_sql),
+            )
+            rows = await cursor.fetchall()
+        return [dict(row) for row in rows]
+
+    async def retire_tools(self, tool_names: List[str]) -> int:
+        """Mark approved tools as retired and return number of tools retired."""
+        normalized = [str(name).strip() for name in (tool_names or []) if str(name).strip()]
+        if not normalized:
+            return 0
+        placeholders = ",".join("?" for _ in normalized)
+        async with self._lock:
+            cursor = await self._db.execute(
+                "UPDATE tool_registry SET status='retired' "
+                "WHERE status='approved' AND name IN (" + placeholders + ")",
+                tuple(normalized),
+            )
+            await self._db.commit()
+            return int(cursor.rowcount or 0)
 
     # ─────────────────────────────────────────────────────────────
     # Pending Tool Approvals  (survive bot restarts)
@@ -1863,6 +1982,29 @@ class LedgerMemory:
         if row is None:
             return None
         return await self.get_synthesis_run(int(row["id"]))
+
+    async def count_synthesis_runs_by_tool_status(
+        self,
+        *,
+        suggested_tool_name: str,
+        statuses: Optional[List[str]] = None,
+    ) -> int:
+        """Count synthesis runs for a tool filtered by status values."""
+        tool_name = str(suggested_tool_name or "").strip()
+        normalized_statuses = [str(item).strip() for item in (statuses or []) if str(item).strip()]
+        if not tool_name or not normalized_statuses:
+            return 0
+
+        placeholders = ",".join("?" for _ in normalized_statuses)
+        params: List[Any] = [tool_name, *normalized_statuses]
+        async with self._lock:
+            cursor = await self._db.execute(
+                "SELECT COUNT(*) AS run_count FROM synthesis_runs "
+                "WHERE suggested_tool_name = ? AND status IN (" + placeholders + ")",
+                tuple(params),
+            )
+            row = await cursor.fetchone()
+        return int((row["run_count"] if row is not None else 0) or 0)
 
     # ─────────────────────────────────────────────────────────────
     # HITL State Persistence  (survive bot restarts)
