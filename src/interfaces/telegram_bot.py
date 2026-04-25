@@ -1012,6 +1012,9 @@ def main() -> None:
         logger.error(f"Bot error: {e}", exc_info=True)
     finally:
         try:
+            # Always release the lock before any restart path. The restart
+            # branch below uses os.execv, so this explicit close guarantees
+            # the replacement process can re-bind the lock port immediately.
             if lock_sock:
                 lock_sock.close()
                 logger.info("Released single-instance lock")
@@ -1019,9 +1022,9 @@ def main() -> None:
             pass
 
     # If a restart was requested, replace the current process with a fresh one.
-    # os.execv replaces the process image in-place â€" the OS PID stays the same
-    # and the lock socket is already closed above, so the new instance can
-    # acquire it cleanly.
+    # os.execv replaces the process image in-place while keeping the same PID.
+    # Ordering matters: the lock socket is closed in finally above before execv,
+    # preventing a self-deadlock where the new image cannot acquire the lock.
     if _restart_requested:
         logger.info("Restarting process...")
         # Flush log handlers so nothing is lost

@@ -2540,6 +2540,10 @@ Rules:
     def _validate_dynamic_tool_token_scan(code: str, tool_name: str) -> None:
         """Reject known escape tokens immediately before dynamic exec."""
         significant_tokens = CognitiveRouter._dynamic_tool_significant_tokens(code, tool_name)
+        # This token gate intentionally catches direct and literal spellings of
+        # dangerous runtime names. Constructed dunder names are still not a viable
+        # escape path because AST call validation already blocks getattr/eval/exec/
+        # __import__/vars/globals/locals before dynamic registration is allowed.
         for index, token in enumerate(significant_tokens):
             CognitiveRouter._validate_dynamic_tool_bare_token(token, tool_name)
             CognitiveRouter._validate_dynamic_tool_dotted_token(significant_tokens, index, tool_name)

@@ -45,6 +45,7 @@ In the future, System 1 can retrieve this pattern via `search_archival_memory` a
 
 ### Security & Interactions
 
+- **Operator Security Guide**: See `SECURITY.md` for the trust model, cloud-redaction boundary, MFA policy, and re-authorization rules.
 - **Telegram Interface**: The primary UI interface. Restricted via strict `ADMIN_USER_ID` checks.
 - **MFA Intercept**: Sensitive actions (e.g., core system updates) are intercepted by the Orchestrator and challenged with multi-factor authentication phrases before proceeding.
 - **Human-In-The-Loop (HITL)**: Used across the system. Halts current processes and saves active states when the Critic fails repeatedly, energy is depleted, or tools need approval, awaiting Admin intervention.

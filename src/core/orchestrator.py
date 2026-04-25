@@ -1,28 +1,36 @@
 """
-Orchestrator Module - Implements State Graph Architecture (Sprint 6)
+Orchestrator Module - Implements State Graph Architecture.
 
-State Graph with Energy Budget, Proactive Heartbeat, and Charter enforcement.
-Passes a State Dictionary between specialized nodes until task is complete,
-exhausted (energy = 0), or blocked (HITL required).
+State graph with energy budgets, proactive heartbeat execution, and charter
+enforcement. A state dictionary is routed through supervisor, workers, and
+critic until complete, blocked for HITL/MFA, or exhausted.
 
-Energy budget model summary:
-- Per-turn budget (state energy): Deducted while executing supervisor/workers/critic
-    in a single user turn. Refunds are applied on operation timeout/failure to avoid
-    charging for incomplete work.
-- Predictive budget (cross-turn): A global pacing budget used by ad-hoc and heartbeat
-    dispatch to prevent over-commitment.
-- Replenishment cadence:
-    - User-turn wall-clock replenishment is calculated in process_message.
-    - Heartbeat-cycle replenishment is applied at the top of _run_heartbeat_cycle via
-        ENERGY_REPLENISH_PER_HEARTBEAT.
-- Predictive refunds:
-    - Successful completion updates can refund predictive budget according to the
-        configured reward policy.
-    - Failures and blocked parallel branches refund unused reserved predictive budget.
-- Deferral and cooldown behavior:
-    - When ROI or reserve constraints fail, tasks are marked deferred_due_to_energy.
-    - defer_count and next_eligible_at are recorded so repeated deferrals eventually
-        receive fairness boosts and cooldown-aware re-evaluation.
+Energy model reference (operator-facing):
+- Sources:
+    - Per-turn state budget in state["energy_remaining"] for the current user turn.
+    - Cross-turn predictive budget in _predictive_energy_budget_remaining used for
+        pacing ad-hoc and heartbeat execution.
+- Sinks:
+    - _deduct_energy charges per-turn budget for supervisor/worker/critic/tool work.
+    - _try_reserve_predictive_energy_budget reserves predictive points before ad-hoc
+        and heartbeat dispatch.
+- Replenishment:
+    - Per-turn replenishment is recalculated on each process_message turn.
+    - Predictive wall-clock replenishment accrues by ENERGY_REPLENISH_PER_HOUR.
+    - Heartbeat cadence replenishes predictive budget by
+        ENERGY_REPLENISH_PER_HEARTBEAT at cycle start.
+- Refunds and reversals:
+    - _refund_energy reverses per-turn deductions after failures/timeouts.
+    - _refund_predictive_energy_budget restores predictive points for failed/blocked
+        branches, reservation races, and successful completion paths.
+- Deferrals and retry pacing:
+    - If ROI/reserve checks fail, tasks are marked deferred_due_to_energy.
+    - defer_count and next_eligible_at are persisted for cooldown-aware fairness
+        and re-evaluation.
+- Completion bonuses:
+    - Completing tasks via update_objective_status can apply predictive completion
+        refunds (reward policy), currently implemented as a bounded completion bonus
+        on successful completion updates.
 
 HITL retry contract: Maximum 3 critic rejections per HITL cycle,
 maximum 3 HITL cycles per task, after which the task is abandoned.
