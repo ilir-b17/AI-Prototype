@@ -8,7 +8,7 @@ The `write` and `delete` operations will immediately return a SECURITY LOCK requ
 ```json
 {
   "name": "manage_file_system",
-  "description": "Manages file system operations. Can 'read' files or 'list' directories. 'write' and 'delete' operations will trigger a SECURITY LOCK. Returns file content, directory listing JSON, or detailed JSON error messages if the path is invalid.",
+  "description": "Manages file system operations and resolves and confines paths to the configured allowed roots. Can 'read' files or 'list' directories. 'write' and 'delete' operations trigger a SECURITY LOCK. Returns file content, directory listing JSON, or detailed JSON error messages if the path is invalid.",
   "parameters": {
     "type": "object",
     "properties": {

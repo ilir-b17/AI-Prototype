@@ -7,22 +7,25 @@ from typing import Any, Optional
 import pdfplumber
 from pypdf import PdfReader
 
+from src.skills._common.path_guard import get_default_allowed_roots, resolve_confined_path
+
 logger = logging.getLogger(__name__)
 
 LEGACY_DEFAULT_MAX_PAGES = 20
 LEGACY_DEFAULT_MAX_CHARS = 12000
 TRUNCATION_MARKER = "\n\n[TRUNCATED]"
 
-_DOWNLOADS_DIR = os.path.abspath(
-    os.getenv(
-        "AIDEN_DOWNLOADS_DIR",
-        os.path.join(
-            os.path.dirname(os.path.dirname(os.path.dirname(__file__))),
-            "..",
-            "downloads",
-        ),
+def _downloads_dir() -> str:
+    return os.path.abspath(
+        os.getenv(
+            "AIDEN_DOWNLOADS_DIR",
+            os.path.join(
+                os.path.dirname(os.path.dirname(os.path.dirname(__file__))),
+                "..",
+                "downloads",
+            ),
+        )
     )
-)
 
 
 def _resolve_pdf_path(file_path: str) -> str:
@@ -33,16 +36,12 @@ def _resolve_pdf_path(file_path: str) -> str:
     # Normalize slashes for Windows paths and common /download/ inputs
     normalized = normalized.replace("/", os.sep)
 
-    # If it's an absolute path and exists, use it as-is.
+    # If it's an absolute path, keep it as-is and let the guard decide.
     if os.path.isabs(normalized):
-        if os.path.exists(normalized):
-            return normalized
-        # If it looks like "/download/Tool.pdf", fall back to downloads basename.
-        base = os.path.basename(normalized)
-        return os.path.join(_DOWNLOADS_DIR, base)
+        return normalized
 
     # Relative path: assume downloads directory.
-    return os.path.join(_DOWNLOADS_DIR, normalized)
+    return os.path.join(_downloads_dir(), normalized)
 
 def _coerce_bool(value: Any, default: bool = False) -> bool:
     if isinstance(value, bool):
@@ -149,7 +148,17 @@ def _extract_pdf_text_sync(
     max_chars: Optional[int],
     full_context: bool = False,
 ) -> str:
-    resolved = _resolve_pdf_path(file_path)
+    try:
+        resolved = resolve_confined_path(
+            _resolve_pdf_path(file_path),
+            get_default_allowed_roots(),
+        )
+    except PermissionError:
+        return json.dumps({
+            "status": "error",
+            "message": "Path is outside the allowed roots"
+        })
+
     if not resolved:
         return json.dumps({
             "status": "error",

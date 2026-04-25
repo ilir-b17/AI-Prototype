@@ -4,18 +4,21 @@ import json
 
 import pandas as pd
 
+from src.skills._common.path_guard import get_default_allowed_roots, resolve_confined_path
+
 logger = logging.getLogger(__name__)
 
-_DOWNLOADS_DIR = os.path.abspath(
-    os.getenv(
-        "AIDEN_DOWNLOADS_DIR",
-        os.path.join(
-            os.path.dirname(os.path.dirname(os.path.dirname(__file__))),
-            "..",
-            "downloads",
-        ),
+def _downloads_dir() -> str:
+    return os.path.abspath(
+        os.getenv(
+            "AIDEN_DOWNLOADS_DIR",
+            os.path.join(
+                os.path.dirname(os.path.dirname(os.path.dirname(__file__))),
+                "..",
+                "downloads",
+            ),
+        )
     )
-)
 
 
 def _resolve_data_path(file_path: str) -> str:
@@ -24,10 +27,8 @@ def _resolve_data_path(file_path: str) -> str:
         return normalized
     normalized = normalized.replace("/", os.sep)
     if os.path.isabs(normalized):
-        if os.path.exists(normalized):
-            return normalized
-        return os.path.join(_DOWNLOADS_DIR, os.path.basename(normalized))
-    return os.path.join(_DOWNLOADS_DIR, normalized)
+        return normalized
+    return os.path.join(_downloads_dir(), normalized)
 
 
 
@@ -41,13 +42,17 @@ async def analyze_table_file(
     Load a CSV/TSV/Excel file and return a concise summary using pandas.
     """
     try:
-        resolved = _resolve_data_path(file_path)
-        if not resolved:
+        try:
+            resolved = resolve_confined_path(
+                _resolve_data_path(file_path),
+                get_default_allowed_roots(),
+            )
+        except PermissionError:
             return json.dumps({
                 "status": "error",
-                "message": "Invalid file_path",
-                "details": "The file_path must be a non-empty string."
+                "message": "Path is outside the allowed roots"
             })
+
         if not os.path.exists(resolved):
             return json.dumps({
                 "status": "error",

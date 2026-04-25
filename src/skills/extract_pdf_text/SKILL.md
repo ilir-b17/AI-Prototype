@@ -7,7 +7,7 @@ Reads and extracts text from a PDF file.
 ```json
 {
   "name": "extract_pdf_text",
-  "description": "Reads text from a local PDF file. Resolves relative paths to the AIDEN_DOWNLOADS_DIR. By default, legacy limits apply (max_pages/max_chars). Set full_context=true to request unchunked extraction; in that mode max_chars can be provided as a dynamic safety cap.",
+  "description": "Reads text from a local PDF file, resolves and confines paths to the configured allowed roots, and resolves relative paths to AIDEN_DOWNLOADS_DIR. By default, legacy limits apply (max_pages/max_chars). Set full_context=true to request unchunked extraction; in that mode max_chars can be provided as a dynamic safety cap.",
   "parameters": {
     "type": "object",
     "properties": {

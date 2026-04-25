@@ -7,7 +7,7 @@ Loads a local CSV, TSV, or Excel file and returns a concise summary.
 ```json
 {
   "name": "analyze_table_file",
-  "description": "Analyzes a local tabular data file (CSV, TSV, XLSX). Resolves relative paths to the AIDEN_DOWNLOADS_DIR. Returns a JSON summary including shape, column types, missing values, and a brief data preview.",
+  "description": "Analyzes a local tabular data file (CSV, TSV, XLSX), resolves and confines paths to the configured allowed roots, and resolves relative paths to AIDEN_DOWNLOADS_DIR. Returns a JSON summary including shape, column types, missing values, and a brief data preview.",
   "parameters": {
     "type": "object",
     "properties": {
