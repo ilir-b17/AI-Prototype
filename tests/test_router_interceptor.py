@@ -131,12 +131,10 @@ class TestExtractInlineToolCall:
         assert name == "run_terminal_command"
 
     def test_json_mixed_with_prose_prefix(self):
-        """JSON blob after prose text should still be found."""
+        """JSON embedded in prose must be ignored as non-dominant content."""
         text = 'I will search for you.\n{"tool_name": "web_search", "arguments": {"query": "test"}}'
         result = CognitiveRouter._extract_inline_tool_call(text)
-        assert result is not None
-        name, _ = result
-        assert name == "web_search"
+        assert result is None
 
     def test_no_tool_call_in_plain_text(self):
         text = "This is just a plain text response with no tool call."
@@ -153,7 +151,7 @@ class TestExtractInlineToolCall:
     # --- XML <tool_code> / <tool_call> wrapper format ---
 
     def test_xml_tool_code_tag_wrapping_json(self):
-        """Model wraps tool call JSON in <tool_code>…</tool_code> tags."""
+        """XML-wrapped JSON is ignored because it is not dominant JSON content."""
         text = (
             "Sure, let me look that up.\n"
             "<tool_code>\n"
@@ -161,13 +159,10 @@ class TestExtractInlineToolCall:
             "</tool_code>"
         )
         result = CognitiveRouter._extract_inline_tool_call(text)
-        assert result is not None
-        name, args = result
-        assert name == "web_search"
-        assert args["query"] == "Vienna weather"
+        assert result is None
 
     def test_xml_tool_code_tag_correctly_parses_tool_name(self):
-        """<tool_code> block with only tool_name (no args) must be parsed."""
+        """XML-wrapped tool_name blocks are ignored for safety."""
         text = (
             "Here is my answer.\n"
             "<tool_code>\n"
@@ -176,27 +171,21 @@ class TestExtractInlineToolCall:
             "Done."
         )
         result = CognitiveRouter._extract_inline_tool_call(text)
-        assert result is not None
-        name, _ = result
-        assert name == "get_system_info"
+        assert result is None
 
     def test_xml_tool_call_tag_alias(self):
-        """Some models use <tool_call> instead of <tool_code>."""
+        """Alias XML wrappers are ignored the same way as <tool_code>."""
         text = (
             "<tool_call>\n"
             '{"name": "web_search", "arguments": {"query": "hello"}}\n'
             "</tool_call>"
         )
         result = CognitiveRouter._extract_inline_tool_call(text)
-        assert result is not None
-        name, args = result
-        assert name == "web_search"
-        assert args["query"] == "hello"
+        assert result is None
 
     def test_xml_block_does_not_leak_into_result(self):
         """
-        When the tool call is embedded in XML tags, the JSON inside must be
-        found — verifying the parser doesn't choke on the surrounding XML.
+        XML wrapper text must prevent inline execution even if inner JSON is valid.
         """
         text = (
             "Let me check the price for you.\n"
@@ -205,10 +194,7 @@ class TestExtractInlineToolCall:
             "</tool_code>"
         )
         result = CognitiveRouter._extract_inline_tool_call(text)
-        assert result is not None
-        name, args = result
-        assert name == "get_stock_price"
-        assert args == {"ticker": "AAPL"}
+        assert result is None
 
 
 # ── _parse_native_tool_call ───────────────────────────────────────────────────

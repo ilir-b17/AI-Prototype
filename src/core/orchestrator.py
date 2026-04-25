@@ -268,6 +268,8 @@ class Orchestrator:
            connection and seed initial goals.
     """
 
+    _deprecated_energy_replenish_turn_warning_logged = False
+
     def __init__(
         self,
         vector_db_path: str = "data/chroma_storage",
@@ -306,6 +308,8 @@ class Orchestrator:
                 int(os.getenv("INITIAL_ENERGY_BUDGET", "100")),
             )
             self._predictive_energy_budget_lock: asyncio.Lock = asyncio.Lock()
+            self._predictive_energy_budget_last_replenished_at = time.time()
+            self._warn_deprecated_energy_replenish_turn_env_once()
 
             self.charter_text = self._load_charter()
             self._ready: asyncio.Event = asyncio.Event()
@@ -2106,6 +2110,60 @@ class Orchestrator:
             and getattr(self, "_predictive_energy_budget_lock", None) is not None
             and hasattr(self, "_predictive_energy_budget_remaining")
         )
+
+    @classmethod
+    def _warn_deprecated_energy_replenish_turn_env_once(cls) -> None:
+        if cls._deprecated_energy_replenish_turn_warning_logged:
+            return
+        if os.getenv("ENERGY_REPLENISH_PER_TURN") is None:
+            return
+        logger.warning(
+            "ENERGY_REPLENISH_PER_TURN is deprecated and ignored. Use ENERGY_REPLENISH_PER_HOUR instead."
+        )
+        cls._deprecated_energy_replenish_turn_warning_logged = True
+
+    @staticmethod
+    def _resolve_energy_replenish_per_hour() -> float:
+        raw_rate = str(os.getenv("ENERGY_REPLENISH_PER_HOUR", "30") or "").strip()
+        try:
+            rate = float(raw_rate)
+        except ValueError:
+            logger.warning(
+                "Invalid ENERGY_REPLENISH_PER_HOUR=%r. Falling back to 30.",
+                raw_rate,
+            )
+            rate = 30.0
+        return max(0.0, rate)
+
+    def _replenish_predictive_energy_budget_wallclock_locked(self, *, now: Optional[float] = None) -> int:
+        if not self._predictive_budget_tracking_available():
+            return 0
+
+        current_time = float(time.time() if now is None else now)
+        last_replenished_at = float(
+            getattr(self, "_predictive_energy_budget_last_replenished_at", current_time)
+        )
+        if current_time <= last_replenished_at:
+            return 0
+
+        replenish_per_hour = self._resolve_energy_replenish_per_hour()
+        if replenish_per_hour <= 0:
+            self._predictive_energy_budget_last_replenished_at = current_time
+            return 0
+
+        elapsed_seconds = current_time - last_replenished_at
+        replenishment_points = int(math.floor((elapsed_seconds / 3600.0) * replenish_per_hour))
+        if replenishment_points <= 0:
+            return 0
+
+        cap = max(0, int(os.getenv("INITIAL_ENERGY_BUDGET", "100")))
+        before = max(0, int(self._predictive_energy_budget_remaining))
+        after = min(cap, before + replenishment_points)
+        self._predictive_energy_budget_remaining = after
+
+        consumed_seconds = (float(replenishment_points) / replenish_per_hour) * 3600.0
+        self._predictive_energy_budget_last_replenished_at = last_replenished_at + consumed_seconds
+        return after - before
 
     async def _get_predictive_energy_budget_remaining(self) -> int:
         if not self._energy_gate_available():
@@ -5948,13 +6006,17 @@ class Orchestrator:
                     0,
                     int(os.getenv("INITIAL_ENERGY_BUDGET", "100")),
                 )
+            if not hasattr(self, "_predictive_energy_budget_last_replenished_at"):
+                self._predictive_energy_budget_last_replenished_at = time.time()
 
             async with self._predictive_energy_budget_lock:
-                replenishment = int(os.getenv("ENERGY_REPLENISH_PER_TURN", "5"))
-                cap = int(os.getenv("INITIAL_ENERGY_BUDGET", "100"))
-                self._predictive_energy_budget_remaining = min(
-                    self._predictive_energy_budget_remaining + replenishment, cap
-                )
+                replenished = self._replenish_predictive_energy_budget_wallclock_locked()
+                if replenished > 0:
+                    logger.info(
+                        "Predictive energy budget replenished by wall clock: +%s. Remaining=%s",
+                        replenished,
+                        self._predictive_energy_budget_remaining,
+                    )
 
             reply = await self._try_resume_mfa(user_id, normalized_user_message)
             if reply is not None:

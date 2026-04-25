@@ -75,9 +75,11 @@ def test_fix3_safe_subprocess_env_excludes_blocked_prefixes(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_fix5_replenish_applies_across_two_turns(monkeypatch):
+async def test_fix5_replenish_requires_elapsed_wall_clock_time(monkeypatch):
     monkeypatch.setenv("INITIAL_ENERGY_BUDGET", "200")
-    monkeypatch.setenv("ENERGY_REPLENISH_PER_TURN", "5")
+    monkeypatch.setenv("ENERGY_REPLENISH_PER_HOUR", "60")
+    monkeypatch.setenv("ENERGY_REPLENISH_PER_TURN", "999")  # deprecated no-op
+    monkeypatch.setattr("src.core.orchestrator.time.time", lambda: 1_000.0)
 
     orchestrator = Orchestrator.__new__(Orchestrator)
     orchestrator._ready = asyncio.Event()
@@ -89,6 +91,7 @@ async def test_fix5_replenish_applies_across_two_turns(monkeypatch):
     orchestrator._user_locks_lock = asyncio.Lock()
     orchestrator._predictive_energy_budget_lock = asyncio.Lock()
     orchestrator._predictive_energy_budget_remaining = 40
+    orchestrator._predictive_energy_budget_last_replenished_at = 1_000.0
 
     orchestrator._get_user_lock = AsyncMock(return_value=asyncio.Lock())
     orchestrator._try_resume_mfa = AsyncMock(return_value=None)
@@ -122,7 +125,7 @@ async def test_fix5_replenish_applies_across_two_turns(monkeypatch):
     assert resp2 == "ok"
 
     projected_without_replenish = initial_budget - 6
-    assert orchestrator._predictive_energy_budget_remaining == projected_without_replenish + 10
+    assert orchestrator._predictive_energy_budget_remaining == projected_without_replenish
 
 
 @pytest.mark.asyncio

@@ -656,6 +656,7 @@ class CognitiveRouter:
         self._system_1_wait_events = 0
         self._system_1_total_wait_seconds = 0.0
         self._system_1_peak_waiting_requests = 0
+        self._inline_tool_call_streak = 0
         self._system2_cooldown_until = 0.0
         # Optional callback to persist cooldown expiry to DB; set by Orchestrator.async_init.
         # The orchestrator callback schedules persistence through Orchestrator._fire_and_forget.
@@ -1171,40 +1172,60 @@ class CognitiveRouter:
         return {k: v for k, v in obj.items() if k not in known_meta}
 
     @staticmethod
-    def _extract_inline_tool_call(text: str) -> Optional[tuple]:
+    def _extract_inline_tool_call(
+        text: str,
+        *,
+        call_context: Optional[Dict[str, Any]] = None,
+    ) -> Optional[tuple]:
         """
         Fallback parser for models that embed tool call JSON inside the text
         ``content`` field instead of using the native ``tool_calls`` array.
 
-        Looks for a top-level JSON object containing a ``tool_name`` (or
-        ``name``) key whose value matches a known meta-tool pattern, plus an
-        optional ``arguments`` / ``parameters`` block.
+        Requires the JSON payload to be the dominant content of the message
+        (raw JSON or ```json fenced JSON) so prose examples are not executed.
 
         Returns ``(tool_name, arguments_dict)`` on success, or ``None`` if no
         recognisable inline tool call is found.
         """
+        if call_context and bool(call_context.get("inline_tool_call_blocked")):
+            return None
+
         if not text:
             return None
 
-        for raw in CognitiveRouter._find_json_blobs(text):
-            try:
-                obj = json.loads(raw)
-            except ValueError:
-                continue
+        candidate = str(text).strip()
+        if not candidate:
+            return None
 
-            if not isinstance(obj, dict):
-                continue
+        if candidate.startswith("```"):
+            fence_match = re.fullmatch(r"```(?:json)?\s*(.*?)\s*```", candidate, flags=re.IGNORECASE | re.DOTALL)
+            if fence_match is None:
+                return None
+            candidate = str(fence_match.group(1) or "").strip()
 
-            name_val = (
-                obj.get("tool_name") or obj.get("name")
-                or obj.get("function_call") or obj.get("tool_call")
-            )
-            if not isinstance(name_val, str) or not name_val.strip():
-                continue
+        if not candidate.startswith("{"):
+            return None
 
-            raw_args = CognitiveRouter._extract_args_from_blob(obj)
-            logger.debug(f"_extract_inline_tool_call: found '{name_val}' in content text")
-            return (name_val.strip(), raw_args)
+        try:
+            obj, end_index = json.JSONDecoder().raw_decode(candidate)
+        except ValueError:
+            return None
+
+        if candidate[end_index:].strip():
+            return None
+        if not isinstance(obj, dict):
+            return None
+
+        name_val = (
+            obj.get("tool_name") or obj.get("name")
+            or obj.get("function_call") or obj.get("tool_call")
+        )
+        if not isinstance(name_val, str) or not name_val.strip():
+            return None
+
+        raw_args = CognitiveRouter._extract_args_from_blob(obj)
+        logger.debug(f"_extract_inline_tool_call: found '{name_val}' in content text")
+        return (name_val.strip(), raw_args)
 
         return None
 
@@ -1819,7 +1840,16 @@ class CognitiveRouter:
             return RouterResult(status="ok", content=content)
         return RouterResult(status="ok", content="Tool(s) executed but model produced no response.")
 
-    async def _handle_text_response(self, message: dict) -> RouterResult:
+    async def _handle_text_response(
+        self,
+        message: dict,
+        *,
+        client=None,
+        model: str = "",
+        current_messages: Optional[List[Dict[str, Any]]] = None,
+        active_tools=None,
+        inline_call_context: Optional[Dict[str, Any]] = None,
+    ) -> RouterResult:
         """Handle a plain-text (no tool_calls) response message from Ollama."""
         if "content" not in message:
             return RouterResult(status="ok", content="[System 1 - Error]: Unexpected response format")
@@ -1829,15 +1859,40 @@ class CognitiveRouter:
             logger.warning("System 1 returned empty response")
             return RouterResult(status="ok", content="[System 1 - Error]: Empty response from model")
 
-        inline_tc = self._extract_inline_tool_call(result)
+        call_context = inline_call_context if inline_call_context is not None else {}
+        calls_executed = int(call_context.get("inline_calls_executed", 0) or 0)
+        call_limit = int(call_context.get("inline_call_limit", 1) or 1)
+        inline_blocked = bool(self._inline_tool_call_streak > 0 or calls_executed >= call_limit)
+
+        inline_tc = self._extract_inline_tool_call(
+            result,
+            call_context={"inline_tool_call_blocked": inline_blocked},
+        )
         if inline_tc:
             inline_name, inline_args = inline_tc
+            self._inline_tool_call_streak += 1
+            call_context["inline_calls_executed"] = calls_executed + 1
             logger.info(f"System 1 in-text tool call detected: {inline_name}")
+
+            if client is not None and model and current_messages is not None:
+                synthetic_message = {
+                    "content": "",
+                    "tool_calls": [{"function": {"name": inline_name, "arguments": inline_args}}],
+                }
+                return await self._run_tool_loop(
+                    client,
+                    model,
+                    synthetic_message,
+                    list(current_messages),
+                    active_tools,
+                )
+
             exec_result = await self._execute_tool(inline_name, inline_args)
             if exec_result.status != "ok":
                 return exec_result
             return RouterResult(status="ok", content=exec_result.content)
 
+        self._inline_tool_call_streak = 0
         logger.info(f"System 1 response received ({len(result)} chars)")
         return RouterResult(status="ok", content=result)
 
@@ -1860,6 +1915,11 @@ class CognitiveRouter:
                 client = self._get_or_create_ollama_client()
                 active_tools = self._format_ollama_tools(allowed_tools) or None
                 prepared_messages = self._prepare_system_1_messages(messages)
+                self._inline_tool_call_streak = 0
+                inline_call_context = {
+                    "inline_calls_executed": 0,
+                    "inline_call_limit": 1,
+                }
                 response, available_model = await self._call_ollama_with_model_fallback(
                     client,
                     prepared_messages,
@@ -1880,7 +1940,14 @@ class CognitiveRouter:
                         active_tools,
                     )
 
-                return await self._handle_text_response(message)
+                return await self._handle_text_response(
+                    message,
+                    client=client,
+                    model=available_model,
+                    current_messages=list(prepared_messages),
+                    active_tools=active_tools,
+                    inline_call_context=inline_call_context,
+                )
 
         except asyncio.TimeoutError:
             error_msg = (
