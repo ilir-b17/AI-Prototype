@@ -1703,11 +1703,27 @@ class LedgerMemory:
     async def load_pending_approvals(self) -> dict:
         """Return {user_id: {synthesis, original_input}} for all pending approvals."""
         import json
+        ttl_seconds = int(os.getenv("PENDING_STATE_TTL_SECONDS", "86400"))
         async with self._lock:
             cursor = await self._db.execute(
-                "SELECT user_id, synthesis_json, original_input, created_at FROM pending_tool_approvals"
+                "SELECT user_id, synthesis_json, original_input, created_at "
+                "FROM pending_tool_approvals "
+                "WHERE created_at > datetime('now', '-' || ? || ' seconds')",
+                (ttl_seconds,),
             )
             rows = await cursor.fetchall()
+            stale_cursor = await self._db.execute(
+                "DELETE FROM pending_tool_approvals "
+                "WHERE created_at <= datetime('now', '-' || ? || ' seconds')",
+                (ttl_seconds,),
+            )
+            stale_count = int(stale_cursor.rowcount or 0)
+            if stale_count > 0:
+                await self._db.commit()
+                logger.warning(
+                    "Pruned %d stale row(s) from pending_tool_approvals during load_pending_approvals.",
+                    stale_count,
+                )
 
         def _to_epoch(value) -> float:
             if isinstance(value, (int, float)):
@@ -2030,11 +2046,27 @@ class LedgerMemory:
     async def load_hitl_states(self) -> dict:
         """Return {user_id: state_dict} for all persisted HITL states."""
         import json as _json
+        ttl_seconds = int(os.getenv("PENDING_STATE_TTL_SECONDS", "86400"))
         async with self._lock:
             cursor = await self._db.execute(
-                "SELECT user_id, state_json, created_at FROM pending_hitl_states"
+                "SELECT user_id, state_json, created_at "
+                "FROM pending_hitl_states "
+                "WHERE created_at > datetime('now', '-' || ? || ' seconds')",
+                (ttl_seconds,),
             )
             rows = await cursor.fetchall()
+            stale_cursor = await self._db.execute(
+                "DELETE FROM pending_hitl_states "
+                "WHERE created_at <= datetime('now', '-' || ? || ' seconds')",
+                (ttl_seconds,),
+            )
+            stale_count = int(stale_cursor.rowcount or 0)
+            if stale_count > 0:
+                await self._db.commit()
+                logger.warning(
+                    "Pruned %d stale row(s) from pending_hitl_states during load_hitl_states.",
+                    stale_count,
+                )
 
         def _to_epoch(value) -> float:
             if isinstance(value, (int, float)):
@@ -2109,11 +2141,27 @@ class LedgerMemory:
     async def load_mfa_states(self) -> dict:
         """Return {user_id: {name, arguments, _created_at}} for all persisted MFA states."""
         import json as _json
+        ttl_seconds = int(os.getenv("PENDING_STATE_TTL_SECONDS", "86400"))
         async with self._lock:
             cursor = await self._db.execute(
-                "SELECT user_id, tool_name, arguments_json, created_at FROM pending_mfa_states"
+                "SELECT user_id, tool_name, arguments_json, created_at "
+                "FROM pending_mfa_states "
+                "WHERE created_at > datetime('now', '-' || ? || ' seconds')",
+                (ttl_seconds,),
             )
             rows = await cursor.fetchall()
+            stale_cursor = await self._db.execute(
+                "DELETE FROM pending_mfa_states "
+                "WHERE created_at <= datetime('now', '-' || ? || ' seconds')",
+                (ttl_seconds,),
+            )
+            stale_count = int(stale_cursor.rowcount or 0)
+            if stale_count > 0:
+                await self._db.commit()
+                logger.warning(
+                    "Pruned %d stale row(s) from pending_mfa_states during load_mfa_states.",
+                    stale_count,
+                )
 
         def _to_epoch(value) -> float:
             if isinstance(value, (int, float)):
