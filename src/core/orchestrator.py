@@ -4472,6 +4472,15 @@ class Orchestrator:
         return min(max(timeout_seconds, 1.0), 15.0)
 
     @staticmethod
+    def _get_max_syntheses_per_user_per_hour() -> int:
+        raw_value = os.getenv("MAX_SYNTHESES_PER_USER_PER_HOUR", "5")
+        try:
+            budget = int(raw_value)
+        except ValueError:
+            budget = 5
+        return max(1, budget)
+
+    @staticmethod
     def _extract_pytest_counts(output_text: str) -> Dict[str, int]:
         """Extract pass/fail/error counts from pytest textual output."""
         counts = {
@@ -4995,17 +5004,50 @@ class Orchestrator:
             last_test_result=last_test_result,
         )
 
-    async def _count_prior_failed_synthesis_runs(self, suggested_tool_name: str) -> int:
-        counter = getattr(self.ledger_memory, "count_synthesis_runs_by_tool_status", None)
+    async def _count_prior_failed_synthesis_runs(self, suggested_tool_name: str) -> tuple[int, int]:
+        exact_counter = getattr(self.ledger_memory, "count_synthesis_runs_by_tool_status", None)
+        fuzzy_counter = getattr(self.ledger_memory, "count_synthesis_failures_fuzzy", None)
+
+        exact_count = 0
+        if callable(exact_counter):
+            try:
+                exact_count = int(
+                    await exact_counter(
+                        suggested_tool_name=str(suggested_tool_name or ""),
+                        statuses=["blocked", "rejected"],
+                    )
+                )
+            except Exception as exc:
+                logger.warning("Could not query exact prior synthesis failures for %s: %s", suggested_tool_name, exc)
+
+        fuzzy_count = 0
+        if callable(fuzzy_counter):
+            try:
+                fuzzy_count = int(
+                    await fuzzy_counter(
+                        str(suggested_tool_name or ""),
+                        threshold=0.75,
+                        window_hours=24,
+                    )
+                )
+            except Exception as exc:
+                logger.warning("Could not query fuzzy prior synthesis failures for %s: %s", suggested_tool_name, exc)
+
+        return max(0, exact_count), max(0, fuzzy_count)
+
+    async def _count_recent_synthesis_runs_for_user(self, user_id: str, *, window_hours: int = 1) -> int:
+        counter = getattr(self.ledger_memory, "count_synthesis_runs_for_user_window", None)
         if not callable(counter):
             return 0
         try:
-            return await counter(
-                suggested_tool_name=str(suggested_tool_name or ""),
-                statuses=["blocked", "rejected"],
+            return int(
+                await counter(
+                    user_id=str(user_id or ""),
+                    window_hours=max(1, int(window_hours or 1)),
+                )
             )
         except Exception as exc:
-            logger.warning("Could not query prior synthesis failures for %s: %s", suggested_tool_name, exc)
+            logger.warning("Could not query per-user synthesis budget usage for %s: %s", user_id, exc)
             return 0
 
     async def tool_synthesis_node(
@@ -5032,7 +5074,16 @@ class Orchestrator:
                 "cannot synthesise a new tool right now. Please configure GROQ_API_KEY."
             )
 
-        prior_failed_runs = await self._count_prior_failed_synthesis_runs(suggested_tool_name)
+        hourly_budget = self._get_max_syntheses_per_user_per_hour()
+        recent_runs = await self._count_recent_synthesis_runs_for_user(user_id, window_hours=1)
+        if recent_runs >= hourly_budget:
+            return (
+                "HITL REQUIRED: Per-user synthesis budget exhausted "
+                f"({hourly_budget} per hour). Manual intervention needed."
+            )
+
+        exact_failed_runs, fuzzy_failed_runs = await self._count_prior_failed_synthesis_runs(suggested_tool_name)
+        prior_failed_runs = max(exact_failed_runs, fuzzy_failed_runs)
         if prior_failed_runs >= 2:
             return (
                 "HITL REQUIRED: This capability has been attempted "

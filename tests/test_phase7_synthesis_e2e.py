@@ -259,6 +259,142 @@ async def test_phase7_repeated_synthesis_failures_require_manual_intervention(tm
 
 
 @pytest.mark.asyncio
+async def test_phase7_fuzzy_name_failures_require_manual_intervention(tmp_path: Path):
+    ledger = LedgerMemory(db_path=str(tmp_path / "phase7_fuzzy_failures.db"))
+    await ledger.initialize()
+    try:
+        run_id_1 = await ledger.create_synthesis_run(
+            user_id="phase7-user",
+            gap_description="Need weather helper",
+            suggested_tool_name="weather_fetch",
+            original_input="Please add weather helper",
+            max_retries=3,
+        )
+        await ledger.update_synthesis_run_status(run_id_1, status="blocked")
+
+        run_id_2 = await ledger.create_synthesis_run(
+            user_id="phase7-user",
+            gap_description="Need weather helper",
+            suggested_tool_name="weather_fetch_v2",
+            original_input="Please add weather helper again",
+            max_retries=3,
+        )
+        await ledger.update_synthesis_run_status(run_id_2, status="rejected")
+
+        orchestrator = Orchestrator.__new__(Orchestrator)
+        orchestrator.ledger_memory = ledger
+        orchestrator.pending_tool_approval = {}
+
+        router = MagicMock()
+        router.get_system_2_available.return_value = True
+        orchestrator.cognitive_router = router
+        orchestrator._execute_synthesis_repair_loop = AsyncMock(return_value={"status": "passed"})
+
+        state = {"user_id": "phase7-user", "user_input": "Please add a weather helper."}
+        router_result = RouterResult(
+            status="capability_gap",
+            gap_description="Need a weather helper tool.",
+            suggested_tool_name="fetch_weather",
+        )
+
+        message = await Orchestrator.tool_synthesis_node(orchestrator, state, router_result)
+
+        assert "This capability has been attempted 2 times without success. Manual intervention needed." in message
+        orchestrator._execute_synthesis_repair_loop.assert_not_awaited()
+    finally:
+        await ledger.close()
+
+
+@pytest.mark.asyncio
+async def test_phase7_fuzzy_failure_count_uses_sliding_24h_window(tmp_path: Path):
+    ledger = LedgerMemory(db_path=str(tmp_path / "phase7_fuzzy_window.db"))
+    await ledger.initialize()
+    try:
+        old_run_id = await ledger.create_synthesis_run(
+            user_id="phase7-user",
+            gap_description="Need weather helper",
+            suggested_tool_name="weather_fetch",
+            original_input="Please add weather helper",
+            max_retries=3,
+        )
+        await ledger.update_synthesis_run_status(old_run_id, status="rejected")
+
+        recent_run_id = await ledger.create_synthesis_run(
+            user_id="phase7-user",
+            gap_description="Need weather helper",
+            suggested_tool_name="weather_fetch_v2",
+            original_input="Please add weather helper again",
+            max_retries=3,
+        )
+        await ledger.update_synthesis_run_status(recent_run_id, status="blocked")
+
+        async with ledger._lock:
+            await ledger._db.execute(
+                "UPDATE synthesis_runs SET created_at = datetime('now', '-25 hours') WHERE id = ?",
+                (old_run_id,),
+            )
+            await ledger._db.commit()
+
+        count_24h = await ledger.count_synthesis_failures_fuzzy("fetch_weather", window_hours=24)
+        count_48h = await ledger.count_synthesis_failures_fuzzy("fetch_weather", window_hours=48)
+
+        assert count_24h == 1
+        assert count_48h == 2
+    finally:
+        await ledger.close()
+
+
+@pytest.mark.asyncio
+async def test_phase7_per_user_hourly_synthesis_budget_blocks_new_run(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.setenv("MAX_SYNTHESES_PER_USER_PER_HOUR", "2")
+
+    ledger = LedgerMemory(db_path=str(tmp_path / "phase7_user_budget.db"))
+    await ledger.initialize()
+    try:
+        await ledger.create_synthesis_run(
+            user_id="phase7-user",
+            gap_description="Need helper A",
+            suggested_tool_name="helper_a",
+            original_input="Please add helper A",
+            max_retries=3,
+        )
+        await ledger.create_synthesis_run(
+            user_id="phase7-user",
+            gap_description="Need helper B",
+            suggested_tool_name="helper_b",
+            original_input="Please add helper B",
+            max_retries=3,
+        )
+
+        orchestrator = Orchestrator.__new__(Orchestrator)
+        orchestrator.ledger_memory = ledger
+        orchestrator.pending_tool_approval = {}
+
+        router = MagicMock()
+        router.get_system_2_available.return_value = True
+        orchestrator.cognitive_router = router
+        orchestrator._execute_synthesis_repair_loop = AsyncMock(return_value={"status": "passed"})
+
+        state = {"user_id": "phase7-user", "user_input": "Please add helper C."}
+        router_result = RouterResult(
+            status="capability_gap",
+            gap_description="Need helper C.",
+            suggested_tool_name="helper_c",
+        )
+
+        message = await Orchestrator.tool_synthesis_node(orchestrator, state, router_result)
+
+        assert "HITL REQUIRED" in message
+        assert "synthesis budget" in message.lower()
+        orchestrator._execute_synthesis_repair_loop.assert_not_awaited()
+    finally:
+        await ledger.close()
+
+
+@pytest.mark.asyncio
 async def test_retired_tools_are_excluded_from_approved_load_list(tmp_path: Path):
     ledger = LedgerMemory(db_path=str(tmp_path / "phase8_tool_retirement.db"))
     await ledger.initialize()

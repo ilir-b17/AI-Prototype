@@ -10,7 +10,9 @@ import os
 import asyncio
 import logging
 import json
+import re
 from datetime import datetime
+from difflib import SequenceMatcher
 from typing import List, Dict, Any, Optional, Tuple
 from enum import Enum
 
@@ -2050,6 +2052,92 @@ class LedgerMemory:
                 "SELECT COUNT(*) AS run_count FROM synthesis_runs "
                 "WHERE suggested_tool_name = ? AND status IN (" + placeholders + ")",
                 tuple(params),
+            )
+            row = await cursor.fetchone()
+        return int((row["run_count"] if row is not None else 0) or 0)
+
+    @staticmethod
+    def _normalize_synthesis_tool_name(name: str, *, sort_tokens: bool = False) -> str:
+        lowered = re.sub(r"[^a-z0-9]+", " ", str(name or "").lower()).strip()
+        if not lowered:
+            return ""
+        tokens = [token for token in lowered.split() if token]
+        if sort_tokens:
+            tokens = sorted(tokens)
+        return "_".join(tokens)
+
+    async def count_synthesis_failures_fuzzy(
+        self,
+        name: str,
+        threshold: float = 0.75,
+        window_hours: int = 24,
+    ) -> int:
+        target_name = str(name or "").strip()
+        if not target_name:
+            return 0
+
+        try:
+            ratio_threshold = float(threshold)
+        except (TypeError, ValueError):
+            ratio_threshold = 0.75
+        ratio_threshold = max(0.0, min(1.0, ratio_threshold))
+
+        try:
+            hours = int(window_hours)
+        except (TypeError, ValueError):
+            hours = 24
+        hours = max(1, hours)
+
+        async with self._lock:
+            cursor = await self._db.execute(
+                "SELECT suggested_tool_name FROM synthesis_runs "
+                "WHERE status IN ('blocked', 'rejected') "
+                "AND created_at >= datetime('now', '-' || ? || ' hours')",
+                (hours,),
+            )
+            rows = await cursor.fetchall()
+
+        target_normalized = self._normalize_synthesis_tool_name(target_name, sort_tokens=False)
+        target_token_sorted = self._normalize_synthesis_tool_name(target_name, sort_tokens=True)
+
+        if not target_normalized:
+            return 0
+
+        matches = 0
+        for row in rows:
+            candidate_raw = str(row["suggested_tool_name"] or "").strip()
+            candidate_normalized = self._normalize_synthesis_tool_name(candidate_raw, sort_tokens=False)
+            if not candidate_normalized:
+                continue
+            candidate_token_sorted = self._normalize_synthesis_tool_name(candidate_raw, sort_tokens=True)
+            direct_ratio = SequenceMatcher(None, target_normalized, candidate_normalized).ratio()
+            token_ratio = SequenceMatcher(None, target_token_sorted, candidate_token_sorted).ratio()
+            if max(direct_ratio, token_ratio) >= ratio_threshold:
+                matches += 1
+        return matches
+
+    async def count_synthesis_runs_for_user_window(
+        self,
+        *,
+        user_id: str,
+        window_hours: int = 1,
+    ) -> int:
+        normalized_user_id = str(user_id or "").strip()
+        if not normalized_user_id:
+            return 0
+
+        try:
+            hours = int(window_hours)
+        except (TypeError, ValueError):
+            hours = 1
+        hours = max(1, hours)
+
+        async with self._lock:
+            cursor = await self._db.execute(
+                "SELECT COUNT(*) AS run_count FROM synthesis_runs "
+                "WHERE user_id = ? "
+                "AND created_at >= datetime('now', '-' || ? || ' hours')",
+                (normalized_user_id, hours),
             )
             row = await cursor.fetchone()
         return int((row["run_count"] if row is not None else 0) or 0)
