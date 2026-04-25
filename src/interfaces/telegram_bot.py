@@ -160,6 +160,24 @@ async def _drain_outbound_queue(bot, queue: asyncio.Queue) -> None:
         queue.task_done()
 
 
+async def _drain_background_tasks(orchestrator_inst: "Orchestrator", timeout: float = 5.0) -> None:
+    """Best-effort drain of orchestrator fire-and-forget tasks before resource shutdown."""
+    background_tasks = list(getattr(orchestrator_inst, "_background_tasks", set()) or [])
+    if not background_tasks:
+        return
+
+    gather_future = asyncio.gather(*background_tasks, return_exceptions=True)
+    try:
+        await asyncio.wait_for(asyncio.shield(gather_future), timeout=timeout)
+    except asyncio.TimeoutError:
+        undrained = sum(1 for task in background_tasks if not task.done())
+        logger.warning(
+            "Orchestrator background task drain timed out after %.1fs; %d background task(s) did not drain in time.",
+            timeout,
+            undrained,
+        )
+
+
 async def _send_admin_outbound_payload(bot, payload) -> None:
     if not isinstance(payload, dict):
         await bot.send_message(
@@ -837,6 +855,9 @@ async def _async_run(application: Application, orchestrator_inst: "Orchestrator"
                 )
             except asyncio.TimeoutError:
                 logger.warning("Background tasks did not cancel in time — forcing exit.")
+
+            # Let fire-and-forget persistence writes finish before closing resources.
+            await _drain_background_tasks(orchestrator_inst, timeout=5.0)
 
             # Close async resources
             for coro in (

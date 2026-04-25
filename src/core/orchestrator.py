@@ -5459,7 +5459,23 @@ class Orchestrator:
         caps = core.get("known_capabilities", "")
         await self.core_memory.update("known_capabilities", f"{caps}, {tool_name}".lstrip(", "))
         logger.info("Tool '%s' approved, registered, and logged to core memory", tool_name)
-        retry = await self.process_message(original_state["user_input"], user_id)
+
+        retry_payload = self._coerce_user_prompt_payload(
+            original_state.get("user_prompt", original_state.get("user_input", ""))
+        )
+        retry_message = str(retry_payload.get("text") or "").strip()
+        if not retry_message and bool(self._extract_audio_bytes(retry_payload)):
+            retry_message = _VOICE_INPUT_PLACEHOLDER
+            retry_payload["text"] = retry_message
+        elif not retry_message:
+            retry_message = str(original_state.get("user_input") or "").strip()
+            retry_payload["text"] = retry_message
+
+        retry = await self._run_user_turn_locked(
+            user_id=user_id,
+            user_message=retry_message,
+            user_prompt=retry_payload,
+        )
         return f"✅ Tool '{tool_name}' deployed.\n\n{retry}"
 
     async def _handle_synthesized_tool_deploy_failure(
@@ -5748,6 +5764,52 @@ class Orchestrator:
         finally:
             self._finalizing_turn_failed = False
 
+    async def _run_user_turn_locked(
+        self,
+        user_id: str,
+        user_message: str,
+        user_prompt: Dict[str, Any],
+    ) -> str:
+        """Run one user turn while assuming the per-user lock is already held."""
+        has_audio_prompt = bool(self._extract_audio_bytes(user_prompt))
+
+        state = await self._load_state(
+            user_id,
+            user_message,
+            user_prompt=user_prompt,
+        )
+        if state.get("final_response") and not state.get("current_plan"):
+            return self.cognitive_router.sanitize_response(state["final_response"])
+
+        if not has_audio_prompt:
+            await self._apply_text_memory_hooks(user_id, user_message)
+        else:
+            logger.info("Audio prompt detected for %s; bypassing text-only fast-path memory hooks.", user_id)
+
+        if not has_audio_prompt:
+            reply = await self._try_goal_planning_response(state)
+            if reply is not None:
+                return await self._finalize_user_response(user_id, user_message, reply)
+
+            reply = await self._try_fast_path_response(state)
+            if reply is not None:
+                return await self._finalize_user_response(user_id, user_message, reply)
+
+        try:
+            return await self._run_graph_loop(state, user_id, user_message)
+        except RequiresHITLError as hitl_err:
+            state["_hitl_question"] = str(hitl_err)
+            state["_hitl_created_at"] = time.time()
+            pending_state = self._strip_audio_bytes_for_persistence(state)
+            self.pending_hitl_state[user_id] = pending_state
+            # Persist so the state survives a bot restart (ISSUE-013)
+            self._fire_and_forget(self.ledger_memory.save_hitl_state(user_id, pending_state))
+            return str(hitl_err)
+        except Exception as e:
+            logger.error(f"Graph execution failed: {e}", exc_info=True)
+            state["_turn_failed"] = True
+            return "An internal error occurred."
+
     async def process_message(self, user_message: Any, user_id: str) -> str:
         """Main entry point: State Graph execution with Energy Budget."""
         user_prompt = self._coerce_user_prompt_payload(user_message)
@@ -5799,42 +5861,11 @@ class Orchestrator:
             if reply is not None:
                 return reply
 
-            state = await self._load_state(
-                user_id,
-                normalized_user_message,
+            return await self._run_user_turn_locked(
+                user_id=user_id,
+                user_message=normalized_user_message,
                 user_prompt=user_prompt,
             )
-            if state.get("final_response") and not state.get("current_plan"):
-                return self.cognitive_router.sanitize_response(state["final_response"])
-
-            if not has_audio_prompt:
-                await self._apply_text_memory_hooks(user_id, normalized_user_message)
-            else:
-                logger.info("Audio prompt detected for %s; bypassing text-only fast-path memory hooks.", user_id)
-
-            if not has_audio_prompt:
-                reply = await self._try_goal_planning_response(state)
-                if reply is not None:
-                    return await self._finalize_user_response(user_id, normalized_user_message, reply)
-
-                reply = await self._try_fast_path_response(state)
-                if reply is not None:
-                    return await self._finalize_user_response(user_id, normalized_user_message, reply)
-
-            try:
-                return await self._run_graph_loop(state, user_id, normalized_user_message)
-            except RequiresHITLError as hitl_err:
-                state["_hitl_question"] = str(hitl_err)
-                state["_hitl_created_at"] = time.time()
-                pending_state = self._strip_audio_bytes_for_persistence(state)
-                self.pending_hitl_state[user_id] = pending_state
-                # Persist so the state survives a bot restart (ISSUE-013)
-                self._fire_and_forget(self.ledger_memory.save_hitl_state(user_id, pending_state))
-                return str(hitl_err)
-            except Exception as e:
-                logger.error(f"Graph execution failed: {e}", exc_info=True)
-                state["_turn_failed"] = True
-                return "An internal error occurred."
 
     async def _handle_blocked_result(
         self,
