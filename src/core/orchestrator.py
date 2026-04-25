@@ -312,6 +312,7 @@ class Orchestrator:
             self.pending_mfa: Dict[str, dict] = {}
             self.pending_hitl_state: Dict[str, dict] = {}
             self.pending_tool_approval: Dict[str, dict] = {}
+            self._admin_user_id = str(os.getenv("ADMIN_USER_ID", "")).strip()
             self._synthesis_in_progress: set[str] = set()
             self._consolidation_turn_counts: Dict[str, int] = {}
             self.outbound_queue: Optional[asyncio.Queue] = None
@@ -3564,6 +3565,10 @@ class Orchestrator:
             )
             return
 
+        if self._has_pending_heartbeat_hitl(task_id) or self._has_pending_heartbeat_mfa(task_id):
+            logger.info("Heartbeat: Task #%s paused awaiting admin guidance.", task_id)
+            return
+
         if self._heartbeat_result_indicates_failure(result):
             await self._handle_heartbeat_task_failure(
                 task,
@@ -5095,6 +5100,73 @@ class Orchestrator:
             return None
         return task_id if task_id > 0 else None
 
+    @staticmethod
+    def _coerce_positive_task_id(raw_task_id: Any) -> Optional[int]:
+        try:
+            task_id = int(raw_task_id)
+        except (TypeError, ValueError):
+            return None
+        return task_id if task_id > 0 else None
+
+    def _get_admin_user_id(self) -> str:
+        admin_user_id = str(getattr(self, "_admin_user_id", "") or "").strip()
+        if not admin_user_id:
+            admin_user_id = str(os.getenv("ADMIN_USER_ID", "") or "").strip()
+        if not admin_user_id:
+            admin_user_id = "heartbeat"
+        self._admin_user_id = admin_user_id
+        return admin_user_id
+
+    def _extract_heartbeat_origin_task_id_from_state(self, state: Dict[str, Any]) -> Optional[int]:
+        existing_task_id = self._coerce_positive_task_id(state.get("_heartbeat_origin_task_id"))
+        if existing_task_id is not None:
+            state["_heartbeat_origin_task_id"] = existing_task_id
+            return existing_task_id
+
+        if str(state.get("user_id") or "") != "heartbeat":
+            return None
+
+        parsed_task_id = self._extract_heartbeat_task_id(str(state.get("user_input") or ""))
+        if parsed_task_id is not None:
+            state["_heartbeat_origin_task_id"] = parsed_task_id
+        return parsed_task_id
+
+    def _pending_owner_for_heartbeat_origin(self, user_id: str, state: Dict[str, Any]) -> str:
+        heartbeat_task_id = self._extract_heartbeat_origin_task_id_from_state(state)
+        if heartbeat_task_id is None:
+            return user_id
+        return self._get_admin_user_id()
+
+    def _has_pending_heartbeat_hitl(self, task_id: int) -> bool:
+        pending_hitl_state = getattr(self, "pending_hitl_state", {}) or {}
+        for pending_state in pending_hitl_state.values():
+            if self._coerce_positive_task_id(pending_state.get("_heartbeat_origin_task_id")) == task_id:
+                return True
+        return False
+
+    def _has_pending_heartbeat_mfa(self, task_id: int) -> bool:
+        pending_mfa = getattr(self, "pending_mfa", {}) or {}
+        for pending_state in pending_mfa.values():
+            if self._coerce_positive_task_id(pending_state.get("_heartbeat_origin_task_id")) == task_id:
+                return True
+        return False
+
+    async def _finalize_resumed_heartbeat_task(self, task_id: int, response: str) -> None:
+        if self._heartbeat_result_indicates_failure(response):
+            await self._handle_heartbeat_task_failure(
+                {
+                    "id": task_id,
+                    "title": f"Task #{task_id}",
+                },
+                reason="post_hitl_resume_failure",
+                result_excerpt=response,
+            )
+            return
+
+        await self.ledger_memory.update_objective_status(task_id, "completed")
+        await self._clear_heartbeat_failure_count(task_id)
+        logger.info("Heartbeat: Task #%s completed after HITL resume.", task_id)
+
     async def _suspend_task_for_moral_halt(self, state: Dict[str, Any]) -> Optional[int]:
         task_id = self._extract_heartbeat_task_id(str(state.get("user_input") or ""))
         if task_id is None:
@@ -5338,6 +5410,7 @@ class Orchestrator:
         if user_id not in self.pending_mfa:
             return None
         pending_tool = self.pending_mfa[user_id]
+        heartbeat_task_id = self._coerce_positive_task_id(pending_tool.get("_heartbeat_origin_task_id"))
         age = time.time() - pending_tool.get("_created_at", 0)
         if age > _PENDING_STATE_TTL_SECONDS:
             del self.pending_mfa[user_id]
@@ -5347,13 +5420,27 @@ class Orchestrator:
         del self.pending_mfa[user_id]
         self._fire_and_forget(self.ledger_memory.clear_mfa_state(user_id))
         if not verify_mfa_challenge(user_message):
-            return "Error: MFA authorization failed. Action aborted."
+            failure_msg = "Error: MFA authorization failed. Action aborted."
+            if heartbeat_task_id is not None:
+                await self._finalize_resumed_heartbeat_task(heartbeat_task_id, failure_msg)
+            return failure_msg
         exec_result = await self.cognitive_router._execute_tool(
             pending_tool["name"], pending_tool["arguments"]
         )
         if exec_result.status == "ok":
+            if heartbeat_task_id is not None:
+                await self._finalize_resumed_heartbeat_task(heartbeat_task_id, exec_result.content)
             return exec_result.content
-        return await self._handle_blocked_result(exec_result, pending_tool.get("user_id", user_id), {})
+        blocked_state = {
+            "user_id": pending_tool.get("user_id", user_id),
+        }
+        if heartbeat_task_id is not None:
+            blocked_state["_heartbeat_origin_task_id"] = heartbeat_task_id
+        return await self._handle_blocked_result(
+            exec_result,
+            pending_tool.get("user_id", user_id),
+            blocked_state,
+        )
 
     async def _pop_pending_tool_approval_payload(self, user_id: str) -> Optional[Dict[str, Any]]:
         if user_id not in self.pending_tool_approval:
@@ -5578,6 +5665,10 @@ class Orchestrator:
                 state["user_prompt"] = dict(user_prompt or {})
                 state["current_plan"] = []
                 state["_energy_gate_cleared"] = False
+                state["_resumed_from_hitl"] = True
+                heartbeat_task_id = self._extract_heartbeat_origin_task_id_from_state(state)
+                if heartbeat_task_id is not None:
+                    state["_heartbeat_origin_task_id"] = heartbeat_task_id
                 # Track how many HITL cycles have been spent on this task (ISSUE-005)
                 state["hitl_count"] = state.get("hitl_count", 0) + 1
                 # Cap recharge to 75 so energy budget is never fully restored — this
@@ -5778,32 +5869,44 @@ class Orchestrator:
             user_message,
             user_prompt=user_prompt,
         )
+        effective_user_id = user_id
+        heartbeat_task_id = self._extract_heartbeat_origin_task_id_from_state(state)
+        if heartbeat_task_id is not None:
+            effective_user_id = "heartbeat"
+
         if state.get("final_response") and not state.get("current_plan"):
             return self.cognitive_router.sanitize_response(state["final_response"])
 
         if not has_audio_prompt:
-            await self._apply_text_memory_hooks(user_id, user_message)
+            await self._apply_text_memory_hooks(effective_user_id, user_message)
         else:
-            logger.info("Audio prompt detected for %s; bypassing text-only fast-path memory hooks.", user_id)
+            logger.info("Audio prompt detected for %s; bypassing text-only fast-path memory hooks.", effective_user_id)
 
         if not has_audio_prompt:
             reply = await self._try_goal_planning_response(state)
             if reply is not None:
-                return await self._finalize_user_response(user_id, user_message, reply)
+                return await self._finalize_user_response(effective_user_id, user_message, reply)
 
             reply = await self._try_fast_path_response(state)
             if reply is not None:
-                return await self._finalize_user_response(user_id, user_message, reply)
+                return await self._finalize_user_response(effective_user_id, user_message, reply)
 
         try:
-            return await self._run_graph_loop(state, user_id, user_message)
+            response = await self._run_graph_loop(state, effective_user_id, user_message)
+            if bool(state.get("_resumed_from_hitl")) and heartbeat_task_id is not None:
+                if not self._has_pending_heartbeat_hitl(heartbeat_task_id) and not self._has_pending_heartbeat_mfa(heartbeat_task_id):
+                    await self._finalize_resumed_heartbeat_task(heartbeat_task_id, response)
+            return response
         except RequiresHITLError as hitl_err:
             state["_hitl_question"] = str(hitl_err)
             state["_hitl_created_at"] = time.time()
+            pending_user_id = self._pending_owner_for_heartbeat_origin(user_id, state)
             pending_state = self._strip_audio_bytes_for_persistence(state)
-            self.pending_hitl_state[user_id] = pending_state
+            self.pending_hitl_state[pending_user_id] = pending_state
             # Persist so the state survives a bot restart (ISSUE-013)
-            self._fire_and_forget(self.ledger_memory.save_hitl_state(user_id, pending_state))
+            self._fire_and_forget(self.ledger_memory.save_hitl_state(pending_user_id, pending_state))
+            if heartbeat_task_id is not None:
+                await self._notify_admin(str(hitl_err))
             return str(hitl_err)
         except Exception as e:
             logger.error(f"Graph execution failed: {e}", exc_info=True)
@@ -5878,23 +5981,36 @@ class Orchestrator:
         registering any pending MFA / HITL / tool-synthesis state as needed.
         """
         if result.status == "mfa_required":
-            self.pending_mfa[user_id] = {
+            pending_owner_id = self._pending_owner_for_heartbeat_origin(user_id, state)
+            heartbeat_task_id = self._extract_heartbeat_origin_task_id_from_state(state)
+            pending_entry = {
                 "name": result.mfa_tool_name,
                 "arguments": result.mfa_arguments,
+                "user_id": str(state.get("user_id") or user_id),
                 "_created_at": time.time(),
             }
+            if heartbeat_task_id is not None:
+                pending_entry["_heartbeat_origin_task_id"] = heartbeat_task_id
+
+            self.pending_mfa[pending_owner_id] = pending_entry
             self._fire_and_forget(
-                self.ledger_memory.save_mfa_state(user_id, result.mfa_tool_name, result.mfa_arguments)
+                self.ledger_memory.save_mfa_state(pending_owner_id, result.mfa_tool_name, result.mfa_arguments)
             )
             return "SECURITY LOCK: Provide the authorization passphrase to continue."
 
         if result.status == "hitl_required":
+            pending_owner_id = self._pending_owner_for_heartbeat_origin(user_id, state)
+            heartbeat_task_id = self._extract_heartbeat_origin_task_id_from_state(state)
             state["_hitl_question"] = result.hitl_message
             state["_hitl_created_at"] = time.time()
+            if heartbeat_task_id is not None:
+                state["_heartbeat_origin_task_id"] = heartbeat_task_id
             pending_state = self._strip_audio_bytes_for_persistence(state)
-            self.pending_hitl_state[user_id] = pending_state
+            self.pending_hitl_state[pending_owner_id] = pending_state
             # Persist so the HITL state survives a bot restart (ISSUE-013)
-            self._fire_and_forget(self.ledger_memory.save_hitl_state(user_id, pending_state))
+            self._fire_and_forget(self.ledger_memory.save_hitl_state(pending_owner_id, pending_state))
+            if heartbeat_task_id is not None:
+                await self._notify_admin(result.hitl_message)
             return result.hitl_message
 
         if result.status == "capability_gap":
