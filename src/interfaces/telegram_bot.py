@@ -43,6 +43,10 @@ def _parse_int_env(name: str, default: int) -> int:
         return default
 
 
+def _resolve_outbound_queue_max_size() -> int:
+    return max(1, _parse_int_env("OUTBOUND_QUEUE_MAX_SIZE", 200))
+
+
 LOG_MAX_BYTES = _parse_int_env("LOG_MAX_BYTES", 10 * 1024 * 1024)
 LOG_BACKUP_COUNT = _parse_int_env("LOG_BACKUP_COUNT", 5)
 
@@ -177,6 +181,39 @@ async def _drain_outbound_queue(bot, queue: asyncio.Queue) -> None:
                 str(message)[:120],
             )
         queue.task_done()
+
+
+def _enqueue_outbound_with_drop_oldest(queue: asyncio.Queue, payload, *, source: str) -> bool:
+    try:
+        queue.put_nowait(payload)
+        return True
+    except asyncio.QueueFull:
+        dropped_payload = None
+        try:
+            dropped_payload = queue.get_nowait()
+            try:
+                queue.task_done()
+            except ValueError:
+                pass
+        except asyncio.QueueEmpty:
+            pass
+
+        logger.warning(
+            "Dropped oldest outbound payload at %s because queue is full (maxsize=%s, dropped_type=%s).",
+            source,
+            getattr(queue, "maxsize", "unknown"),
+            type(dropped_payload).__name__ if dropped_payload is not None else "none",
+        )
+
+        try:
+            queue.put_nowait(payload)
+            return True
+        except asyncio.QueueFull:
+            logger.error(
+                "Could not enqueue outbound payload at %s after dropping oldest.",
+                source,
+            )
+            return False
 
 
 async def _drain_background_tasks(orchestrator_inst: "Orchestrator", timeout: float = 5.0) -> None:
@@ -798,7 +835,7 @@ async def _async_run(application: Application, orchestrator_inst: "Orchestrator"
         except Exception as e:
             logger.warning(f"delete_webhook failed (non-fatal): {e}")
 
-        outbound_queue: asyncio.Queue = asyncio.Queue()
+        outbound_queue: asyncio.Queue = asyncio.Queue(maxsize=_resolve_outbound_queue_max_size())
         orchestrator_inst.outbound_queue = outbound_queue
 
         # Async-init the orchestrator
@@ -823,8 +860,10 @@ async def _async_run(application: Application, orchestrator_inst: "Orchestrator"
                 "_hitl_question",
                 "A task is awaiting your guidance. Please reply to continue.",
             )
-            await outbound_queue.put(
-                f"\u26a0\ufe0f AIDEN restarted — pending task restored:\n\n{_question}"
+            _enqueue_outbound_with_drop_oldest(
+                outbound_queue,
+                f"\u26a0\ufe0f AIDEN restarted — pending task restored:\n\n{_question}",
+                source="async_run_pending_hitl_restore",
             )
 
         _heartbeat_task = asyncio.create_task(orchestrator_inst._heartbeat_loop())

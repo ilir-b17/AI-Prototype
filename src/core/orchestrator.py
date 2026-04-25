@@ -40,6 +40,7 @@ import sys
 import tempfile
 import time
 import weakref
+from collections import OrderedDict
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass
 from datetime import datetime
@@ -209,10 +210,12 @@ _HEARTBEAT_FAILURE_STRIKES = int(os.getenv("HEARTBEAT_FAILURE_STRIKES", "3"))
 _HEARTBEAT_FAILURE_STATE_KEY = "heartbeat_task_failure_counts"
 HEARTBEAT_TASK_PREFIX_FMT = "[HEARTBEAT TASK #{task_id}]"
 _INTENT_CLASSIFIER_CACHE_TTL_SECONDS = 300.0
+_INTENT_CLASSIFIER_CACHE_MAX_SIZE_DEFAULT = 256
 _INTENT_CLASSIFIER_TIMEOUT_SECONDS = 10.0
 _INTENT_CLASSIFIER_MAX_OUTPUT_TOKENS = 60
 _USER_INTENTS = frozenset({"capability_query", "task", "profile_update", "casual"})
 _HEARTBEAT_REPLENISH_ENV_DEFAULT = 2
+_CONSOLIDATION_TURN_COUNT_MAX_USERS = 100
 _EXPLICIT_MEMORY_REQUEST_RE = re.compile(
     r"\b(?:remember\s+that|remember\s+my|don'?t\s+forget|please\s+remember|save\s+that|note\s+that)\b",
     flags=re.IGNORECASE,
@@ -355,7 +358,8 @@ class Orchestrator:
             self.pending_tool_approval: Dict[str, dict] = {}
             self._admin_user_id = str(os.getenv("ADMIN_USER_ID", "")).strip()
             self._synthesis_in_progress: Dict[str, float] = {}
-            self._consolidation_turn_counts: Dict[str, int] = {}
+            self._consolidation_turn_counts: "OrderedDict[str, int]" = OrderedDict()
+            self._intent_classification_cache: "OrderedDict[str, tuple[float, str]]" = OrderedDict()
             self.outbound_queue: Optional[asyncio.Queue] = None
             self.sensory_state: Dict[str, str] = {}
             # Background task registry — holds strong references to prevent GC (ISSUE-002)
@@ -1130,26 +1134,78 @@ class Orchestrator:
             return "task"
         return "casual"
 
-    def _get_cached_user_intent(self, cache_key: str) -> Optional[str]:
+    @staticmethod
+    def _resolve_positive_int_env(name: str, default: int) -> int:
+        raw = str(os.getenv(name, str(default))).strip()
+        try:
+            value = int(raw)
+        except (TypeError, ValueError):
+            return int(default)
+        return value if value > 0 else int(default)
+
+    @classmethod
+    def _intent_classifier_cache_max_size(cls) -> int:
+        return cls._resolve_positive_int_env(
+            "INTENT_CLASSIFIER_CACHE_MAX_SIZE",
+            _INTENT_CLASSIFIER_CACHE_MAX_SIZE_DEFAULT,
+        )
+
+    @staticmethod
+    def _evict_ordered_mapping_to_size(
+        mapping: "OrderedDict[Any, Any]",
+        max_size: int,
+        *,
+        label: str,
+    ) -> None:
+        while len(mapping) > max_size:
+            evicted_key, _ = mapping.popitem(last=False)
+            logger.warning(
+                "%s exceeded max size (%s); evicted least-recently-used key: %s",
+                label,
+                max_size,
+                evicted_key,
+            )
+
+    def _coerce_intent_cache(self) -> "OrderedDict[str, tuple[float, str]]":
         cache = getattr(self, "_intent_classification_cache", None)
-        if not isinstance(cache, dict):
-            self._intent_classification_cache = {}
-            return None
+        if isinstance(cache, OrderedDict):
+            return cache
+        if isinstance(cache, dict):
+            ordered = OrderedDict(cache.items())
+        else:
+            ordered = OrderedDict()
+        self._intent_classification_cache = ordered
+        self._evict_ordered_mapping_to_size(
+            ordered,
+            self._intent_classifier_cache_max_size(),
+            label="Intent classifier cache",
+        )
+        return ordered
+
+    def _get_cached_user_intent(self, cache_key: str) -> Optional[str]:
+        cache = self._coerce_intent_cache()
         cached = cache.get(cache_key)
         if not cached:
+            return None
+        if not isinstance(cached, (tuple, list)) or len(cached) != 2:
+            cache.pop(cache_key, None)
             return None
         expires_at, intent = cached
         if float(expires_at) <= time.time():
             cache.pop(cache_key, None)
             return None
+        cache.move_to_end(cache_key)
         return str(intent)
 
     def _cache_user_intent(self, cache_key: str, intent: str) -> None:
-        cache = getattr(self, "_intent_classification_cache", None)
-        if not isinstance(cache, dict):
-            cache = {}
-            self._intent_classification_cache = cache
+        cache = self._coerce_intent_cache()
         cache[cache_key] = (time.time() + _INTENT_CLASSIFIER_CACHE_TTL_SECONDS, intent)
+        cache.move_to_end(cache_key)
+        self._evict_ordered_mapping_to_size(
+            cache,
+            self._intent_classifier_cache_max_size(),
+            label="Intent classifier cache",
+        )
 
     @staticmethod
     def _build_intent_classifier_messages(user_message: str) -> List[Dict[str, str]]:
@@ -3527,12 +3583,49 @@ class Orchestrator:
 
         return state
 
-    async def _notify_admin(self, message: str) -> None:
+    def _enqueue_outbound_payload(self, payload: Any, *, source: str) -> bool:
+        queue = getattr(self, "outbound_queue", None)
+        if queue is None:
+            logger.info("[Admin notification (no queue)]: %s", payload)
+            return False
+
+        try:
+            queue.put_nowait(payload)
+            return True
+        except asyncio.QueueFull:
+            dropped_payload = None
+            try:
+                dropped_payload = queue.get_nowait()
+                try:
+                    queue.task_done()
+                except ValueError:
+                    pass
+            except asyncio.QueueEmpty:
+                pass
+
+            logger.warning(
+                "Dropped oldest outbound message because queue is full "
+                "(source=%s, maxsize=%s, dropped_type=%s).",
+                source,
+                getattr(queue, "maxsize", "unknown"),
+                type(dropped_payload).__name__ if dropped_payload is not None else "none",
+            )
+
+            try:
+                queue.put_nowait(payload)
+                return True
+            except asyncio.QueueFull:
+                logger.error(
+                    "Failed to enqueue outbound payload after dropping oldest message "
+                    "(source=%s).",
+                    source,
+                )
+                return False
+
+    async def _notify_admin(self, message: Any) -> None:
         """Send a message to the admin via the outbound queue (used by heartbeat)."""
-        if self.outbound_queue is not None:
-            await self.outbound_queue.put(message)
-        else:
-            logger.info(f"[Admin notification (no queue)]: {message}")
+        self._enqueue_outbound_payload(message, source="notify_admin")
+        await asyncio.sleep(0)
 
     @staticmethod
     def _heartbeat_result_indicates_failure(result: str) -> bool:
@@ -3862,12 +3955,105 @@ class Orchestrator:
                 except Exception as e:
                     logger.error(f"Heartbeat error: {e}", exc_info=True)
 
+    @staticmethod
+    def _is_pending_entry_expired(
+        entry: Any,
+        *,
+        created_at_key: str,
+        ttl_seconds: int,
+        now_epoch: float,
+    ) -> bool:
+        payload = entry if isinstance(entry, dict) else {}
+        try:
+            created_at = float(payload.get(created_at_key, 0) or 0)
+        except (TypeError, ValueError):
+            created_at = 0.0
+        if created_at <= 0:
+            return True
+        return (now_epoch - created_at) > float(ttl_seconds)
+
+    def _purge_expired_pending_in_memory(
+        self,
+        *,
+        attr_name: str,
+        created_at_key: str,
+        ttl_seconds: int,
+        now_epoch: float,
+    ) -> int:
+        pending_store = getattr(self, attr_name, None)
+        if not isinstance(pending_store, dict):
+            return 0
+
+        expired_users = [
+            user_id
+            for user_id, payload in pending_store.items()
+            if self._is_pending_entry_expired(
+                payload,
+                created_at_key=created_at_key,
+                ttl_seconds=ttl_seconds,
+                now_epoch=now_epoch,
+            )
+        ]
+        for user_id in expired_users:
+            pending_store.pop(user_id, None)
+        if expired_users:
+            logger.warning(
+                "Swept %d expired in-memory pending entries from %s.",
+                len(expired_users),
+                attr_name,
+            )
+        return len(expired_users)
+
+    async def _sweep_expired_pending_state(self) -> None:
+        ttl_seconds = self._resolve_positive_int_env(
+            "PENDING_STATE_TTL_SECONDS",
+            _PENDING_STATE_TTL_SECONDS,
+        )
+
+        db_deleted: Dict[str, int] = {}
+        purge_pending = getattr(self.ledger_memory, "purge_expired_pending", None)
+        if callable(purge_pending):
+            try:
+                db_deleted = await purge_pending(ttl_seconds=ttl_seconds)
+            except Exception as e:
+                logger.warning("Pending-state DB sweep failed: %s", e)
+
+        now_epoch = time.time()
+        mem_deleted = {
+            "pending_tool_approval": self._purge_expired_pending_in_memory(
+                attr_name="pending_tool_approval",
+                created_at_key="_created_at",
+                ttl_seconds=ttl_seconds,
+                now_epoch=now_epoch,
+            ),
+            "pending_hitl_state": self._purge_expired_pending_in_memory(
+                attr_name="pending_hitl_state",
+                created_at_key="_hitl_created_at",
+                ttl_seconds=ttl_seconds,
+                now_epoch=now_epoch,
+            ),
+            "pending_mfa": self._purge_expired_pending_in_memory(
+                attr_name="pending_mfa",
+                created_at_key="_created_at",
+                ttl_seconds=ttl_seconds,
+                now_epoch=now_epoch,
+            ),
+        }
+
+        if any(int(value or 0) > 0 for value in db_deleted.values()) or any(mem_deleted.values()):
+            logger.info(
+                "Pending-state sweep complete. DB deleted=%s in-memory deleted=%s",
+                db_deleted,
+                mem_deleted,
+            )
+
     async def _memory_consolidation_loop(self) -> None:
         """Background task: periodically consolidate chat history into long-term memory."""
         logger.info("Memory consolidation loop started.")
         while True:
             await asyncio.sleep(MEMORY_CONSOLIDATION_INTERVAL)
             try:
+                await self._sweep_expired_pending_state()
                 user_ids = await self.ledger_memory.get_recent_user_ids(limit=20)
                 if not user_ids:
                     continue
@@ -3978,6 +4164,7 @@ class Orchestrator:
                 self.pending_tool_approval[user_id] = {
                     "synthesis": payload["synthesis"],
                     "original_state": {"user_input": payload["original_input"], "user_id": user_id},
+                    "_created_at": float(payload.get("_created_at", time.time())),
                 }
             if pending:
                 logger.info(f"Restored {len(pending)} pending tool approval(s) from DB")
@@ -4038,15 +4225,31 @@ class Orchestrator:
             logger.warning("Failed to restore heartbeat failure counts: %s", e)
             self._heartbeat_failure_counts = {}
 
+    def _coerce_consolidation_turn_counts(self) -> "OrderedDict[str, int]":
+        counts = getattr(self, "_consolidation_turn_counts", None)
+        if isinstance(counts, OrderedDict):
+            return counts
+        if isinstance(counts, dict):
+            ordered = OrderedDict(counts.items())
+        else:
+            ordered = OrderedDict()
+        self._consolidation_turn_counts = ordered
+        self._evict_ordered_mapping_to_size(
+            ordered,
+            _CONSOLIDATION_TURN_COUNT_MAX_USERS,
+            label="Consolidation turn counts",
+        )
+        return ordered
+
     async def _restore_consolidation_turn_counts(self) -> None:
         prefix = "consolidation_turn_count:"
-        restored: Dict[str, int] = {}
+        restored: "OrderedDict[str, int]" = OrderedDict()
         if not hasattr(self, "_consolidation_turn_counts"):
-            self._consolidation_turn_counts = {}
+            self._consolidation_turn_counts = OrderedDict()
 
         getter = getattr(self.ledger_memory, "get_system_state_keys_by_prefix", None)
         if not callable(getter):
-            self._consolidation_turn_counts = restored
+            self._consolidation_turn_counts = OrderedDict()
             return
 
         try:
@@ -4068,11 +4271,12 @@ class Orchestrator:
                 restored[user_id] = max(0, count)
 
             self._consolidation_turn_counts = restored
-            if restored:
-                logger.info("Restored %d consolidation turn counter(s) from DB", len(restored))
+            bounded_counts = self._coerce_consolidation_turn_counts()
+            if bounded_counts:
+                logger.info("Restored %d consolidation turn counter(s) from DB", len(bounded_counts))
         except Exception as e:
             logger.warning("Failed to restore consolidation turn counts: %s", e)
-            self._consolidation_turn_counts = {}
+            self._consolidation_turn_counts = OrderedDict()
 
     async def _persist_heartbeat_failure_counts(self) -> None:
         payload = {
@@ -5999,16 +6203,22 @@ class Orchestrator:
         except Exception as e:
             logger.warning(f"Failed to save chat turn for {user_id}: {e}")
 
-        if not hasattr(self, "_consolidation_turn_counts"):
-            self._consolidation_turn_counts = {}
+        counts = self._coerce_consolidation_turn_counts()
 
         trigger_turns = max(1, _CONSOLIDATION_TRIGGER_TURNS)
-        new_count = self._consolidation_turn_counts.get(user_id, 0) + 1
-        self._consolidation_turn_counts[user_id] = new_count
+        new_count = int(counts.get(user_id, 0)) + 1
+        counts[user_id] = new_count
+        counts.move_to_end(user_id)
+        self._evict_ordered_mapping_to_size(
+            counts,
+            _CONSOLIDATION_TURN_COUNT_MAX_USERS,
+            label="Consolidation turn counts",
+        )
         self._persist_consolidation_turn_count_async(user_id, new_count)
 
         if new_count >= trigger_turns:
-            self._consolidation_turn_counts[user_id] = 0
+            counts[user_id] = 0
+            counts.move_to_end(user_id)
             self._persist_consolidation_turn_count_async(user_id, 0)
             self._fire_and_forget(self._consolidate_memory(user_id))
 
@@ -6381,8 +6591,7 @@ class Orchestrator:
         try:
             async def _run_synthesis() -> None:
                 hitl_prompt = await self.tool_synthesis_node(state, result)
-                if self.outbound_queue is not None:
-                    await self.outbound_queue.put(hitl_prompt)
+                await self._notify_admin(hitl_prompt)
 
             await asyncio.wait_for(
                 _run_synthesis(),

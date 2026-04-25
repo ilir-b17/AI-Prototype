@@ -45,6 +45,36 @@ async def _refund_predictive_budget_for_completion(task_id: int, ledger: Any) ->
     except Exception:
         return 0
 
+
+async def _clear_heartbeat_failure_for_completion(task_id: int, ledger: Any) -> bool:
+    """Clear persisted heartbeat failure count when a Task is completed via this skill."""
+    try:
+        context: Dict[str, Any] = await ledger.get_task_with_parent_context(task_id)
+    except Exception:
+        return False
+    if not context:
+        return False
+
+    task = dict(context.get("task") or {})
+    if str(task.get("tier") or "").strip() != "Task":
+        return False
+    if str(task.get("status") or "").strip().lower() != "completed":
+        return False
+
+    try:
+        from src.core.runtime_context import get_orchestrator
+
+        orchestrator = get_orchestrator()
+        clear_fn = getattr(orchestrator, "_clear_heartbeat_failure_count", None)
+        if not callable(clear_fn):
+            return False
+
+        await clear_fn(task_id)
+        logger.info("Cleared heartbeat failure strikes for task %s via update_objective_status.", task_id)
+        return True
+    except Exception:
+        return False
+
 async def update_objective_status(task_id: int, new_status: str) -> str:
     logger.info(f"update_objective_status: id={task_id} -> {new_status}")
 
@@ -78,6 +108,7 @@ async def update_objective_status(task_id: int, new_status: str) -> str:
         refund_amount = 0
         if str(new_status).strip().lower() == "completed":
             refund_amount = await _refund_predictive_budget_for_completion(task_id, ledger)
+            await _clear_heartbeat_failure_for_completion(task_id, ledger)
 
         message = f"Objective {task_id} marked as '{new_status}'."
         if refund_amount > 0:

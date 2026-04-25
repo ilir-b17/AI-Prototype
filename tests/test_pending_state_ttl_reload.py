@@ -115,3 +115,56 @@ async def test_load_mfa_states_honors_env_ttl_override(tmp_path: Path, monkeypat
         assert await _fetch_user_ids(ledger, "pending_mfa_states") == []
     finally:
         await ledger.close()
+
+
+@pytest.mark.asyncio
+async def test_purge_expired_pending_removes_only_stale_rows(tmp_path: Path) -> None:
+    ledger = await _create_ledger(tmp_path, "pending_purge.db")
+    try:
+        async with ledger._lock:
+            await ledger._db.execute(
+                "INSERT INTO pending_tool_approvals (user_id, synthesis_json, original_input, created_at) "
+                "VALUES (?, ?, ?, datetime('now'))",
+                ("fresh-approval", json.dumps({"tool_name": "new_tool"}), "build tool"),
+            )
+            await ledger._db.execute(
+                "INSERT INTO pending_tool_approvals (user_id, synthesis_json, original_input, created_at) "
+                "VALUES (?, ?, ?, datetime('now', '-2 days'))",
+                ("stale-approval", json.dumps({"tool_name": "old_tool"}), "stale tool"),
+            )
+
+            await ledger._db.execute(
+                "INSERT INTO pending_hitl_states (user_id, state_json, created_at) "
+                "VALUES (?, ?, datetime('now'))",
+                ("fresh-hitl", json.dumps({"workflow": "ok"})),
+            )
+            await ledger._db.execute(
+                "INSERT INTO pending_hitl_states (user_id, state_json, created_at) "
+                "VALUES (?, ?, datetime('now', '-2 days'))",
+                ("stale-hitl", json.dumps({"workflow": "old"})),
+            )
+
+            await ledger._db.execute(
+                "INSERT INTO pending_mfa_states (user_id, tool_name, arguments_json, created_at) "
+                "VALUES (?, ?, ?, datetime('now'))",
+                ("fresh-mfa", "request_core_update", json.dumps({"k": "v"})),
+            )
+            await ledger._db.execute(
+                "INSERT INTO pending_mfa_states (user_id, tool_name, arguments_json, created_at) "
+                "VALUES (?, ?, ?, datetime('now', '-2 days'))",
+                ("stale-mfa", "request_core_update", json.dumps({"k": "v"})),
+            )
+            await ledger._db.commit()
+
+        deleted = await ledger.purge_expired_pending(ttl_seconds=86400)
+
+        assert deleted == {
+            "pending_tool_approvals": 1,
+            "pending_hitl_states": 1,
+            "pending_mfa_states": 1,
+        }
+        assert await _fetch_user_ids(ledger, "pending_tool_approvals") == ["fresh-approval"]
+        assert await _fetch_user_ids(ledger, "pending_hitl_states") == ["fresh-hitl"]
+        assert await _fetch_user_ids(ledger, "pending_mfa_states") == ["fresh-mfa"]
+    finally:
+        await ledger.close()

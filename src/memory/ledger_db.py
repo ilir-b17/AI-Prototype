@@ -1683,6 +1683,38 @@ class LedgerMemory:
             await self._db.commit()
             return int(cursor.rowcount or 0)
 
+    async def purge_expired_pending(self, ttl_seconds: int) -> Dict[str, int]:
+        """Delete stale pending-state rows from all pending tables and return per-table counts."""
+        ttl = max(1, int(ttl_seconds))
+        table_names = [
+            "pending_tool_approvals",
+            "pending_hitl_states",
+            "pending_mfa_states",
+        ]
+        deleted_by_table: Dict[str, int] = {table_name: 0 for table_name in table_names}
+
+        async with self._lock:
+            for table_name in table_names:
+                cursor = await self._db.execute(
+                    f"DELETE FROM {table_name} "
+                    "WHERE created_at <= datetime('now', '-' || ? || ' seconds')",
+                    (ttl,),
+                )
+                deleted_by_table[table_name] = int(cursor.rowcount or 0)
+
+            if any(count > 0 for count in deleted_by_table.values()):
+                await self._db.commit()
+
+        for table_name, deleted_count in deleted_by_table.items():
+            if deleted_count > 0:
+                logger.warning(
+                    "Purged %d stale row(s) from %s.",
+                    deleted_count,
+                    table_name,
+                )
+
+        return deleted_by_table
+
     # ─────────────────────────────────────────────────────────────
     # Pending Tool Approvals  (survive bot restarts)
     # ─────────────────────────────────────────────────────────────

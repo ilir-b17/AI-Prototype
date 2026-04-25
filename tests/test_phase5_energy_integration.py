@@ -193,3 +193,35 @@ async def test_completion_updates_refund_predictive_budget_after_success_streak(
     finally:
         set_runtime_context(None, None, None, None)
         await ledger.close()
+
+
+@pytest.mark.asyncio
+async def test_completion_update_clears_persisted_heartbeat_failure_strikes(tmp_path: Path) -> None:
+    ledger = LedgerMemory(db_path=str(tmp_path / "phase8_completion_clear_heartbeat.db"))
+    await ledger.initialize()
+    try:
+        epic_id = await ledger.add_objective(tier="Epic", title="Clear Strikes Epic")
+        story_id = await ledger.add_objective(tier="Story", title="Clear Strikes Story", parent_id=epic_id)
+        task_id = await ledger.add_objective(
+            tier="Task",
+            title="Clear Strikes Task",
+            parent_id=story_id,
+        )
+
+        orchestrator = Orchestrator.__new__(Orchestrator)
+        orchestrator.ledger_memory = ledger
+        orchestrator._heartbeat_failure_counts = {task_id: 2}
+        await Orchestrator._persist_heartbeat_failure_counts(orchestrator)
+
+        set_runtime_context(ledger, None, None, orchestrator)
+        payload = json.loads(await update_objective_status_skill(task_id, "completed"))
+
+        assert payload["status"] == "success"
+        assert task_id not in orchestrator._heartbeat_failure_counts
+
+        persisted = await ledger.get_system_state("heartbeat_task_failure_counts")
+        decoded = json.loads(str(persisted or "{}"))
+        assert str(task_id) not in decoded
+    finally:
+        set_runtime_context(None, None, None, None)
+        await ledger.close()
