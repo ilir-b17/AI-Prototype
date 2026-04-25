@@ -1258,6 +1258,13 @@ class CognitiveRouter:
         minutes, seconds = divmod(remaining, 60)
         return f"Rate limited. Retry in {minutes}m{seconds}s."
 
+    def _groq_cooldown_active(self) -> tuple[bool, str]:
+        cooldown_until = float(getattr(self, "_system2_cooldown_until", 0.0) or 0.0)
+        if cooldown_until and time.time() < cooldown_until:
+            msg = self._format_cooldown_message() or "Rate limited. Please try again later."
+            return True, msg
+        return False, ""
+
     async def _call_ollama_with_model_fallback(
         self,
         client,
@@ -2584,8 +2591,8 @@ Rules:
         Route to System 2. Priority: Ollama Cloud > Groq > Gemini.
         Returns a :class:`RouterResult` — never raises for security intercepts.
         """
-        if self._system2_cooldown_until and time.time() < self._system2_cooldown_until:
-            msg = self._format_cooldown_message() or "Rate limited. Please try again later."
+        cooldown_active, msg = self._groq_cooldown_active()
+        if cooldown_active:
             return RouterResult(status="ok", content=f"[System 2 - Error]: {msg}")
 
         sanitized_messages = self._prepare_system_2_messages(messages)
@@ -2797,7 +2804,9 @@ Rules:
         match = re.search(r"try again in (\d+)m(\d+(?:\.\d+)?)s", err_text)
         if match:
             cooldown_seconds = int(match.group(1)) * 60 + int(float(match.group(2)))
-        self._system2_cooldown_until = time.time() + cooldown_seconds
+        current_cooldown_until = float(getattr(self, "_system2_cooldown_until", 0.0) or 0.0)
+        parsed_cooldown_until = time.time() + cooldown_seconds
+        self._system2_cooldown_until = max(current_cooldown_until, parsed_cooldown_until)
         # Persist cooldown so it survives a bot restart
         if self._persist_cooldown_cb is not None:
             try:
@@ -3037,6 +3046,10 @@ Rules:
         allowed_tools: Optional[List[str]] = None
     ) -> RouterResult:
         """Route to Groq API (llama-3.3-70b or configured model) with full tool calling."""
+        cooldown_active, msg = self._groq_cooldown_active()
+        if cooldown_active:
+            return RouterResult(status="ok", content=f"[System 2 - Error]: {msg}")
+
         logger.info(f"Routing to System 2 (Groq/{self.groq_model})")
         try:
             response = await self._create_groq_completion(messages, allowed_tools=allowed_tools)
