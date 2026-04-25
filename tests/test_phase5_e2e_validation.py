@@ -114,8 +114,8 @@ async def test_phase5_slice6_e2e_heartbeat_energy_gating_budget_and_rollup(tmp_p
         first_prompt = orchestrator.process_message.await_args_list[0].kwargs["user_message"]
         assert f"[HEARTBEAT TASK #{task_b_id}]" in first_prompt
 
-        # B effort=2 with multiplier=1 => cost=2.
-        assert orchestrator._predictive_energy_budget_remaining == 18
+        # Heartbeat replenishes +2 then task B costs 2 => net unchanged.
+        assert orchestrator._predictive_energy_budget_remaining == 20
 
         # Roll-up should reflect one of two tasks completed.
         rollup_after_cycle_1 = await ledger.get_objective_hierarchy_rollup(epic_id=epic_id)
@@ -135,8 +135,8 @@ async def test_phase5_slice6_e2e_heartbeat_energy_gating_budget_and_rollup(tmp_p
         assert await _fetch_status(ledger, story_id) == "completed"
         assert await _fetch_status(ledger, epic_id) == "completed"
 
-        # A effort=9 with multiplier=1 => additional cost=9.
-        assert orchestrator._predictive_energy_budget_remaining == 9
+        # Second cycle replenishes +2 then task A costs 9.
+        assert orchestrator._predictive_energy_budget_remaining == 13
 
         rollup_after_cycle_2 = await ledger.get_objective_hierarchy_rollup(epic_id=epic_id)
         story_rollup_2 = next(item for item in rollup_after_cycle_2 if item["id"] == story_id)

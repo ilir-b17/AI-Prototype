@@ -83,8 +83,8 @@ async def test_heartbeat_defers_low_roi_then_executes_high_roi_and_charges_once(
         heartbeat_prompt = orchestrator.process_message.await_args.kwargs["user_message"]
         assert f"[HEARTBEAT TASK #{high_roi_task_id}]" in heartbeat_prompt
 
-        # Only the executed task should consume budget: effort=2, multiplier=3 => predicted_cost=6.
-        assert orchestrator._predictive_energy_budget_remaining == 14
+        # Heartbeat replenishes +2 before dispatch, then executed task consumes 6.
+        assert orchestrator._predictive_energy_budget_remaining == 16
 
         # Deferred tasks must not trigger strike/block handling.
         assert low_roi_task_id not in orchestrator._heartbeat_failure_counts

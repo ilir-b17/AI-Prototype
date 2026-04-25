@@ -5,6 +5,25 @@ State Graph with Energy Budget, Proactive Heartbeat, and Charter enforcement.
 Passes a State Dictionary between specialized nodes until task is complete,
 exhausted (energy = 0), or blocked (HITL required).
 
+Energy budget model summary:
+- Per-turn budget (state energy): Deducted while executing supervisor/workers/critic
+    in a single user turn. Refunds are applied on operation timeout/failure to avoid
+    charging for incomplete work.
+- Predictive budget (cross-turn): A global pacing budget used by ad-hoc and heartbeat
+    dispatch to prevent over-commitment.
+- Replenishment cadence:
+    - User-turn wall-clock replenishment is calculated in process_message.
+    - Heartbeat-cycle replenishment is applied at the top of _run_heartbeat_cycle via
+        ENERGY_REPLENISH_PER_HEARTBEAT.
+- Predictive refunds:
+    - Successful completion updates can refund predictive budget according to the
+        configured reward policy.
+    - Failures and blocked parallel branches refund unused reserved predictive budget.
+- Deferral and cooldown behavior:
+    - When ROI or reserve constraints fail, tasks are marked deferred_due_to_energy.
+    - defer_count and next_eligible_at are recorded so repeated deferrals eventually
+        receive fairness boosts and cooldown-aware re-evaluation.
+
 HITL retry contract: Maximum 3 critic rejections per HITL cycle,
 maximum 3 HITL cycles per task, after which the task is abandoned.
 """
@@ -193,6 +212,7 @@ _INTENT_CLASSIFIER_CACHE_TTL_SECONDS = 300.0
 _INTENT_CLASSIFIER_TIMEOUT_SECONDS = 10.0
 _INTENT_CLASSIFIER_MAX_OUTPUT_TOKENS = 60
 _USER_INTENTS = frozenset({"capability_query", "task", "profile_update", "casual"})
+_HEARTBEAT_REPLENISH_ENV_DEFAULT = 2
 _EXPLICIT_MEMORY_REQUEST_RE = re.compile(
     r"\b(?:remember\s+that|remember\s+my|don'?t\s+forget|please\s+remember|save\s+that|note\s+that)\b",
     flags=re.IGNORECASE,
@@ -2156,7 +2176,54 @@ class Orchestrator:
             rate = 30.0
         return max(0.0, rate)
 
-    def _replenish_predictive_energy_budget_wallclock_locked(self, *, now: Optional[float] = None) -> int:
+    @staticmethod
+    def _resolve_energy_replenish_per_heartbeat() -> int:
+        raw_value = str(
+            os.getenv("ENERGY_REPLENISH_PER_HEARTBEAT", str(_HEARTBEAT_REPLENISH_ENV_DEFAULT)) or ""
+        ).strip()
+        try:
+            amount = int(raw_value)
+        except ValueError:
+            logger.warning(
+                "Invalid ENERGY_REPLENISH_PER_HEARTBEAT=%r. Falling back to %s.",
+                raw_value,
+                _HEARTBEAT_REPLENISH_ENV_DEFAULT,
+            )
+            amount = _HEARTBEAT_REPLENISH_ENV_DEFAULT
+        return max(0, amount)
+
+    def _apply_predictive_energy_tick_locked(self, amount: int) -> int:
+        if amount <= 0 or not self._predictive_budget_tracking_available():
+            return 0
+
+        cap = max(0, int(os.getenv("INITIAL_ENERGY_BUDGET", "100")))
+        before = max(0, int(self._predictive_energy_budget_remaining))
+        after = min(cap, before + int(amount))
+        self._predictive_energy_budget_remaining = after
+        return after - before
+
+    async def _tick_predictive_energy_budget(self, amount: int, reason: str) -> int:
+        if amount <= 0 or not self._predictive_budget_tracking_available():
+            return 0
+
+        async with self._predictive_energy_budget_lock:
+            applied = self._apply_predictive_energy_tick_locked(int(amount))
+            remaining = max(0, int(self._predictive_energy_budget_remaining))
+
+        if applied > 0:
+            logger.info(
+                "Predictive energy budget replenished: +%s (%s). Remaining=%s",
+                applied,
+                reason,
+                remaining,
+            )
+        return applied
+
+    def _compute_predictive_energy_replenishment_points_wallclock_locked(
+        self,
+        *,
+        now: Optional[float] = None,
+    ) -> int:
         if not self._predictive_budget_tracking_available():
             return 0
 
@@ -2177,14 +2244,13 @@ class Orchestrator:
         if replenishment_points <= 0:
             return 0
 
-        cap = max(0, int(os.getenv("INITIAL_ENERGY_BUDGET", "100")))
-        before = max(0, int(self._predictive_energy_budget_remaining))
-        after = min(cap, before + replenishment_points)
-        self._predictive_energy_budget_remaining = after
-
         consumed_seconds = (float(replenishment_points) / replenish_per_hour) * 3600.0
         self._predictive_energy_budget_last_replenished_at = last_replenished_at + consumed_seconds
-        return after - before
+        return replenishment_points
+
+    def _replenish_predictive_energy_budget_wallclock_locked(self, *, now: Optional[float] = None) -> int:
+        replenishment_points = self._compute_predictive_energy_replenishment_points_wallclock_locked(now=now)
+        return self._apply_predictive_energy_tick_locked(replenishment_points)
 
     async def _get_predictive_energy_budget_remaining(self) -> int:
         if not self._energy_gate_available():
@@ -2201,15 +2267,17 @@ class Orchestrator:
     async def _refund_predictive_energy_budget(self, amount: int, reason: str) -> None:
         if amount <= 0 or not self._predictive_budget_tracking_available():
             return
-        cap = max(0, int(os.getenv("INITIAL_ENERGY_BUDGET", "100")))
+
         async with self._predictive_energy_budget_lock:
+            applied = self._apply_predictive_energy_tick_locked(int(amount))
             remaining = max(0, int(self._predictive_energy_budget_remaining))
-            self._predictive_energy_budget_remaining = min(cap, remaining + int(amount))
+
+        if applied > 0:
             logger.info(
                 "Predictive energy budget refunded: +%s (%s). Remaining=%s",
-                amount,
+                applied,
                 reason,
-                self._predictive_energy_budget_remaining,
+                remaining,
             )
 
     async def _try_reserve_predictive_energy_budget(
@@ -3670,6 +3738,11 @@ class Orchestrator:
         logger.info("Heartbeat: Task #%s completed.", task_id)
 
     async def _run_heartbeat_cycle(self) -> None:
+        await self._tick_predictive_energy_budget(
+            amount=self._resolve_energy_replenish_per_heartbeat(),
+            reason="heartbeat_cycle",
+        )
+
         logger.info("Heartbeat: Querying objective backlog for executable Tasks...")
         candidate_contexts = await self._select_executable_heartbeat_tasks()
 
@@ -6099,13 +6172,21 @@ class Orchestrator:
             if not hasattr(self, "_predictive_energy_budget_last_replenished_at"):
                 self._predictive_energy_budget_last_replenished_at = time.time()
 
-            async with self._predictive_energy_budget_lock:
-                replenished = self._replenish_predictive_energy_budget_wallclock_locked()
+            replenished = 0
+            if str(user_id or "").strip() != "heartbeat":
+                async with self._predictive_energy_budget_lock:
+                    replenishment_points = (
+                        self._compute_predictive_energy_replenishment_points_wallclock_locked()
+                    )
+                replenished = await self._tick_predictive_energy_budget(
+                    replenishment_points,
+                    reason="user_turn_wallclock",
+                )
                 if replenished > 0:
                     logger.info(
                         "Predictive energy budget replenished by wall clock: +%s. Remaining=%s",
                         replenished,
-                        self._predictive_energy_budget_remaining,
+                        await self._get_predictive_energy_budget_remaining(),
                     )
 
             reply = await self._try_resume_mfa(user_id, normalized_user_message)
