@@ -1010,3 +1010,532 @@ ollama._types.ResponseError: model failed to load, this may be due to resource l
 2026-04-26 11:33:49,880 - src.interfaces.telegram_bot - INFO - Bot interrupted by user
 2026-04-26 11:33:49,880 - src.interfaces.telegram_bot - INFO - Released single-instance lock
 2026-04-26 11:34:12,818 - src.interfaces.telegram_bot - INFO - Message received from user 8769582575: Analyse everything in my archival memory and produce a comprehensive report covering all projects, decisions, and open items
+2026-04-26 11:39:04,245 - src.interfaces.telegram_bot - INFO - Initializing Orchestrator...
+2026-04-26 11:39:04,246 - src.core.orchestrator - INFO - Initializing Orchestrator (State Graph)
+2026-04-26 11:39:04,388 - src.memory.vector_db - INFO - VectorMemory initialized with persistence at data/chroma_storage
+2026-04-26 11:39:05,006 - src.core.skill_manager - INFO - 22 skills loaded, 0 failed: [].
+2026-04-26 11:39:05,006 - src.core.skill_manager - INFO - SkillRegistry ready — 22 skills: analyze_table_file, ask_admin_for_guidance, consolidate_memory, escalate_to_system_2, execute_python_sandbox, extract_pdf_text, extract_web_article, get_stock_price, get_system_info, manage_file_system, query_highest_priority_task, request_capability, request_core_update, run_terminal_command, search_archival_memory, spawn_new_objective, unit_converter, update_core_memory, update_ledger, update_objective_status, weather_current, web_search
+2026-04-26 11:39:05,479 - src.core.llm_router - INFO - System 1 model inspected: capabilities=audio, completion, thinking, tools, vision context_length=131072 options={'temperature': 0.2}
+2026-04-26 11:39:05,733 - src.core.llm_router - INFO - System 2: Ollama Cloud (deepseek-v3.2 @ https://api.ollama.com) — API key configured
+2026-04-26 11:39:05,734 - src.core.llm_router - INFO - CognitiveRouter initialized. System 1: gemma4:e4b (max concurrency: 1, keep_alive=15m, think=False)
+2026-04-26 11:39:05,735 - src.core.llm_router - INFO - Feature flags: ENABLE_128K_CONTEXT=True ENABLE_NATIVE_AUDIO=True ENABLE_PARALLEL_TOOLS=True ENABLE_SCOPED_SKILL_CONTEXT=True
+2026-04-26 11:39:05,735 - src.core.llm_router - INFO - Parallel tool execution: read-only concurrency=4
+2026-04-26 11:39:05,737 - src.core.orchestrator - WARNING - ENERGY_REPLENISH_PER_TURN is deprecated and ignored. Use ENERGY_REPLENISH_PER_HOUR instead.
+2026-04-26 11:39:05,739 - src.core.orchestrator - INFO - Orchestrator __init__ complete — call async_init() to finish setup
+2026-04-26 11:39:05,739 - src.interfaces.telegram_bot - INFO - Orchestrator initialized successfully
+2026-04-26 11:39:05,742 - src.interfaces.telegram_bot - INFO - Acquired single-instance lock on port 55678
+2026-04-26 11:39:06,543 - src.interfaces.telegram_bot - INFO - Cleared stale Telegram webhook/session before polling.
+2026-04-26 11:39:06,564 - src.memory.ledger_db - INFO - LedgerMemory initialized (aiosqlite) at data/ledger.db
+2026-04-26 11:39:06,572 - src.core.dynamic_tool_worker - INFO - Dynamic tool worker started pid=15352
+2026-04-26 11:39:07,105 - src.core.llm_router - INFO - System 1 preloaded: gemma4:e4b
+2026-04-26 11:39:07,107 - src.core.orchestrator - INFO - Restored 1 consolidation turn counter(s) from DB
+2026-04-26 11:39:07,110 - src.memory.core_memory - INFO - Updated Core Memory: host_os = Windows
+2026-04-26 11:39:07,112 - src.core.orchestrator - INFO - Orchestrator async_init complete
+2026-04-26 11:39:07,112 - src.interfaces.telegram_bot - INFO - Orchestrator async_init, heartbeat loop, sensory update loop, memory consolidation loop, and outbound queue drainer started. Tasks: Task-9, Task-10, Task-12, Task-11
+2026-04-26 11:39:07,113 - src.core.orchestrator - INFO - Heartbeat loop started.
+2026-04-26 11:39:07,113 - src.core.orchestrator - INFO - Memory consolidation loop started.
+2026-04-26 11:39:07,156 - telegram.ext.Application - INFO - Application started
+2026-04-26 11:39:07,157 - src.interfaces.telegram_bot - INFO - Telegram bot initialized and polling is active.
+2026-04-26 11:39:07,158 - src.interfaces.telegram_bot - INFO - Waiting for Telegram updates. No further terminal output is expected until a message arrives or shutdown begins.
+2026-04-26 11:39:22,662 - src.interfaces.telegram_bot - INFO - Message received from user 8769582575: Hi Aiden
+2026-04-26 11:39:22,677 - src.core.llm_router - INFO - Routing to System 1 (Local Model - gemma4:e4b)
+2026-04-26 11:39:25,837 - src.core.llm_router - INFO - System 1 response received (44 chars)
+2026-04-26 11:39:25,838 - src.core.orchestrator - INFO - Energy budget reserved: -6 (ad_hoc:fast_path_direct:8769582575). Remaining=94
+2026-04-26 11:39:25,839 - src.core.orchestrator - INFO - Ad-hoc dispatch approved by energy gate (fast_path_direct): roi=3.50 cost=6 remaining=94
+2026-04-26 11:39:26,442 - src.memory.vector_db - INFO - Query returned 3 results
+2026-04-26 11:39:26,443 - src.core.llm_router - INFO - Routing to System 1 (Local Model - gemma4:e4b)
+2026-04-26 11:39:28,522 - src.core.llm_router - INFO - System 1 response received (56 chars)
+2026-04-26 11:39:28,632 - src.interfaces.telegram_bot - INFO - Response sent to user 8769582575
+2026-04-26 11:40:38,267 - src.interfaces.telegram_bot - INFO - Message received from user 8769582575: I  want you to conduct a research on the following topic:  "trafficking in persons for organ removal". Can you generate a report and email it to ilirb17@gmail.com
+2026-04-26 11:40:38,362 - src.core.llm_router - INFO - Routing to System 1 (Local Model - gemma4:e4b)
+2026-04-26 11:40:40,872 - src.core.llm_router - INFO - System 1 response received (44 chars)
+2026-04-26 11:40:40,873 - src.core.orchestrator - INFO - Ad-hoc dispatch approved by comfort-budget floor (graph_dispatch): ROI=1.14 below threshold but budget=99 > floor=50
+2026-04-26 11:40:40,873 - src.core.orchestrator - INFO - Energy budget reserved: -21 (ad_hoc:graph_dispatch:8769582575). Remaining=78
+2026-04-26 11:40:40,874 - src.core.orchestrator - INFO - Ad-hoc dispatch approved by energy gate (graph_dispatch): roi=1.14 cost=21 remaining=78
+2026-04-26 11:40:40,932 - src.memory.vector_db - INFO - Query returned 3 results
+2026-04-26 11:40:40,956 - src.core.orchestrator - INFO - Supervisor system prompt sha256=a04b9239d725f54e79aaf23490c03c125b30bfc3682ff2db43c11b289aba2227 bytes=14806
+2026-04-26 11:40:41,021 - src.core.orchestrator - INFO - Routing Supervisor through System 1 (Local Model)
+2026-04-26 11:40:41,114 - src.core.llm_router - INFO - Routing to System 1 (Local Model - gemma4:e4b)
+2026-04-26 11:40:57,265 - src.core.llm_router - INFO - Injected scoped SKILL.md context for tool 'web_search' in current turn.
+2026-04-26 11:40:57,265 - src.core.llm_router - INFO - Executing tool: web_search with args: ['query']
+2026-04-26 11:40:57,265 - src.skills.web_search - INFO - web_search: 'trafficking in persons for organ removal' (max=5)
+2026-04-26 11:40:57,875 - primp - INFO - response: https://en.wikipedia.org/w/api.php?action=opensearch&profile=fuzzy&limit=1&search=trafficking%20in%20persons%20for%20organ%20removal 200
+2026-04-26 11:40:57,995 - primp - INFO - response: https://grokipedia.com/api/typeahead?query=trafficking+in+persons+for+organ+removal&limit=1 200
+2026-04-26 11:40:58,575 - primp - INFO - response: https://yandex.com/search/site/?text=trafficking+in+persons+for+organ+removal&web=1&searchid=1685536 200
+2026-04-26 11:40:58,605 - src.core.llm_router - INFO - System 1 tool call #1.1: web_search → 2234 chars
+2026-04-26 11:41:31,367 - src.core.llm_router - INFO - System 1 response after 1 tool call(s) (3735 chars)
+2026-04-26 11:41:31,565 - src.memory.vector_db - INFO - Memory added with ID: 68207926-7744-4c3c-ad26-34375e20a085
+2026-04-26 11:41:31,614 - src.interfaces.telegram_bot - INFO - Response delivered to user 8769582575
+2026-04-26 11:42:58,542 - src.interfaces.telegram_bot - INFO - Message received from user 8769582575: please proceed with the below steps: generate the full report content and save this report to a file named downloads/Organ_Trafficking_Report.txt
+2026-04-26 11:42:58,555 - src.core.llm_router - INFO - Routing to System 1 (Local Model - gemma4:e4b)
+2026-04-26 11:43:00,829 - src.core.llm_router - INFO - System 1 response received (44 chars)
+2026-04-26 11:43:00,830 - src.core.orchestrator - INFO - Energy budget reserved: -15 (ad_hoc:graph_dispatch:8769582575). Remaining=68
+2026-04-26 11:43:00,831 - src.core.orchestrator - INFO - Ad-hoc dispatch approved by energy gate (graph_dispatch): roi=1.60 cost=15 remaining=68
+2026-04-26 11:43:00,916 - src.memory.vector_db - INFO - Query returned 3 results
+2026-04-26 11:43:00,919 - src.core.orchestrator - INFO - Supervisor system prompt sha256=a04b9239d725f54e79aaf23490c03c125b30bfc3682ff2db43c11b289aba2227 bytes=14806
+2026-04-26 11:43:00,920 - src.core.orchestrator - INFO - Routing Supervisor through System 1 (Local Model)
+2026-04-26 11:43:00,922 - src.core.llm_router - INFO - Routing to System 1 (Local Model - gemma4:e4b)
+2026-04-26 11:43:26,477 - src.core.llm_router - INFO - Injected scoped SKILL.md context for tool 'manage_file_system' in current turn.
+2026-04-26 11:43:26,477 - src.core.llm_router - INFO - Executing tool: manage_file_system with args: ['action', 'content', 'file_path']
+2026-04-26 11:43:26,478 - src.skills.manage_file_system - INFO - manage_file_system called with action: write, file_path: downloads/Organ_Trafficking_Report.txt
+2026-04-26 11:43:26,479 - src.core.llm_router - INFO - System 1 tool call #1.1: manage_file_system → 174 chars
+2026-04-26 11:43:47,922 - src.core.llm_router - INFO - System 1 response after 1 tool call(s) (2723 chars)
+2026-04-26 11:43:48,283 - src.memory.vector_db - INFO - Memory added with ID: 52e41953-ef05-4101-927e-40f1cba4bd41
+2026-04-26 11:43:48,425 - src.interfaces.telegram_bot - INFO - Response delivered to user 8769582575
+2026-04-26 12:03:57,985 - src.interfaces.telegram_bot - INFO - Shutting down — stopping polling and cleaning up...
+2026-04-26 12:03:59,087 - telegram.ext.Application - INFO - Application is stopping. This might take a moment.
+2026-04-26 12:03:59,087 - telegram.ext.Application - INFO - Application.stop() complete
+2026-04-26 12:03:59,146 - src.memory.ledger_db - INFO - LedgerMemory connection closed
+2026-04-26 12:03:59,147 - src.memory.vector_db - INFO - Closing VectorMemory connections
+2026-04-26 12:03:59,148 - src.interfaces.telegram_bot - INFO - Shutdown complete.
+2026-04-26 12:03:59,150 - src.interfaces.telegram_bot - INFO - Bot interrupted by user
+2026-04-26 12:03:59,150 - src.interfaces.telegram_bot - INFO - Released single-instance lock
+2026-04-26 12:19:33,748 - src.interfaces.telegram_bot - INFO - Initializing Orchestrator...
+2026-04-26 12:19:33,750 - src.core.orchestrator - INFO - Initializing Orchestrator (State Graph)
+2026-04-26 12:19:33,936 - src.memory.vector_db - INFO - Normalized 2 vector memory timestamps to canonical UTC format.
+2026-04-26 12:19:33,936 - src.memory.vector_db - INFO - VectorMemory initialized with persistence at data/chroma_storage
+2026-04-26 12:19:34,376 - src.core.skill_manager - INFO - 24 skills loaded, 0 failed: [].
+2026-04-26 12:19:34,376 - src.core.skill_manager - INFO - SkillRegistry ready — 24 skills: analyze_table_file, ask_admin_for_guidance, consolidate_memory, escalate_to_system_2, execute_python_sandbox, extract_pdf_text, extract_web_article, generate_docx_report, get_stock_price, get_system_info, manage_file_system, query_highest_priority_task, request_capability, request_core_update, run_terminal_command, search_archival_memory, send_email, spawn_new_objective, unit_converter, update_core_memory, update_ledger, update_objective_status, weather_current, web_search
+2026-04-26 12:19:34,759 - src.core.llm_router - INFO - System 1 model inspected: capabilities=audio, completion, thinking, tools, vision context_length=131072 options={'temperature': 0.2}
+2026-04-26 12:19:34,937 - src.core.llm_router - INFO - System 2: Ollama Cloud (deepseek-v3.2 @ https://api.ollama.com) — API key configured
+2026-04-26 12:19:34,937 - src.core.llm_router - INFO - CognitiveRouter initialized. System 1: gemma4:e4b (max concurrency: 1, keep_alive=15m, think=False)
+2026-04-26 12:19:34,937 - src.core.llm_router - INFO - Feature flags: ENABLE_128K_CONTEXT=True ENABLE_NATIVE_AUDIO=True ENABLE_PARALLEL_TOOLS=True ENABLE_SCOPED_SKILL_CONTEXT=True
+2026-04-26 12:19:34,938 - src.core.llm_router - INFO - Parallel tool execution: read-only concurrency=4
+2026-04-26 12:19:34,939 - src.core.orchestrator - WARNING - ENERGY_REPLENISH_PER_TURN is deprecated and ignored. Use ENERGY_REPLENISH_PER_HOUR instead.
+2026-04-26 12:19:34,940 - src.core.orchestrator - INFO - Orchestrator __init__ complete — call async_init() to finish setup
+2026-04-26 12:19:34,941 - src.interfaces.telegram_bot - INFO - Orchestrator initialized successfully
+2026-04-26 12:19:34,941 - src.interfaces.telegram_bot - INFO - Acquired single-instance lock on port 55678
+2026-04-26 12:19:35,377 - src.interfaces.telegram_bot - INFO - Cleared stale Telegram webhook/session before polling.
+2026-04-26 12:19:35,391 - src.memory.ledger_db - INFO - LedgerMemory initialized (aiosqlite) at data/ledger.db
+2026-04-26 12:19:35,400 - src.core.dynamic_tool_worker - INFO - Dynamic tool worker started pid=26912
+2026-04-26 12:19:49,631 - src.core.llm_router - INFO - System 1 preloaded: gemma4:e4b
+2026-04-26 12:19:49,634 - src.core.orchestrator - INFO - Restored 1 consolidation turn counter(s) from DB
+2026-04-26 12:19:49,638 - src.memory.core_memory - INFO - Updated Core Memory: host_os = Windows
+2026-04-26 12:19:49,642 - src.core.orchestrator - INFO - Orchestrator async_init complete
+2026-04-26 12:19:49,643 - src.interfaces.telegram_bot - INFO - Orchestrator async_init, heartbeat loop, sensory update loop, memory consolidation loop, and outbound queue drainer started. Tasks: Task-9, Task-10, Task-12, Task-11
+2026-04-26 12:19:49,643 - src.core.orchestrator - INFO - Heartbeat loop started.
+2026-04-26 12:19:49,644 - src.core.orchestrator - INFO - Memory consolidation loop started.
+2026-04-26 12:19:49,736 - telegram.ext.Application - INFO - Application started
+2026-04-26 12:19:49,737 - src.interfaces.telegram_bot - INFO - Telegram bot initialized and polling is active.
+2026-04-26 12:19:49,737 - src.interfaces.telegram_bot - INFO - Waiting for Telegram updates. No further terminal output is expected until a message arrives or shutdown begins.
+2026-04-26 12:20:51,401 - src.interfaces.telegram_bot - INFO - Message received from user 8769582575: Please Nate you have new tools now at your disposal. I  want you to conduct a research on the following topic:  "trafficking in persons for organ removal". Can you generate a report in docx and email it to ilirb17@gmail.com
+2026-04-26 12:20:51,460 - src.core.llm_router - INFO - Routing to System 1 (Local Model - gemma4:e4b)
+2026-04-26 12:20:54,729 - src.core.llm_router - INFO - System 1 response received (44 chars)
+2026-04-26 12:20:54,730 - src.core.orchestrator - INFO - Energy budget reserved: -12 (ad_hoc:graph_dispatch:8769582575). Remaining=88
+2026-04-26 12:20:54,730 - src.core.orchestrator - INFO - Ad-hoc dispatch approved by energy gate (graph_dispatch): roi=2.00 cost=12 remaining=88
+2026-04-26 12:20:55,129 - src.memory.vector_db - INFO - Query returned 3 results
+2026-04-26 12:20:55,132 - src.core.orchestrator - INFO - Supervisor system prompt sha256=afe1ec5c027fc495dba3f49064e0b0dbabcd33d8eef9c4faba577a6c7929d4b2 bytes=14972
+2026-04-26 12:20:55,132 - src.core.orchestrator - INFO - Routing Supervisor through System 1 (Local Model)
+2026-04-26 12:20:55,133 - src.core.llm_router - INFO - Routing to System 1 (Local Model - gemma4:e4b)
+2026-04-26 12:21:11,292 - src.core.llm_router - INFO - Injected scoped SKILL.md context for tool 'web_search' in current turn.
+2026-04-26 12:21:11,292 - src.core.llm_router - INFO - Executing tool: web_search with args: ['query']
+2026-04-26 12:21:11,307 - src.skills.web_search - INFO - web_search: 'trafficking in persons for organ removal' (max=5)
+2026-04-26 12:21:11,822 - primp - INFO - response: https://en.wikipedia.org/w/api.php?action=opensearch&profile=fuzzy&limit=1&search=trafficking%20in%20persons%20for%20organ%20removal 200
+2026-04-26 12:21:11,930 - primp - INFO - response: https://grokipedia.com/api/typeahead?query=trafficking+in+persons+for+organ+removal&limit=1 200
+2026-04-26 12:21:12,048 - primp - INFO - response: https://www.google.com/search?q=trafficking+in+persons+for+organ+removal&filter=1&start=0&hl=en-US&lr=lang_en&cr=countryUS 200
+2026-04-26 12:21:13,099 - primp - INFO - response: https://html.duckduckgo.com/html/ 200
+2026-04-26 12:21:13,134 - src.core.llm_router - INFO - System 1 tool call #1.1: web_search → 2616 chars
+2026-04-26 12:21:44,718 - src.core.llm_router - INFO - Injected scoped SKILL.md context for tool 'generate_docx_report' in current turn.
+2026-04-26 12:21:44,718 - src.core.llm_router - INFO - Executing tool: generate_docx_report with args: ['content', 'filename', 'title']
+2026-04-26 12:21:44,781 - src.core.llm_router - INFO - System 1 tool call #2.1: generate_docx_report → 128 chars
+2026-04-26 12:21:50,687 - src.core.llm_router - INFO - Injected scoped SKILL.md context for tool 'send_email' in current turn.
+2026-04-26 12:21:50,688 - src.core.llm_router - INFO - Executing tool: send_email with args: ['body', 'recipient', 'subject']
+2026-04-26 12:21:51,831 - src.core.llm_router - INFO - System 1 tool call #3.1: send_email → 67 chars
+2026-04-26 12:21:56,967 - src.core.llm_router - INFO - System 1 response after 3 tool call(s) (520 chars)
+2026-04-26 12:21:57,193 - src.memory.vector_db - INFO - Memory added with ID: 2bb8879e-7417-4887-944d-d16a395e4b61
+2026-04-26 12:21:57,259 - src.interfaces.telegram_bot - INFO - Response delivered to user 8769582575
+2026-04-26 12:23:09,942 - src.interfaces.telegram_bot - INFO - Message received from user 8769582575: The attached did not come through can you resend all the report as a text instead?
+2026-04-26 12:23:09,962 - src.core.llm_router - INFO - Routing to System 1 (Local Model - gemma4:e4b)
+2026-04-26 12:23:12,665 - src.core.llm_router - INFO - System 1 response received (44 chars)
+2026-04-26 12:23:12,665 - src.core.orchestrator - INFO - Energy budget reserved: -9 (ad_hoc:graph_dispatch:8769582575). Remaining=84
+2026-04-26 12:23:12,666 - src.core.orchestrator - INFO - Ad-hoc dispatch approved by energy gate (graph_dispatch): roi=2.33 cost=9 remaining=84
+2026-04-26 12:23:12,720 - src.memory.vector_db - INFO - Query returned 3 results
+2026-04-26 12:23:12,722 - src.core.orchestrator - INFO - Supervisor system prompt sha256=afe1ec5c027fc495dba3f49064e0b0dbabcd33d8eef9c4faba577a6c7929d4b2 bytes=14972
+2026-04-26 12:23:12,723 - src.core.orchestrator - INFO - Routing Supervisor through System 1 (Local Model)
+2026-04-26 12:23:12,723 - src.core.llm_router - INFO - Routing to System 1 (Local Model - gemma4:e4b)
+2026-04-26 12:23:37,426 - src.core.llm_router - INFO - System 1 response received (2590 chars)
+2026-04-26 12:23:37,663 - src.interfaces.telegram_bot - INFO - Response delivered to user 8769582575
+2026-04-26 12:23:37,697 - src.memory.vector_db - INFO - Memory added with ID: 03017c99-b55b-4528-b126-18cfa69e16a4
+2026-04-26 12:26:18,243 - src.interfaces.telegram_bot - INFO - Message received from user 8769582575: No, send the text as an email to the same address as the above
+2026-04-26 12:26:18,262 - src.core.llm_router - INFO - Routing to System 1 (Local Model - gemma4:e4b)
+2026-04-26 12:26:21,029 - src.core.llm_router - INFO - System 1 response received (44 chars)
+2026-04-26 12:26:21,030 - src.core.orchestrator - INFO - Energy budget reserved: -9 (ad_hoc:graph_dispatch:8769582575). Remaining=80
+2026-04-26 12:26:21,030 - src.core.orchestrator - INFO - Ad-hoc dispatch approved by energy gate (graph_dispatch): roi=2.33 cost=9 remaining=80
+2026-04-26 12:26:21,080 - src.memory.vector_db - INFO - Query returned 3 results
+2026-04-26 12:26:21,097 - src.core.orchestrator - INFO - Supervisor system prompt sha256=afe1ec5c027fc495dba3f49064e0b0dbabcd33d8eef9c4faba577a6c7929d4b2 bytes=14972
+2026-04-26 12:26:21,099 - src.core.orchestrator - INFO - Routing Supervisor through System 1 (Local Model)
+2026-04-26 12:26:21,124 - src.core.llm_router - INFO - Routing to System 1 (Local Model - gemma4:e4b)
+2026-04-26 12:26:48,389 - src.core.llm_router - INFO - Injected scoped SKILL.md context for tool 'send_email' in current turn.
+2026-04-26 12:26:48,389 - src.core.llm_router - INFO - Executing tool: send_email with args: ['body', 'recipient', 'subject']
+2026-04-26 12:26:49,707 - src.core.llm_router - INFO - System 1 tool call #1.1: send_email → 67 chars
+2026-04-26 12:26:53,657 - src.core.llm_router - INFO - System 1 response after 1 tool call(s) (370 chars)
+2026-04-26 12:26:53,835 - src.memory.ledger_db - INFO - Retrieved 20 log entries
+2026-04-26 12:26:53,845 - src.memory.vector_db - INFO - Memory added with ID: c52d3adb-5232-40af-8fd5-814c3a5fa54c
+2026-04-26 12:26:53,874 - src.memory.vector_db - INFO - Query returned 5 results
+2026-04-26 12:26:53,909 - src.memory.vector_db - INFO - Query returned 1 results
+2026-04-26 12:26:53,933 - src.memory.vector_db - INFO - Query returned 1 results
+2026-04-26 12:26:53,949 - src.interfaces.telegram_bot - INFO - Response delivered to user 8769582575
+2026-04-26 12:26:53,952 - src.memory.vector_db - INFO - Query returned 1 results
+2026-04-26 12:26:53,971 - src.memory.vector_db - INFO - Query returned 1 results
+2026-04-26 12:26:53,999 - src.memory.vector_db - INFO - Query returned 1 results
+2026-04-26 12:26:54,019 - src.memory.vector_db - INFO - Query returned 1 results
+2026-04-26 12:26:54,045 - src.memory.vector_db - INFO - Query returned 1 results
+2026-04-26 12:26:54,075 - src.memory.vector_db - INFO - Query returned 1 results
+2026-04-26 12:26:54,092 - src.memory.vector_db - INFO - Query returned 1 results
+2026-04-26 12:26:54,113 - src.memory.vector_db - INFO - Query returned 1 results
+2026-04-26 12:26:54,140 - src.memory.vector_db - INFO - Query returned 1 results
+2026-04-26 12:26:54,154 - src.memory.vector_db - INFO - Query returned 1 results
+2026-04-26 12:26:54,171 - src.memory.vector_db - INFO - Query returned 1 results
+2026-04-26 12:26:54,189 - src.memory.vector_db - INFO - Query returned 1 results
+2026-04-26 12:26:54,207 - src.memory.vector_db - INFO - Query returned 1 results
+2026-04-26 12:26:54,227 - src.memory.vector_db - INFO - Query returned 1 results
+2026-04-26 12:26:54,242 - src.memory.vector_db - INFO - Query returned 1 results
+2026-04-26 12:26:54,273 - src.memory.vector_db - INFO - Query returned 1 results
+2026-04-26 12:26:54,290 - src.memory.vector_db - INFO - Query returned 1 results
+2026-04-26 12:26:54,295 - src.core.orchestrator - INFO - System 2 payload redacted for nocturnal_scoring: 2 -> 2 message(s)
+2026-04-26 12:26:54,298 - src.core.llm_router - INFO - Routing to System 2 (Ollama Cloud/deepseek-v3.2)
+2026-04-26 12:27:39,308 - src.core.orchestrator - WARNING - Memory consolidation skipped: LLM did not respond within 90s
+2026-04-26 12:28:07,286 - src.interfaces.telegram_bot - INFO - Message received from user 8769582575: Thanks. Please send an email to enia19@gmail.com with the subject and text "Just so you know, your husband love you"
+2026-04-26 12:28:07,301 - src.core.llm_router - INFO - Routing to System 1 (Local Model - gemma4:e4b)
+2026-04-26 12:28:09,839 - src.core.llm_router - INFO - System 1 response received (44 chars)
+2026-04-26 12:28:09,839 - src.core.orchestrator - INFO - Energy budget reserved: -9 (ad_hoc:graph_dispatch:8769582575). Remaining=76
+2026-04-26 12:28:09,840 - src.core.orchestrator - INFO - Ad-hoc dispatch approved by energy gate (graph_dispatch): roi=2.33 cost=9 remaining=76
+2026-04-26 12:28:09,896 - src.memory.vector_db - INFO - Query returned 3 results
+2026-04-26 12:28:10,071 - src.core.orchestrator - INFO - Supervisor system prompt sha256=afe1ec5c027fc495dba3f49064e0b0dbabcd33d8eef9c4faba577a6c7929d4b2 bytes=14972
+2026-04-26 12:28:10,084 - src.core.orchestrator - INFO - Routing Supervisor through System 1 (Local Model)
+2026-04-26 12:28:10,100 - src.core.llm_router - INFO - Routing to System 1 (Local Model - gemma4:e4b)
+2026-04-26 12:28:15,629 - src.core.llm_router - INFO - Injected scoped SKILL.md context for tool 'send_email' in current turn.
+2026-04-26 12:28:15,631 - src.core.llm_router - INFO - Executing tool: send_email with args: ['body', 'recipient', 'subject']
+2026-04-26 12:28:17,234 - src.core.llm_router - INFO - System 1 tool call #1.1: send_email → 66 chars
+2026-04-26 12:28:19,234 - src.core.llm_router - INFO - System 1 response after 1 tool call(s) (139 chars)
+2026-04-26 12:28:19,480 - src.memory.vector_db - INFO - Memory added with ID: 25ca5dd3-d294-4276-8e20-eb0bdc802b8f
+2026-04-26 12:28:19,602 - src.interfaces.telegram_bot - INFO - Response delivered to user 8769582575
+2026-04-26 15:31:49,122 - src.core.orchestrator - INFO - Energy budget refunded: +2 (heartbeat_cycle). Remaining=78
+2026-04-26 15:31:49,129 - src.core.orchestrator - INFO - Heartbeat: Querying objective backlog for executable Tasks...
+2026-04-26 15:31:49,137 - src.core.orchestrator - INFO - Heartbeat: No executable dependency-resolved tasks available.
+2026-04-26 15:31:49,524 - src.interfaces.telegram_bot - INFO - Message received from user 8769582575: What are the latest news regarding Gemma4?
+2026-04-26 15:31:49,600 - src.core.llm_router - INFO - Routing to System 1 (Local Model - gemma4:e4b)
+2026-04-26 15:32:08,735 - src.core.llm_router - INFO - System 1 response received (44 chars)
+2026-04-26 15:32:08,736 - src.core.orchestrator - INFO - Energy budget reserved: -6 (ad_hoc:fast_path_single_tool:web_search:8769582575). Remaining=77
+2026-04-26 15:32:08,737 - src.core.orchestrator - INFO - Ad-hoc dispatch approved by energy gate (fast_path_single_tool:web_search): roi=3.50 cost=6 remaining=77
+2026-04-26 15:32:08,738 - src.core.llm_router - INFO - Executing tool: web_search with args: ['query', 'max_results']
+2026-04-26 15:32:08,738 - src.skills.web_search - INFO - web_search: 'What are the latest news regarding Gemma4' (max=5)
+2026-04-26 15:32:09,029 - primp - INFO - response: https://en.wikipedia.org/w/api.php?action=opensearch&profile=fuzzy&limit=1&search=What%20are%20the%20latest%20news%20regarding%20Gemma4 200
+2026-04-26 15:32:09,192 - primp - INFO - response: https://grokipedia.com/api/typeahead?query=What+are+the+latest+news+regarding+Gemma4&limit=1 200
+2026-04-26 15:32:10,788 - primp - INFO - response: https://www.mojeek.com/search?q=What+are+the+latest+news+regarding+Gemma4 200
+2026-04-26 15:32:10,820 - src.core.llm_router - INFO - Routing to System 1 (Local Model - gemma4:e4b)
+2026-04-26 15:32:13,927 - src.core.llm_router - INFO - System 1 response received (320 chars)
+2026-04-26 15:32:14,017 - src.interfaces.telegram_bot - INFO - Response delivered to user 8769582575
+2026-04-26 15:32:14,077 - src.memory.vector_db - INFO - Memory added with ID: 5d590a10-32be-4930-9e47-220a1f94b478
+2026-04-26 17:43:59,732 - src.core.orchestrator - INFO - Energy budget refunded: +2 (heartbeat_cycle). Remaining=79
+2026-04-26 17:43:59,734 - src.core.orchestrator - INFO - Heartbeat: Querying objective backlog for executable Tasks...
+2026-04-26 17:43:59,740 - src.core.orchestrator - INFO - Heartbeat: No executable dependency-resolved tasks available.
+2026-04-26 18:11:50,243 - src.interfaces.telegram_bot - INFO - Initializing Orchestrator...
+2026-04-26 18:11:50,244 - src.core.orchestrator - INFO - Initializing Orchestrator (State Graph)
+2026-04-26 18:11:50,418 - src.memory.vector_db - INFO - Normalized 5 vector memory timestamps to canonical UTC format.
+2026-04-26 18:11:50,418 - src.memory.vector_db - INFO - VectorMemory initialized with persistence at data/chroma_storage
+2026-04-26 18:11:50,844 - src.core.skill_manager - INFO - 28 skills loaded, 0 failed: [].
+2026-04-26 18:11:50,844 - src.core.skill_manager - INFO - SkillRegistry ready — 28 skills: analyze_table_file, ask_admin_for_guidance, consolidate_memory, escalate_to_system_2, execute_python_sandbox, extract_pdf_text, extract_web_article, generate_docx_report, get_stock_price, get_system_info, manage_file_system, query_decision_log, query_energy_state, query_highest_priority_task, query_objective_status, query_system_health, request_capability, request_core_update, run_terminal_command, search_archival_memory, send_email, spawn_new_objective, unit_converter, update_core_memory, update_ledger, update_objective_status, weather_current, web_search
+2026-04-26 18:11:51,204 - src.core.llm_router - INFO - System 1 model inspected: capabilities=audio, completion, thinking, tools, vision context_length=131072 options={'temperature': 0.2}
+2026-04-26 18:11:51,354 - src.core.llm_router - INFO - System 2: Ollama Cloud (deepseek-v3.2 @ https://api.ollama.com) — API key configured
+2026-04-26 18:11:51,355 - src.core.llm_router - INFO - CognitiveRouter initialized. System 1: gemma4:e4b (max concurrency: 1, keep_alive=15m, think=False)
+2026-04-26 18:11:51,355 - src.core.llm_router - INFO - Feature flags: ENABLE_128K_CONTEXT=True ENABLE_NATIVE_AUDIO=True ENABLE_PARALLEL_TOOLS=True ENABLE_SCOPED_SKILL_CONTEXT=True
+2026-04-26 18:11:51,355 - src.core.llm_router - INFO - Parallel tool execution: read-only concurrency=4
+2026-04-26 18:11:51,356 - src.core.orchestrator - WARNING - ENERGY_REPLENISH_PER_TURN is deprecated and ignored. Use ENERGY_REPLENISH_PER_HOUR instead.
+2026-04-26 18:11:51,357 - src.core.orchestrator - INFO - Orchestrator __init__ complete — call async_init() to finish setup
+2026-04-26 18:11:51,357 - src.interfaces.telegram_bot - INFO - Orchestrator initialized successfully
+2026-04-26 18:11:51,357 - src.interfaces.telegram_bot - ERROR - Another bot instance appears to be running (lock port 55678 in use). Exiting.
+2026-04-26 18:11:51,358 - src.interfaces.telegram_bot - INFO - Released single-instance lock
+2026-04-26 18:13:59,755 - src.core.orchestrator - INFO - Energy budget refunded: +2 (heartbeat_cycle). Remaining=81
+2026-04-26 18:13:59,757 - src.core.orchestrator - INFO - Heartbeat: Querying objective backlog for executable Tasks...
+2026-04-26 18:13:59,762 - src.core.orchestrator - INFO - Heartbeat: No executable dependency-resolved tasks available.
+2026-04-26 18:19:38,852 - src.memory.ledger_db - INFO - Migrated tool_registry: added column 'last_used_at'
+2026-04-26 18:19:38,876 - src.memory.ledger_db - INFO - Migrated chat_history: added column 'session_id'
+2026-04-26 18:19:38,879 - src.memory.ledger_db - INFO - LedgerMemory initialized (aiosqlite) at C:\Users\iboci\AppData\Local\Temp\tmpqz64lgzr.db
+2026-04-26 18:19:39,303 - src.core.skill_manager - INFO - 28 skills loaded, 0 failed: [].
+2026-04-26 18:19:39,303 - src.core.skill_manager - INFO - SkillRegistry ready — 28 skills: analyze_table_file, ask_admin_for_guidance, consolidate_memory, escalate_to_system_2, execute_python_sandbox, extract_pdf_text, extract_web_article, generate_docx_report, get_stock_price, get_system_info, manage_file_system, query_decision_log, query_energy_state, query_highest_priority_task, query_objective_status, query_system_health, request_capability, request_core_update, run_terminal_command, search_archival_memory, send_email, spawn_new_objective, unit_converter, update_core_memory, update_ledger, update_objective_status, weather_current, web_search
+2026-04-26 18:19:39,342 - src.memory.ledger_db - INFO - LedgerMemory connection closed
+2026-04-26 18:19:49,617 - src.memory.ledger_db - INFO - Retrieved 20 log entries
+2026-04-26 18:19:49,687 - src.memory.vector_db - INFO - Query returned 5 results
+2026-04-26 18:19:49,708 - src.memory.vector_db - INFO - Query returned 1 results
+2026-04-26 18:19:49,724 - src.memory.vector_db - INFO - Query returned 1 results
+2026-04-26 18:19:49,750 - src.memory.vector_db - INFO - Query returned 1 results
+2026-04-26 18:19:49,771 - src.memory.vector_db - INFO - Query returned 1 results
+2026-04-26 18:19:49,789 - src.memory.vector_db - INFO - Query returned 1 results
+2026-04-26 18:19:49,802 - src.memory.vector_db - INFO - Query returned 1 results
+2026-04-26 18:19:49,815 - src.memory.vector_db - INFO - Query returned 1 results
+2026-04-26 18:19:49,827 - src.memory.vector_db - INFO - Query returned 1 results
+2026-04-26 18:19:49,841 - src.memory.vector_db - INFO - Query returned 1 results
+2026-04-26 18:19:49,860 - src.memory.vector_db - INFO - Query returned 1 results
+2026-04-26 18:19:49,875 - src.memory.vector_db - INFO - Query returned 1 results
+2026-04-26 18:19:49,888 - src.memory.vector_db - INFO - Query returned 1 results
+2026-04-26 18:19:49,908 - src.memory.vector_db - INFO - Query returned 1 results
+2026-04-26 18:19:49,921 - src.memory.vector_db - INFO - Query returned 1 results
+2026-04-26 18:19:49,939 - src.memory.vector_db - INFO - Query returned 1 results
+2026-04-26 18:19:49,956 - src.memory.vector_db - INFO - Query returned 1 results
+2026-04-26 18:19:49,968 - src.memory.vector_db - INFO - Query returned 1 results
+2026-04-26 18:19:49,983 - src.memory.vector_db - INFO - Query returned 1 results
+2026-04-26 18:19:49,997 - src.memory.vector_db - INFO - Query returned 1 results
+2026-04-26 18:19:50,002 - src.core.orchestrator - INFO - System 2 payload redacted for nocturnal_scoring: 2 -> 2 message(s)
+2026-04-26 18:19:50,010 - src.core.llm_router - INFO - Routing to System 2 (Ollama Cloud/deepseek-v3.2)
+2026-04-26 18:20:35,022 - src.core.orchestrator - WARNING - Memory consolidation skipped: LLM did not respond within 90s
+2026-04-26 18:20:35,024 - src.memory.vector_db - WARNING - Vector memory pruning failed: Expected operand value to be an int or a float for operator $lt, got 2025-10-28T16:20:35
+2026-04-26 18:42:10,198 - src.interfaces.telegram_bot - INFO - Shutting down — stopping polling and cleaning up...
+2026-04-26 18:42:14,281 - telegram.ext.Application - INFO - Application is stopping. This might take a moment.
+2026-04-26 18:42:14,281 - telegram.ext.Application - INFO - Application.stop() complete
+2026-04-26 18:42:14,335 - src.memory.ledger_db - INFO - LedgerMemory connection closed
+2026-04-26 18:42:14,339 - src.memory.vector_db - INFO - Closing VectorMemory connections
+2026-04-26 18:42:14,339 - src.interfaces.telegram_bot - INFO - Shutdown complete.
+2026-04-26 18:42:14,342 - src.interfaces.telegram_bot - INFO - Bot interrupted by user
+2026-04-26 18:42:14,342 - src.interfaces.telegram_bot - INFO - Released single-instance lock
+2026-04-26 19:02:25,766 - src.core.orchestrator - INFO - Initializing Orchestrator (State Graph)
+2026-04-26 19:02:25,852 - src.memory.vector_db - INFO - VectorMemory initialized with persistence at data/chroma_storage
+2026-04-26 19:02:26,273 - src.core.skill_manager - INFO - 28 skills loaded, 0 failed: [].
+2026-04-26 19:02:26,273 - src.core.skill_manager - INFO - SkillRegistry ready — 28 skills: analyze_table_file, ask_admin_for_guidance, consolidate_memory, escalate_to_system_2, execute_python_sandbox, extract_pdf_text, extract_web_article, generate_docx_report, get_stock_price, get_system_info, manage_file_system, query_decision_log, query_energy_state, query_highest_priority_task, query_objective_status, query_system_health, request_capability, request_core_update, run_terminal_command, search_archival_memory, send_email, spawn_new_objective, unit_converter, update_core_memory, update_ledger, update_objective_status, weather_current, web_search
+2026-04-26 19:02:26,632 - src.core.llm_router - INFO - System 1 model inspected: capabilities=audio, completion, thinking, tools, vision context_length=131072 options={'temperature': 0.2}
+2026-04-26 19:02:26,632 - src.core.llm_router - WARNING - No System 2 provider configured — capability synthesis will be unavailable. Set OLLAMA_CLOUD_API_KEY, GROQ_API_KEY, or GEMINI_API_KEY+USE_GEMINI=True.
+2026-04-26 19:02:26,632 - src.core.llm_router - INFO - CognitiveRouter initialized. System 1: gemma4:e4b (max concurrency: 1, keep_alive=15m, think=False)
+2026-04-26 19:02:26,632 - src.core.llm_router - INFO - Feature flags: ENABLE_128K_CONTEXT=True ENABLE_NATIVE_AUDIO=True ENABLE_PARALLEL_TOOLS=True ENABLE_SCOPED_SKILL_CONTEXT=True
+2026-04-26 19:02:26,633 - src.core.llm_router - INFO - Parallel tool execution: read-only concurrency=4
+2026-04-26 19:02:26,634 - src.core.orchestrator - WARNING - ENERGY_REPLENISH_PER_TURN is deprecated and ignored. Use ENERGY_REPLENISH_PER_HOUR instead.
+2026-04-26 19:02:26,635 - src.core.orchestrator - INFO - Orchestrator __init__ complete — call async_init() to finish setup
+2026-04-26 19:02:26,641 - src.memory.ledger_db - INFO - LedgerMemory initialized (aiosqlite) at data/ledger.db
+2026-04-26 19:02:26,647 - src.core.dynamic_tool_worker - INFO - Dynamic tool worker started pid=21492
+2026-04-26 19:02:39,144 - src.core.llm_router - INFO - System 1 preloaded: gemma4:e4b
+2026-04-26 19:02:39,146 - src.core.orchestrator - INFO - Restored 1 consolidation turn counter(s) from DB
+2026-04-26 19:02:39,148 - src.memory.core_memory - INFO - Updated Core Memory: host_os = Windows
+2026-04-26 19:02:39,149 - src.core.orchestrator - INFO - Orchestrator async_init complete
+2026-04-26 19:02:39,154 - src.core.llm_router - INFO - Routing to System 1 (Local Model - gemma4:e4b)
+2026-04-26 19:02:40,314 - src.core.llm_router - INFO - System 1 response received (44 chars)
+2026-04-26 19:02:40,314 - src.core.orchestrator - INFO - Energy budget reserved: -3 (ad_hoc:fast_path_direct:slice6_live_verify). Remaining=97
+2026-04-26 19:02:40,315 - src.core.orchestrator - INFO - Ad-hoc dispatch approved by energy gate (fast_path_direct): roi=8.00 cost=3 remaining=97
+2026-04-26 19:02:40,957 - src.memory.vector_db - INFO - Query returned 3 results
+2026-04-26 19:02:40,958 - src.core.llm_router - INFO - Routing to System 1 (Local Model - gemma4:e4b)
+2026-04-26 19:02:41,976 - src.core.llm_router - INFO - System 1 response received (31 chars)
+2026-04-26 19:02:42,361 - src.core.llm_router - INFO - Routing to System 1 (Local Model - gemma4:e4b)
+2026-04-26 19:02:43,161 - src.core.llm_router - INFO - System 1 response received (44 chars)
+2026-04-26 19:02:43,161 - src.core.orchestrator - INFO - Energy budget reserved: -9 (ad_hoc:graph_dispatch:slice6_live_verify). Remaining=91
+2026-04-26 19:02:43,161 - src.core.orchestrator - INFO - Ad-hoc dispatch approved by energy gate (graph_dispatch): roi=2.00 cost=9 remaining=91
+2026-04-26 19:02:43,200 - src.memory.vector_db - INFO - Query returned 3 results
+2026-04-26 19:02:43,201 - src.core.orchestrator - INFO - Supervisor system prompt sha256=e33dd1fbf9be7555d4f9f7159d89d8bb0632ac8c3e6a267ab0f377d2dcff69c9 bytes=16386
+2026-04-26 19:02:43,201 - src.core.orchestrator - INFO - Routing Supervisor through System 1 (Local Model)
+2026-04-26 19:02:43,202 - src.core.llm_router - INFO - Routing to System 1 (Local Model - gemma4:e4b)
+2026-04-26 19:02:50,165 - src.core.llm_router - INFO - Injected scoped SKILL.md context for tool 'search_archival_memory' in current turn.
+2026-04-26 19:02:50,166 - src.core.llm_router - INFO - Executing tool: search_archival_memory with args: ['query']
+2026-04-26 19:02:50,166 - src.skills.search_archival_memory - INFO - search_archival_memory: query='machine learning' session_id=None epic_id=None
+2026-04-26 19:02:50,201 - src.memory.vector_db - INFO - Query returned 3 results
+2026-04-26 19:02:50,202 - src.core.llm_router - INFO - System 1 tool call #1.1: search_archival_memory → 2165 chars
+2026-04-26 19:03:07,571 - src.core.llm_router - INFO - System 1 response after 1 tool call(s) (2449 chars)
+2026-04-26 19:03:07,628 - src.memory.vector_db - INFO - Memory added with ID: df7dbc26-f24d-4195-8e3f-32170c651bc6
+2026-04-26 19:03:07,945 - src.core.orchestrator - INFO - Introspection fast-path triggered: type=energy message='What is my current cognitive energy budget?'
+2026-04-26 19:03:07,947 - src.core.llm_router - INFO - Routing to System 1 (Local Model - gemma4:e4b)
+2026-04-26 19:03:12,110 - src.core.llm_router - INFO - System 1 response received (530 chars)
+2026-04-26 19:03:12,160 - src.memory.vector_db - INFO - Memory added with ID: bcd19ede-01a1-4028-80b8-6ad6aec5f6c6
+2026-04-26 19:03:12,492 - src.core.orchestrator - INFO - Introspection fast-path triggered: type=energy message='Are there any deferred tasks in the backlog?'
+2026-04-26 19:03:12,494 - src.core.llm_router - INFO - Routing to System 1 (Local Model - gemma4:e4b)
+2026-04-26 19:03:15,580 - src.core.llm_router - INFO - System 1 response received (397 chars)
+2026-04-26 19:03:15,638 - src.memory.vector_db - INFO - Memory added with ID: 68e2a6cd-0711-4b08-aff9-e988369110d6
+2026-04-26 19:03:15,938 - src.core.llm_router - INFO - Routing to System 1 (Local Model - gemma4:e4b)
+2026-04-26 19:03:16,818 - src.core.llm_router - INFO - System 1 response received (44 chars)
+2026-04-26 19:03:16,819 - src.core.orchestrator - INFO - Energy budget reserved: -6 (ad_hoc:graph_dispatch:slice6_live_verify). Remaining=94
+2026-04-26 19:03:16,819 - src.core.orchestrator - INFO - Ad-hoc dispatch approved by energy gate (graph_dispatch): roi=3.50 cost=6 remaining=94
+2026-04-26 19:03:16,853 - src.memory.vector_db - INFO - Query returned 3 results
+2026-04-26 19:03:16,854 - src.core.orchestrator - INFO - Supervisor system prompt sha256=e33dd1fbf9be7555d4f9f7159d89d8bb0632ac8c3e6a267ab0f377d2dcff69c9 bytes=16386
+2026-04-26 19:03:16,855 - src.core.orchestrator - INFO - Routing Supervisor through System 1 (Local Model)
+2026-04-26 19:03:16,855 - src.core.llm_router - INFO - Routing to System 1 (Local Model - gemma4:e4b)
+2026-04-26 19:03:23,972 - src.core.llm_router - INFO - Injected scoped SKILL.md context for tool 'query_system_health' in current turn.
+2026-04-26 19:03:23,973 - src.core.llm_router - INFO - Executing tool: query_system_health with args: ['hours', 'include_error_log', 'include_synthesis_history']
+2026-04-26 19:03:23,973 - src.core.llm_router - INFO - System 1 tool call #1.1: query_system_health → 430 chars
+2026-04-26 19:03:31,926 - src.core.llm_router - INFO - System 1 response after 1 tool call(s) (973 chars)
+2026-04-26 19:03:31,995 - src.memory.vector_db - INFO - Memory added with ID: 674d6eb6-a489-48fa-8712-bfe559d2bd4e
+2026-04-26 19:03:32,316 - src.core.orchestrator - INFO - Introspection fast-path triggered: type=decision message='Why did you use the research agent for my last question?'
+2026-04-26 19:03:32,318 - src.core.llm_router - INFO - Routing to System 1 (Local Model - gemma4:e4b)
+2026-04-26 19:03:36,575 - src.core.llm_router - INFO - System 1 response received (593 chars)
+2026-04-26 19:03:36,630 - src.memory.vector_db - INFO - Memory added with ID: c3d8d43e-fcff-4912-bf39-eb82f1bd55cb
+2026-04-26 19:03:36,951 - src.core.orchestrator - INFO - Introspection fast-path triggered: type=backlog message='What tasks are currently blocked?'
+2026-04-26 19:03:36,952 - src.core.llm_router - INFO - Routing to System 1 (Local Model - gemma4:e4b)
+2026-04-26 19:03:40,593 - src.core.llm_router - INFO - System 1 response received (457 chars)
+2026-04-26 19:03:40,642 - src.memory.vector_db - INFO - Memory added with ID: b4a394fd-b1ba-492e-8d0c-8ff255ca52f3
+2026-04-26 19:03:40,966 - src.core.llm_router - INFO - Routing to System 1 (Local Model - gemma4:e4b)
+2026-04-26 19:03:41,738 - src.core.llm_router - INFO - System 1 response received (41 chars)
+2026-04-26 19:03:41,739 - src.core.orchestrator - INFO - Energy budget reserved: -3 (ad_hoc:fast_path_single_tool:get_system_info:slice6_live_verify). Remaining=97
+2026-04-26 19:03:41,739 - src.core.orchestrator - INFO - Ad-hoc dispatch approved by energy gate (fast_path_single_tool:get_system_info): roi=3.00 cost=3 remaining=97
+2026-04-26 19:03:41,740 - src.core.llm_router - INFO - Executing tool: get_system_info with args: []
+2026-04-26 19:03:41,842 - src.core.llm_router - INFO - Routing to System 1 (Local Model - gemma4:e4b)
+2026-04-26 19:03:44,182 - src.core.llm_router - INFO - System 1 response received (142 chars)
+2026-04-26 19:03:44,237 - src.memory.vector_db - INFO - Memory added with ID: 2c2d9449-04ca-4172-b4cb-2984a33f6886
+2026-04-26 19:03:44,551 - src.core.orchestrator - INFO - Introspection fast-path triggered: type=energy message='What is my energy budget?'
+2026-04-26 19:03:44,552 - src.core.llm_router - INFO - Routing to System 1 (Local Model - gemma4:e4b)
+2026-04-26 19:03:47,536 - src.core.llm_router - INFO - System 1 response received (361 chars)
+2026-04-26 19:03:47,586 - src.memory.vector_db - INFO - Memory added with ID: 8e896660-915d-485a-bc9d-d0a2e6aab058
+2026-04-26 19:03:47,962 - src.memory.ledger_db - INFO - LedgerMemory connection closed
+2026-04-26 19:03:47,963 - src.memory.vector_db - INFO - Closing VectorMemory connections
+2026-04-26 19:08:00,646 - src.core.orchestrator - INFO - Initializing Orchestrator (State Graph)
+2026-04-26 19:08:00,814 - src.memory.vector_db - INFO - Normalized 8 vector memory timestamps to canonical UTC format.
+2026-04-26 19:08:00,815 - src.memory.vector_db - INFO - VectorMemory initialized with persistence at data/chroma_storage
+2026-04-26 19:08:01,238 - src.core.skill_manager - INFO - 28 skills loaded, 0 failed: [].
+2026-04-26 19:08:01,238 - src.core.skill_manager - INFO - SkillRegistry ready — 28 skills: analyze_table_file, ask_admin_for_guidance, consolidate_memory, escalate_to_system_2, execute_python_sandbox, extract_pdf_text, extract_web_article, generate_docx_report, get_stock_price, get_system_info, manage_file_system, query_decision_log, query_energy_state, query_highest_priority_task, query_objective_status, query_system_health, request_capability, request_core_update, run_terminal_command, search_archival_memory, send_email, spawn_new_objective, unit_converter, update_core_memory, update_ledger, update_objective_status, weather_current, web_search
+2026-04-26 19:08:01,570 - src.core.llm_router - INFO - System 1 model inspected: capabilities=audio, completion, thinking, tools, vision context_length=131072 options={'temperature': 0.2}
+2026-04-26 19:08:01,571 - src.core.llm_router - WARNING - No System 2 provider configured — capability synthesis will be unavailable. Set OLLAMA_CLOUD_API_KEY, GROQ_API_KEY, or GEMINI_API_KEY+USE_GEMINI=True.
+2026-04-26 19:08:01,571 - src.core.llm_router - INFO - CognitiveRouter initialized. System 1: gemma4:e4b (max concurrency: 1, keep_alive=15m, think=False)
+2026-04-26 19:08:01,571 - src.core.llm_router - INFO - Feature flags: ENABLE_128K_CONTEXT=True ENABLE_NATIVE_AUDIO=True ENABLE_PARALLEL_TOOLS=True ENABLE_SCOPED_SKILL_CONTEXT=True
+2026-04-26 19:08:01,571 - src.core.llm_router - INFO - Parallel tool execution: read-only concurrency=4
+2026-04-26 19:08:01,572 - src.core.orchestrator - WARNING - ENERGY_REPLENISH_PER_TURN is deprecated and ignored. Use ENERGY_REPLENISH_PER_HOUR instead.
+2026-04-26 19:08:01,573 - src.core.orchestrator - INFO - Orchestrator __init__ complete — call async_init() to finish setup
+2026-04-26 19:08:01,580 - src.memory.ledger_db - INFO - LedgerMemory initialized (aiosqlite) at data/ledger.db
+2026-04-26 19:08:01,585 - src.core.dynamic_tool_worker - INFO - Dynamic tool worker started pid=25892
+2026-04-26 19:08:01,889 - src.core.llm_router - INFO - System 1 preloaded: gemma4:e4b
+2026-04-26 19:08:01,891 - src.core.orchestrator - INFO - Restored 2 consolidation turn counter(s) from DB
+2026-04-26 19:08:01,893 - src.memory.core_memory - INFO - Updated Core Memory: host_os = Windows
+2026-04-26 19:08:01,893 - src.core.orchestrator - INFO - Orchestrator async_init complete
+2026-04-26 19:08:01,899 - src.core.llm_router - INFO - Routing to System 1 (Local Model - gemma4:e4b)
+2026-04-26 19:08:02,753 - src.core.llm_router - INFO - System 1 response received (44 chars)
+2026-04-26 19:08:02,753 - src.core.orchestrator - INFO - Energy budget reserved: -3 (ad_hoc:fast_path_direct:slice6_live_verify_v2). Remaining=97
+2026-04-26 19:08:02,753 - src.core.orchestrator - INFO - Ad-hoc dispatch approved by energy gate (fast_path_direct): roi=8.00 cost=3 remaining=97
+2026-04-26 19:08:02,922 - src.memory.vector_db - INFO - Query returned 3 results
+2026-04-26 19:08:02,923 - src.core.llm_router - INFO - Routing to System 1 (Local Model - gemma4:e4b)
+2026-04-26 19:08:03,954 - src.core.llm_router - INFO - System 1 response received (31 chars)
+2026-04-26 19:08:04,374 - src.core.llm_router - INFO - Routing to System 1 (Local Model - gemma4:e4b)
+2026-04-26 19:08:05,166 - src.core.llm_router - INFO - System 1 response received (44 chars)
+2026-04-26 19:08:05,166 - src.core.orchestrator - INFO - Energy budget reserved: -9 (ad_hoc:graph_dispatch:slice6_live_verify_v2). Remaining=91
+2026-04-26 19:08:05,166 - src.core.orchestrator - INFO - Ad-hoc dispatch approved by energy gate (graph_dispatch): roi=2.33 cost=9 remaining=91
+2026-04-26 19:08:05,183 - src.memory.vector_db - INFO - Query returned 3 results
+2026-04-26 19:08:05,199 - src.core.orchestrator - INFO - Supervisor system prompt sha256=e33dd1fbf9be7555d4f9f7159d89d8bb0632ac8c3e6a267ab0f377d2dcff69c9 bytes=16386
+2026-04-26 19:08:05,200 - src.core.orchestrator - INFO - Routing Supervisor through System 1 (Local Model)
+2026-04-26 19:08:05,200 - src.core.llm_router - INFO - Routing to System 1 (Local Model - gemma4:e4b)
+2026-04-26 19:08:11,234 - src.core.llm_router - INFO - Injected scoped SKILL.md context for tool 'search_archival_memory' in current turn.
+2026-04-26 19:08:11,235 - src.core.llm_router - INFO - Executing tool: search_archival_memory with args: ['query']
+2026-04-26 19:08:11,235 - src.skills.search_archival_memory - INFO - search_archival_memory: query='machine learning' session_id=None epic_id=None
+2026-04-26 19:08:11,252 - src.memory.vector_db - INFO - Query returned 3 results
+2026-04-26 19:08:11,252 - src.core.llm_router - INFO - System 1 tool call #1.1: search_archival_memory → 2886 chars
+2026-04-26 19:08:27,484 - src.core.llm_router - INFO - System 1 response after 1 tool call(s) (2425 chars)
+2026-04-26 19:08:27,631 - src.memory.vector_db - INFO - Memory added with ID: 1692f9aa-315c-42dc-a97c-3513587f817a
+2026-04-26 19:08:27,959 - src.core.orchestrator - INFO - Introspection fast-path triggered: type=energy message='What is my current cognitive energy budget?'
+2026-04-26 19:08:27,960 - src.core.llm_router - INFO - Routing to System 1 (Local Model - gemma4:e4b)
+2026-04-26 19:08:31,842 - src.core.llm_router - INFO - System 1 response received (538 chars)
+2026-04-26 19:08:32,042 - src.memory.vector_db - INFO - Memory added with ID: 1b6991de-6925-4b4b-ae33-5b4de62252ed
+2026-04-26 19:08:32,348 - src.core.orchestrator - INFO - Introspection fast-path triggered: type=energy message='Are there any deferred tasks in the backlog?'
+2026-04-26 19:08:32,350 - src.core.llm_router - INFO - Routing to System 1 (Local Model - gemma4:e4b)
+2026-04-26 19:08:36,200 - src.core.llm_router - INFO - System 1 response received (506 chars)
+2026-04-26 19:08:36,243 - src.memory.vector_db - INFO - Memory added with ID: d6d9d9ee-8056-469a-9f52-9e4339c69a2d
+2026-04-26 19:08:36,628 - src.core.orchestrator - INFO - Introspection fast-path triggered: type=health message='Were there any system errors in the last 24 hours?'
+2026-04-26 19:08:36,630 - src.core.llm_router - INFO - Routing to System 1 (Local Model - gemma4:e4b)
+2026-04-26 19:08:39,191 - src.core.llm_router - INFO - System 1 response received (381 chars)
+2026-04-26 19:08:39,241 - src.memory.vector_db - INFO - Memory added with ID: d1c5738e-1fe3-49b9-ada0-2d7b12ed27b3
+2026-04-26 19:08:39,621 - src.core.orchestrator - INFO - Introspection fast-path triggered: type=decision message='Why did you use the research agent for my last question?'
+2026-04-26 19:08:39,623 - src.core.llm_router - INFO - Routing to System 1 (Local Model - gemma4:e4b)
+2026-04-26 19:08:44,061 - src.core.llm_router - INFO - System 1 response received (669 chars)
+2026-04-26 19:08:44,122 - src.memory.vector_db - INFO - Memory added with ID: d773820a-6e47-49b0-bc41-71b1eb2606d2
+2026-04-26 19:08:44,467 - src.core.orchestrator - INFO - Introspection fast-path triggered: type=backlog message='What tasks are currently blocked?'
+2026-04-26 19:08:44,470 - src.core.llm_router - INFO - Routing to System 1 (Local Model - gemma4:e4b)
+2026-04-26 19:08:47,757 - src.core.llm_router - INFO - System 1 response received (382 chars)
+2026-04-26 19:08:47,832 - src.memory.vector_db - INFO - Memory added with ID: 06ae2ff0-daa7-4236-a424-9498f4627f3b
+2026-04-26 19:08:48,184 - src.core.llm_router - INFO - Routing to System 1 (Local Model - gemma4:e4b)
+2026-04-26 19:08:49,005 - src.core.llm_router - INFO - System 1 response received (41 chars)
+2026-04-26 19:08:49,006 - src.core.orchestrator - INFO - Energy budget reserved: -3 (ad_hoc:fast_path_single_tool:get_system_info:slice6_live_verify_v2). Remaining=97
+2026-04-26 19:08:49,006 - src.core.orchestrator - INFO - Ad-hoc dispatch approved by energy gate (fast_path_single_tool:get_system_info): roi=3.00 cost=3 remaining=97
+2026-04-26 19:08:49,006 - src.core.llm_router - INFO - Executing tool: get_system_info with args: []
+2026-04-26 19:08:49,107 - src.core.llm_router - INFO - Routing to System 1 (Local Model - gemma4:e4b)
+2026-04-26 19:08:51,627 - src.core.llm_router - INFO - System 1 response received (142 chars)
+2026-04-26 19:08:52,187 - src.core.orchestrator - INFO - Introspection fast-path triggered: type=energy message='What is my energy budget?'
+2026-04-26 19:08:52,189 - src.core.llm_router - INFO - Routing to System 1 (Local Model - gemma4:e4b)
+2026-04-26 19:08:56,339 - src.core.llm_router - INFO - System 1 response received (383 chars)
+2026-04-26 19:08:56,793 - src.memory.ledger_db - INFO - LedgerMemory connection closed
+2026-04-26 19:08:56,793 - src.memory.vector_db - INFO - Closing VectorMemory connections
+2026-04-26 19:09:52,116 - src.core.orchestrator - INFO - Initializing Orchestrator (State Graph)
+2026-04-26 19:09:52,653 - src.memory.vector_db - INFO - Normalized 6 vector memory timestamps to canonical UTC format.
+2026-04-26 19:09:52,653 - src.memory.vector_db - INFO - VectorMemory initialized with persistence at data/chroma_storage
+2026-04-26 19:09:56,283 - src.core.skill_manager - INFO - 28 skills loaded, 0 failed: [].
+2026-04-26 19:09:56,283 - src.core.skill_manager - INFO - SkillRegistry ready — 28 skills: analyze_table_file, ask_admin_for_guidance, consolidate_memory, escalate_to_system_2, execute_python_sandbox, extract_pdf_text, extract_web_article, generate_docx_report, get_stock_price, get_system_info, manage_file_system, query_decision_log, query_energy_state, query_highest_priority_task, query_objective_status, query_system_health, request_capability, request_core_update, run_terminal_command, search_archival_memory, send_email, spawn_new_objective, unit_converter, update_core_memory, update_ledger, update_objective_status, weather_current, web_search
+2026-04-26 19:09:56,599 - src.core.llm_router - INFO - System 1 model inspected: capabilities=audio, completion, thinking, tools, vision context_length=131072 options={'temperature': 0.2}
+2026-04-26 19:09:56,600 - src.core.llm_router - WARNING - No System 2 provider configured — capability synthesis will be unavailable. Set OLLAMA_CLOUD_API_KEY, GROQ_API_KEY, or GEMINI_API_KEY+USE_GEMINI=True.
+2026-04-26 19:09:56,600 - src.core.llm_router - INFO - CognitiveRouter initialized. System 1: gemma4:e4b (max concurrency: 1, keep_alive=15m, think=False)
+2026-04-26 19:09:56,600 - src.core.llm_router - INFO - Feature flags: ENABLE_128K_CONTEXT=True ENABLE_NATIVE_AUDIO=True ENABLE_PARALLEL_TOOLS=True ENABLE_SCOPED_SKILL_CONTEXT=True
+2026-04-26 19:09:56,600 - src.core.llm_router - INFO - Parallel tool execution: read-only concurrency=4
+2026-04-26 19:09:56,613 - src.core.orchestrator - WARNING - ENERGY_REPLENISH_PER_TURN is deprecated and ignored. Use ENERGY_REPLENISH_PER_HOUR instead.
+2026-04-26 19:09:56,618 - src.core.orchestrator - INFO - Orchestrator __init__ complete — call async_init() to finish setup
+2026-04-26 19:09:56,624 - src.memory.ledger_db - INFO - LedgerMemory initialized (aiosqlite) at data/ledger.db
+2026-04-26 19:09:56,630 - src.core.dynamic_tool_worker - INFO - Dynamic tool worker started pid=31528
+2026-04-26 19:09:56,919 - src.core.llm_router - INFO - System 1 preloaded: gemma4:e4b
+2026-04-26 19:09:56,920 - src.core.orchestrator - INFO - Restored 3 consolidation turn counter(s) from DB
+2026-04-26 19:09:56,922 - src.memory.core_memory - INFO - Updated Core Memory: host_os = Windows
+2026-04-26 19:09:56,923 - src.core.orchestrator - INFO - Orchestrator async_init complete
+2026-04-26 19:09:56,990 - src.core.llm_router - INFO - Routing to System 1 (Local Model - gemma4:e4b)
+2026-04-26 19:09:58,038 - src.core.llm_router - INFO - System 1 response received (44 chars)
+2026-04-26 19:09:58,039 - src.core.orchestrator - INFO - Ad-hoc dispatch approved by comfort-budget floor (graph_dispatch): ROI=1.12 below threshold but budget=100 > floor=50
+2026-04-26 19:09:58,039 - src.core.orchestrator - INFO - Energy budget reserved: -24 (ad_hoc:graph_dispatch:slice6_research_agent_probe). Remaining=76
+2026-04-26 19:09:58,039 - src.core.orchestrator - INFO - Ad-hoc dispatch approved by energy gate (graph_dispatch): roi=1.12 cost=24 remaining=76
+2026-04-26 19:09:58,233 - src.memory.vector_db - INFO - Query returned 3 results
+2026-04-26 19:09:58,234 - src.core.orchestrator - INFO - Supervisor system prompt sha256=e33dd1fbf9be7555d4f9f7159d89d8bb0632ac8c3e6a267ab0f377d2dcff69c9 bytes=16386
+2026-04-26 19:09:58,235 - src.core.orchestrator - INFO - Routing Supervisor through System 1 (Local Model)
+2026-04-26 19:09:58,235 - src.core.llm_router - INFO - Routing to System 1 (Local Model - gemma4:e4b)
+2026-04-26 19:10:15,556 - src.core.llm_router - INFO - Injected scoped SKILL.md context for tool 'search_archival_memory' in current turn.
+2026-04-26 19:10:15,557 - src.core.llm_router - INFO - Executing tool: search_archival_memory with args: ['n_results', 'query']
+2026-04-26 19:10:15,557 - src.skills.search_archival_memory - INFO - search_archival_memory: query='all projects, decisions, and open items' session_id=None epic_id=None
+2026-04-26 19:10:15,572 - src.memory.vector_db - INFO - Query returned 10 results
+2026-04-26 19:10:15,573 - src.core.llm_router - INFO - System 1 tool call #1.1: search_archival_memory → 8192 chars
+2026-04-26 19:10:36,286 - src.core.llm_router - INFO - Executing tool: research_agent with args: ['task', 'reason']
+2026-04-26 19:10:36,287 - src.core.llm_router - WARNING - System 1 requested invalid tool usage for 'research_agent': Error: Unknown tool 'research_agent'.
+2026-04-26 19:10:36,287 - src.core.llm_router - INFO - System 1 tool call #2.1: research_agent → 37 chars
+2026-04-26 19:11:12,981 - src.core.llm_router - INFO - System 1 response after 2 tool call(s) (5261 chars)
+2026-04-26 19:11:13,046 - src.memory.vector_db - INFO - Memory added with ID: 48631658-9cd4-49be-a0f9-a24ad6c8d2ac
+2026-04-26 19:11:13,555 - src.memory.ledger_db - INFO - LedgerMemory connection closed
+2026-04-26 19:11:13,555 - src.memory.vector_db - INFO - Closing VectorMemory connections
+2026-04-26 20:24:46,729 - src.interfaces.telegram_bot - INFO - Initializing Orchestrator...
+2026-04-26 20:24:46,729 - src.core.orchestrator - INFO - Initializing Orchestrator (State Graph)
+2026-04-26 20:24:46,870 - src.memory.vector_db - INFO - VectorMemory initialized with persistence at data/chroma_storage
+2026-04-26 20:24:47,452 - src.core.skill_manager - WARNING - Skipping skill 'generate_docx_report': cannot import name 'get_prompt_config' from 'src.core.runtime_context' (C:\Users\iboci\Live-Trading-bot\AI_Prototype\src\core\runtime_context.py)
+2026-04-26 20:24:47,468 - src.core.skill_manager - INFO - 27 skills loaded, 1 failed: [generate_docx_report].
+2026-04-26 20:24:47,468 - src.core.skill_manager - INFO - SkillRegistry ready — 27 skills: analyze_table_file, ask_admin_for_guidance, consolidate_memory, escalate_to_system_2, execute_python_sandbox, extract_pdf_text, extract_web_article, get_stock_price, get_system_info, manage_file_system, query_decision_log, query_energy_state, query_highest_priority_task, query_objective_status, query_system_health, request_capability, request_core_update, run_terminal_command, search_archival_memory, send_email, spawn_new_objective, unit_converter, update_core_memory, update_ledger, update_objective_status, weather_current, web_search
+2026-04-26 20:24:47,969 - src.core.llm_router - INFO - System 1 model inspected: capabilities=audio, completion, thinking, tools, vision context_length=131072 options={'temperature': 0.2}
+2026-04-26 20:24:48,253 - src.core.llm_router - INFO - System 2: Ollama Cloud (deepseek-v3.2 @ https://api.ollama.com) — API key configured
+2026-04-26 20:24:48,254 - src.core.llm_router - INFO - CognitiveRouter initialized. System 1: gemma4:e4b (max concurrency: 1, keep_alive=15m, think=False)
+2026-04-26 20:24:48,255 - src.core.llm_router - INFO - Feature flags: ENABLE_128K_CONTEXT=True ENABLE_NATIVE_AUDIO=True ENABLE_PARALLEL_TOOLS=True ENABLE_SCOPED_SKILL_CONTEXT=True
+2026-04-26 20:24:48,256 - src.core.llm_router - INFO - Parallel tool execution: read-only concurrency=4
+2026-04-26 20:24:48,259 - src.core.orchestrator - INFO - MemoryReranker initialised: alpha=0.70 multiplier=4 max_candidates=16 timeout=20.0s
+2026-04-26 20:24:48,261 - src.core.orchestrator - WARNING - ENERGY_REPLENISH_PER_TURN is deprecated and ignored. Use ENERGY_REPLENISH_PER_HOUR instead.
+2026-04-26 20:24:48,266 - src.core.orchestrator - INFO - Orchestrator __init__ complete — call async_init() to finish setup
+2026-04-26 20:24:48,266 - src.interfaces.telegram_bot - INFO - Orchestrator initialized successfully
+2026-04-26 20:24:48,268 - src.interfaces.telegram_bot - INFO - Acquired single-instance lock on port 55678
+2026-04-26 20:24:49,240 - src.interfaces.telegram_bot - INFO - Cleared stale Telegram webhook/session before polling.
+2026-04-26 20:24:49,252 - src.memory.ledger_db - INFO - LedgerMemory initialized (aiosqlite) at data/ledger.db
+2026-04-26 20:24:49,260 - src.core.dynamic_tool_worker - INFO - Dynamic tool worker started pid=20056
+2026-04-26 20:25:04,510 - src.core.llm_router - INFO - System 1 preloaded: gemma4:e4b
+2026-04-26 20:25:04,513 - src.core.orchestrator - INFO - Restored 4 consolidation turn counter(s) from DB
+2026-04-26 20:25:04,547 - src.memory.core_memory - INFO - Updated Core Memory: host_os = Windows
+2026-04-26 20:25:04,548 - src.core.orchestrator - INFO - Orchestrator async_init complete
+2026-04-26 20:25:04,548 - src.interfaces.telegram_bot - INFO - Orchestrator async_init, heartbeat loop, sensory update loop, memory consolidation loop, and outbound queue drainer started. Tasks: Task-9, Task-10, Task-12, Task-11
+2026-04-26 20:25:04,549 - src.core.orchestrator - INFO - Heartbeat loop started.
+2026-04-26 20:25:04,549 - src.core.orchestrator - INFO - Memory consolidation loop started.
+2026-04-26 20:25:04,628 - telegram.ext.Application - INFO - Application started
+2026-04-26 20:25:04,628 - src.interfaces.telegram_bot - INFO - Telegram bot initialized and polling is active.
+2026-04-26 20:25:04,629 - src.interfaces.telegram_bot - INFO - Waiting for Telegram updates. No further terminal output is expected until a message arrives or shutdown begins.
+2026-04-26 21:06:26,200 - src.interfaces.telegram_bot - INFO - Initializing Orchestrator...
+2026-04-26 21:06:26,200 - src.core.orchestrator - INFO - Initializing Orchestrator (State Graph)
+2026-04-26 21:06:26,313 - src.memory.vector_db - INFO - VectorMemory initialized with persistence at data/chroma_storage
+2026-04-26 21:06:26,833 - src.core.skill_manager - WARNING - Skipping skill 'generate_docx_report': cannot import name 'get_prompt_config' from 'src.core.runtime_context' (C:\Users\iboci\Live-Trading-bot\AI_Prototype\src\core\runtime_context.py)
+2026-04-26 21:06:26,851 - src.core.skill_manager - INFO - 27 skills loaded, 1 failed: [generate_docx_report].
+2026-04-26 21:06:26,851 - src.core.skill_manager - INFO - SkillRegistry ready — 27 skills: analyze_table_file, ask_admin_for_guidance, consolidate_memory, escalate_to_system_2, execute_python_sandbox, extract_pdf_text, extract_web_article, get_stock_price, get_system_info, manage_file_system, query_decision_log, query_energy_state, query_highest_priority_task, query_objective_status, query_system_health, request_capability, request_core_update, run_terminal_command, search_archival_memory, send_email, spawn_new_objective, unit_converter, update_core_memory, update_ledger, update_objective_status, weather_current, web_search
+2026-04-26 21:06:27,293 - src.core.llm_router - INFO - System 1 model inspected: capabilities=audio, completion, thinking, tools, vision context_length=131072 options={'temperature': 0.2}
+2026-04-26 21:06:27,489 - src.core.llm_router - INFO - System 2: Ollama Cloud (deepseek-v3.2 @ https://api.ollama.com) — API key configured
+2026-04-26 21:06:27,490 - src.core.llm_router - INFO - CognitiveRouter initialized. System 1: gemma4:e4b (max concurrency: 1, keep_alive=15m, think=False)
+2026-04-26 21:06:27,490 - src.core.llm_router - INFO - Feature flags: ENABLE_128K_CONTEXT=True ENABLE_NATIVE_AUDIO=True ENABLE_PARALLEL_TOOLS=True ENABLE_SCOPED_SKILL_CONTEXT=True
+2026-04-26 21:06:27,490 - src.core.llm_router - INFO - Parallel tool execution: read-only concurrency=4
+2026-04-26 21:06:27,492 - src.core.orchestrator - INFO - MemoryReranker initialised: alpha=0.70 multiplier=4 max_candidates=16 timeout=20.0s
+2026-04-26 21:06:27,492 - src.core.orchestrator - WARNING - ENERGY_REPLENISH_PER_TURN is deprecated and ignored. Use ENERGY_REPLENISH_PER_HOUR instead.
+2026-04-26 21:06:27,493 - src.core.orchestrator - INFO - Orchestrator __init__ complete — call async_init() to finish setup
+2026-04-26 21:06:27,493 - src.interfaces.telegram_bot - INFO - Orchestrator initialized successfully
+2026-04-26 21:06:27,493 - src.interfaces.telegram_bot - INFO - Acquired single-instance lock on port 55678
+2026-04-26 21:06:27,991 - src.interfaces.telegram_bot - INFO - Cleared stale Telegram webhook/session before polling.
+2026-04-26 21:06:27,999 - src.memory.ledger_db - INFO - LedgerMemory initialized (aiosqlite) at data/ledger.db
+2026-04-26 21:06:28,007 - src.core.dynamic_tool_worker - INFO - Dynamic tool worker started pid=30204
+2026-04-26 21:06:40,470 - src.core.llm_router - INFO - System 1 preloaded: gemma4:e4b
+2026-04-26 21:06:40,472 - src.core.orchestrator - INFO - Restored 4 consolidation turn counter(s) from DB
+2026-04-26 21:06:40,505 - src.memory.core_memory - INFO - Updated Core Memory: host_os = Windows
+2026-04-26 21:06:40,507 - src.core.orchestrator - INFO - Orchestrator async_init complete
+2026-04-26 21:06:40,507 - src.interfaces.telegram_bot - INFO - Orchestrator async_init, heartbeat loop, sensory update loop, memory consolidation loop, and outbound queue drainer started. Tasks: Task-9, Task-10, Task-12, Task-11
+2026-04-26 21:06:40,508 - src.core.orchestrator - INFO - Heartbeat loop started.
+2026-04-26 21:06:40,508 - src.core.orchestrator - INFO - Memory consolidation loop started.
+2026-04-26 21:06:40,633 - telegram.ext.Application - INFO - Application started
+2026-04-26 21:06:40,633 - src.interfaces.telegram_bot - INFO - Telegram bot initialized and polling is active.
+2026-04-26 21:06:40,634 - src.interfaces.telegram_bot - INFO - Waiting for Telegram updates. No further terminal output is expected until a message arrives or shutdown begins.

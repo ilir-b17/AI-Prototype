@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
-import os as _os
+import os
 import re
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -67,7 +67,7 @@ _LEDGER_HINTS = (
     "moral",
     "violation",
 )
-_NOCTURNAL_CORE_FACTS_MAX = int(_os.getenv("MAX_NOCTURNAL_CORE_FACTS", "60"))
+_NOCTURNAL_CORE_FACTS_MAX = int(os.getenv("MAX_NOCTURNAL_CORE_FACTS", "60"))
 
 
 @dataclass
@@ -354,12 +354,21 @@ class NocturnalConsolidationSlice1:
         if vector_memory is None:
             return deduped_batch
 
+        # Use broader recall for duplicate detection — if a similar memory
+        # exists anywhere in the top 3 results, suppress this candidate.
+        # This catches paraphrased duplicates that cosine@1 would miss.
+        _dedup_n = int(os.getenv("NOCTURNAL_DEDUP_RECALL_N", "3"))
+
         unique_candidates: List[ConsolidationCandidate] = []
         for candidate in deduped_batch:
             try:
-                matches = await vector_memory.query_memory_async(candidate.text, n_results=1)
+                matches = await vector_memory.query_memory_async(
+                    candidate.text, n_results=_dedup_n
+                )
             except Exception as exc:
-                logger.warning("Semantic dedup query failed; keeping candidate: %s", exc)
+                logger.warning(
+                    "Semantic dedup query failed; keeping candidate: %s", exc
+                )
                 unique_candidates.append(candidate)
                 continue
 
@@ -367,13 +376,40 @@ class NocturnalConsolidationSlice1:
                 unique_candidates.append(candidate)
                 continue
 
-            distance = matches[0].get("distance")
-            if isinstance(distance, (int, float)) and float(distance) <= self.vector_distance_threshold:
-                continue
-
-            unique_candidates.append(candidate)
+            # Check if ANY of the top-N matches is too similar
+            is_near_duplicate = any(
+                isinstance(m.get("distance"), (int, float))
+                and float(m["distance"]) <= self.vector_distance_threshold
+                for m in matches
+            )
+            if not is_near_duplicate:
+                unique_candidates.append(candidate)
 
         return unique_candidates
+
+    @staticmethod
+    def _pre_score_candidate_quality(candidate: ConsolidationCandidate) -> float:
+        """Heuristic pre-score to prioritize higher-value candidates pre-System 2."""
+        source_weight = {
+            "critic_feedback": 1.00,
+            "ledger_log": 0.95,
+            "system_2_blueprint": 0.90,
+            "worker_output": 0.85,
+            "chat_user": 0.75,
+            "chat_assistant": 0.65,
+        }.get(str(candidate.source or ""), 0.50)
+
+        text = str(candidate.text or "").lower()
+        signal_bonus = 0.0
+        if "prefer" in text or "preference" in text:
+            signal_bonus += 0.20
+        if "error" in text or "warning" in text or "critical" in text:
+            signal_bonus += 0.15
+        if "must" in text or "should" in text:
+            signal_bonus += 0.10
+
+        length_bonus = min(len(text) / 400.0, 0.25)
+        return source_weight + signal_bonus + length_bonus
 
     async def extract_and_filter_candidates(
         self,
@@ -397,7 +433,18 @@ class NocturnalConsolidationSlice1:
             now_iso=now_iso,
         )
         deterministic = self.deterministic_filter(extracted)
-        return await self.semantic_deduplicate(deterministic, vector_memory=vector_memory)
+        deduplicated = await self.semantic_deduplicate(
+            deterministic,
+            vector_memory=vector_memory,
+        )
+
+        # Pre-score and prioritize candidates before System 2 quality scoring.
+        # This improves top-of-list relevance when candidate volume is high.
+        return sorted(
+            deduplicated,
+            key=self._pre_score_candidate_quality,
+            reverse=True,
+        )
 
     @staticmethod
     def _apply_redactor(

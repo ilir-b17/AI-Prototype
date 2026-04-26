@@ -956,6 +956,532 @@ async def session_command(
         await update.message.reply_text(f"Session command error: {e}")
 
 
+async def why_command(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    """/why [last|moral|energy|health|backlog] - introspect AIDEN's state.
+
+    Subcommands:
+      /why          - explain the last supervisor decision
+      /why last     - same as /why
+      /why moral    - recent moral audit results
+      /why energy   - current energy budget and deferred tasks
+      /why backlog  - current backlog status summary
+      /why health   - system health: errors and synthesis history
+    """
+    if not is_authorized(update.effective_user.id):
+        await update.message.reply_text(_UNAUTHORIZED_MSG)
+        return
+
+    orchestrator_inst = context.bot_data.get("orchestrator") or orchestrator
+    if orchestrator_inst is None:
+        await update.message.reply_text(_ORCHESTRATOR_NOT_AVAILABLE_MSG)
+        return
+
+    args = getattr(context, "args", []) or []
+    subcommand = (args[0].lower() if args else "last").strip()
+
+    user_id = str(update.effective_user.id)
+
+    await update.message.reply_text(
+        f"⏳ Fetching introspection data ({subcommand})..."
+    )
+
+    try:
+        result = await asyncio.wait_for(
+            _execute_why_subcommand(orchestrator_inst, subcommand, user_id),
+            timeout=float(os.getenv("AGENT_TIMEOUT_SECONDS", "60")),
+        )
+        await update.message.reply_text(result[:4096])
+    except asyncio.TimeoutError:
+        await update.message.reply_text(
+            "Introspection query timed out. Try again or use a more specific subcommand."
+        )
+    except Exception as exc:
+        logger.error("/why error: %s", exc, exc_info=True)
+        await update.message.reply_text(f"Introspection failed: {exc}")
+
+
+async def memory_command(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    """/memory [query|stats|compare] - debug two-stage memory retrieval.
+
+    Subcommands:
+      /memory stats              - ChromaDB collection statistics
+      /memory query <text>       - run two-stage retrieval and show scores
+      /memory compare <text>     - show cosine-only vs reranked side-by-side
+    """
+    if not is_authorized(update.effective_user.id):
+        await update.message.reply_text(_UNAUTHORIZED_MSG)
+        return
+
+    orchestrator_inst = context.bot_data.get("orchestrator") or orchestrator
+    if orchestrator_inst is None:
+        await update.message.reply_text(_ORCHESTRATOR_NOT_AVAILABLE_MSG)
+        return
+
+    args = getattr(context, "args", []) or []
+    subcommand = (args[0].lower() if args else "stats").strip()
+    query_text = " ".join(args[1:]).strip() if len(args) > 1 else ""
+
+    try:
+        if subcommand == "stats":
+            await _memory_stats(update, orchestrator_inst)
+
+        elif subcommand == "query":
+            if not query_text:
+                await update.message.reply_text(
+                    "Usage: /memory query <your search text>"
+                )
+                return
+            await update.message.reply_text(f"⏳ Searching: {query_text!r}...")
+            await _memory_query(update, orchestrator_inst, query_text)
+
+        elif subcommand == "compare":
+            if not query_text:
+                await update.message.reply_text(
+                    "Usage: /memory compare <your search text>"
+                )
+                return
+            await update.message.reply_text(
+                f"⏳ Running cosine vs reranked comparison for: {query_text!r}..."
+            )
+            await _memory_compare(update, orchestrator_inst, query_text)
+
+        else:
+            await update.message.reply_text(
+                f"Unknown subcommand: {subcommand!r}\n\n"
+                "Available: /memory stats, /memory query <text>, "
+                "/memory compare <text>"
+            )
+
+    except Exception as exc:
+        logger.error("/memory error: %s", exc, exc_info=True)
+        await update.message.reply_text(f"Memory command error: {exc}")
+
+
+async def _memory_stats(update: Update, orchestrator_inst) -> None:
+    try:
+        count = orchestrator_inst.vector_memory.get_memory_count()
+        reranker = getattr(orchestrator_inst, "memory_reranker", None)
+        reranker_enabled = reranker.enabled if reranker else False
+        reranker_config = reranker.config if reranker else None
+
+        lines = [
+            "🧠 Archival Memory Stats",
+            "",
+            f"Total memories: {count}",
+            f"Two-stage reranking: {'✅ enabled' if reranker_enabled else '❌ disabled'}",
+        ]
+        if reranker_config and reranker_enabled:
+            lines += [
+                f"  Recall multiplier: {reranker_config.recall_multiplier}x",
+                f"  Max candidates: {reranker_config.max_candidates}",
+                f"  LLM score weight (alpha): {reranker_config.alpha:.0%}",
+                f"  Timeout: {reranker_config.timeout_seconds}s",
+            ]
+        await update.message.reply_text("\n".join(lines))
+    except Exception as exc:
+        await update.message.reply_text(f"Stats error: {exc}")
+
+
+async def _memory_query(update: Update, orchestrator_inst, query: str) -> None:
+    """Run two-stage retrieval and show ranked results."""
+    _ = orchestrator_inst
+    try:
+        from src.skills.search_archival_memory import search_archival_memory
+        import json
+
+        result_json = await asyncio.wait_for(
+            search_archival_memory(query, n_results=5),
+            timeout=60.0,
+        )
+        data = json.loads(result_json)
+
+        if data.get("status") != "success":
+            await update.message.reply_text(
+                f"Search failed: {data.get('message', 'Unknown error')}"
+            )
+            return
+
+        results = data.get("results", [])
+        reranked = data.get("reranked", False)
+        candidates = data.get("candidates_retrieved", 0)
+
+        lines = [
+            f"🔍 Memory Search: {query!r}",
+            "",
+            f"Retrieved {candidates} candidates -> {len(results)} results "
+            f"({'reranked ✅' if reranked else 'cosine only'})",
+            "",
+        ]
+        for i, r in enumerate(results, 1):
+            doc_preview = str(r.get("document", ""))[:120]
+            dist = r.get("distance", 0)
+            if reranked:
+                combined = r.get("combined_score", 0)
+                llm = r.get("rerank_score", 0)
+                lines.append(
+                    f"{i}. [score={combined:.2f} llm={llm:.1f} cos={dist:.2f}]\n"
+                    f"   {doc_preview}..."
+                )
+            else:
+                lines.append(f"{i}. [distance={dist:.3f}]\n   {doc_preview}...")
+
+        await update.message.reply_text("\n".join(lines)[:4096])
+
+    except asyncio.TimeoutError:
+        await update.message.reply_text("Search timed out.")
+    except Exception as exc:
+        await update.message.reply_text(f"Query error: {exc}")
+
+
+async def _memory_compare(update: Update, orchestrator_inst, query: str) -> None:
+    """Show cosine-only vs reranked results side by side."""
+    _ = orchestrator_inst
+    try:
+        from src.skills.search_archival_memory import search_archival_memory
+        import json
+
+        # Run cosine-only
+        cosine_json = await asyncio.wait_for(
+            search_archival_memory(query, n_results=5, skip_reranking=True),
+            timeout=30.0,
+        )
+        cosine_data = json.loads(cosine_json)
+        cosine_results = cosine_data.get("results", [])
+
+        # Run with reranking
+        reranked_json = await asyncio.wait_for(
+            search_archival_memory(query, n_results=5, skip_reranking=False),
+            timeout=60.0,
+        )
+        reranked_data = json.loads(reranked_json)
+        reranked_results = reranked_data.get("results", [])
+        was_reranked = reranked_data.get("reranked", False)
+
+        lines = [
+            f"📊 Cosine vs Reranked: {query!r}",
+            "",
+            "━━ Cosine only ━━",
+        ]
+        for i, r in enumerate(cosine_results[:3], 1):
+            lines.append(
+                f"{i}. [{r.get('distance', 0):.3f}] "
+                f"{str(r.get('document', ''))[:80]}..."
+            )
+
+        lines += ["", f"━━ Reranked ({'✅' if was_reranked else 'same - reranking disabled'}) ━━"]
+        for i, r in enumerate(reranked_results[:3], 1):
+            if was_reranked:
+                lines.append(
+                    f"{i}. [score={r.get('combined_score', 0):.2f}] "
+                    f"{str(r.get('document', ''))[:80]}..."
+                )
+            else:
+                lines.append(
+                    f"{i}. [{r.get('distance', 0):.3f}] "
+                    f"{str(r.get('document', ''))[:80]}..."
+                )
+
+        # Highlight any ordering differences
+        cosine_order = [
+            str(r.get("document", ""))[:30]
+            for r in cosine_results[:3]
+        ]
+        reranked_order = [
+            str(r.get("document", ""))[:30]
+            for r in reranked_results[:3]
+        ]
+        if cosine_order != reranked_order and was_reranked:
+            lines += ["", "↕️ Ordering changed by reranking"]
+        elif was_reranked:
+            lines += ["", "= Same ordering (cosine and reranked agree)"]
+
+        await update.message.reply_text("\n".join(lines)[:4096])
+
+    except asyncio.TimeoutError:
+        await update.message.reply_text("Comparison timed out.")
+    except Exception as exc:
+        await update.message.reply_text(f"Compare error: {exc}")
+
+
+async def _execute_why_subcommand(
+    orchestrator_inst,
+    subcommand: str,
+    user_id: str,
+) -> str:
+    """Execute the appropriate introspection query for /why subcommand."""
+    registry = orchestrator_inst.cognitive_router.registry
+    handlers = {
+        "": _why_last_subcommand,
+        "last": _why_last_subcommand,
+        "moral": _why_moral_subcommand,
+        "energy": _why_energy_subcommand,
+        "backlog": _why_backlog_subcommand,
+        "health": _why_health_subcommand,
+    }
+    handler = handlers.get(str(subcommand or "").strip().lower())
+    if handler is None:
+        return (
+            f"Unknown subcommand: {subcommand!r}\n\n"
+            "Available: /why (last decision), /why moral, /why energy, "
+            "/why backlog, /why health"
+        )
+
+    return await handler(registry, user_id)
+
+
+def _parse_why_json_payload(raw: str):
+    import json as _json
+
+    try:
+        parsed = _json.loads(raw)
+    except Exception:
+        return None
+    return parsed if isinstance(parsed, dict) else None
+
+
+async def _why_last_subcommand(registry, user_id: str) -> str:
+    fn = registry.get_function("query_decision_log")
+    if fn is None:
+        return "query_decision_log skill not loaded."
+
+    raw = await fn(scope="last_turn", limit=1, user_id=user_id)
+    data = _parse_why_json_payload(raw)
+    if data is None:
+        return raw
+
+    decisions = data.get("decisions", [])
+    total = data.get("total_decisions_on_record", 0)
+    if not decisions:
+        return (
+            f"No supervisor decisions recorded yet "
+            f"(total on record: {total}).\n\n"
+            "Decisions are logged after each completed turn. "
+            "Send a message and then /why to see the decision."
+        )
+
+    d = decisions[0]
+    reasoning = str(d.get("reasoning_preview", "")).strip()
+    is_direct = bool(d.get("is_direct", False))
+    workers = int(d.get("worker_count", 0) or 0)
+
+    lines = [
+        "📋 Last Supervisor Decision",
+        "",
+        f"Question: {d.get('user_input_preview', '')}",
+        f"Plan: {d.get('plan', 'Direct response')}",
+        f"Mode: {'Direct response' if is_direct else f'{workers} agent(s)'}",
+    ]
+    if reasoning:
+        lines.append(f"Reasoning: {reasoning}")
+    lines += [
+        f"Energy before: {d.get('energy_before', 0)}",
+        f"Timestamp: {d.get('timestamp', '')}",
+        "",
+        f"Total decisions on record: {total}",
+        "Use /why moral for audit results - /why energy for budget",
+    ]
+    return "\n".join(lines)
+
+
+async def _why_moral_subcommand(registry, user_id: str) -> str:
+    fn = registry.get_function("query_decision_log")
+    if fn is None:
+        return "query_decision_log skill not loaded."
+
+    raw = await fn(scope="all", limit=5, user_id=user_id)
+    data = _parse_why_json_payload(raw)
+    if data is None:
+        return raw
+
+    moral_records = data.get("moral_audit_records", [])
+    if not moral_records:
+        return (
+            "✅ No moral audit records found for recent turns.\n\n"
+            "This could mean:\n"
+            "- Recent outputs passed trivially (read-only fast-path)\n"
+            "- No turns have completed yet\n"
+            "Moral audit records are created when the critic evaluates output."
+        )
+
+    lines = ["⚖️ Recent Moral Audit Results", ""]
+    for r in moral_records[:5]:
+        approved = bool(r.get("is_approved", True))
+        icon = "✅" if approved else "❌"
+        lines.append(f"{icon} [{r.get('audit_mode', '')}] {r.get('request_preview', '?')[:60]}")
+        if not approved:
+            tiers = r.get("violated_tiers", [])
+            constraints = r.get("remediation_constraints", [])
+            if tiers:
+                lines.append(f"   Violated: {', '.join(tiers)}")
+            if constraints:
+                lines.append(f"   Constraints: {'; '.join(constraints[:2])}")
+        lines.append(f"   {r.get('timestamp', '')}")
+        lines.append("")
+    return "\n".join(lines)
+
+
+async def _why_energy_subcommand(registry, user_id: str) -> str:
+    _ = user_id
+    fn = registry.get_function("query_energy_state")
+    if fn is None:
+        return "query_energy_state skill not loaded."
+
+    raw = await fn(include_deferred_tasks=True, include_blocked_tasks=True)
+    data = _parse_why_json_payload(raw)
+    if data is None:
+        return raw
+
+    energy = data.get("energy", {})
+    snapshot = data.get("backlog_snapshot", {})
+    deferred = data.get("deferred_tasks", [])
+    blocked = data.get("blocked_tasks", [])
+
+    lines = [
+        "⚡ Energy State",
+        "",
+        f"Current budget: {energy.get('current_predictive_budget', '?')}/{energy.get('initial_budget', 100)} ({energy.get('budget_percent', 0)}%)",
+        f"ROI threshold: {energy.get('policy', {}).get('roi_threshold', '?')}",
+        f"Min reserve: {energy.get('policy', {}).get('min_reserve', '?')}",
+        "",
+        "Backlog snapshot:",
+        f"  Pending: {snapshot.get('pending', 0)}  "
+        f"Active: {snapshot.get('active', 0)}  "
+        f"Deferred: {snapshot.get('deferred', 0)}  "
+        f"Blocked: {snapshot.get('blocked', 0)}",
+    ]
+
+    if deferred:
+        lines += ["", f"Deferred tasks ({len(deferred)}):"]
+        for t in deferred[:5]:
+            force_note = " [⚠ will force-execute next]" if t.get("will_force_execute", False) else ""
+            lines.append(
+                f"  #{t['id']} {t['title'][:50]} "
+                f"(defer #{t.get('defer_count', 0)}, "
+                f"ROI={t.get('roi_at_deferral', 0):.2f})"
+                f"{force_note}"
+            )
+
+    if blocked:
+        lines += ["", f"Blocked tasks ({len(blocked)}):"]
+        for t in blocked[:3]:
+            lines.append(f"  #{t['id']} {t['title'][:50]}")
+
+    return "\n".join(lines)
+
+
+async def _why_backlog_subcommand(registry, user_id: str) -> str:
+    _ = user_id
+    fn = registry.get_function("query_objective_status")
+    if fn is None:
+        return "query_objective_status skill not loaded."
+
+    raw = await fn(status_filter="all", include_energy_context=False, limit=20)
+    data = _parse_why_json_payload(raw)
+    if data is None:
+        return raw
+
+    summary = data.get("backlog_summary", {})
+    tasks = data.get("tasks", [])
+
+    lines = [
+        "📋 Objective Backlog Status",
+        "",
+        f"Pending:   {summary.get('pending', 0)}",
+        f"Active:    {summary.get('active', 0)}",
+        f"Deferred:  {summary.get('deferred_due_to_energy', 0)}",
+        f"Blocked:   {summary.get('blocked', 0)}",
+        f"Completed: {summary.get('completed', 0)}",
+    ]
+
+    if tasks:
+        lines += ["", "Active objectives (sample):"]
+        status_icons = {
+            "pending": "⏳",
+            "active": "🔄",
+            "deferred_due_to_energy": "💤",
+            "blocked": "🚫",
+            "completed": "✅",
+        }
+        for t in tasks[:8]:
+            status_icon = status_icons.get(str(t.get("status", "")), "❓")
+            lines.append(
+                f"  {status_icon} [{t.get('tier', '?')}] "
+                f"#{t.get('id', '?')} {str(t.get('title', ''))[:50]}"
+            )
+
+    lines += [
+        "",
+        "Use /why energy for deferred task details",
+        "Use /goals for full backlog view",
+    ]
+    return "\n".join(lines)
+
+
+async def _why_health_subcommand(registry, user_id: str) -> str:
+    _ = user_id
+    fn = registry.get_function("query_system_health")
+    if fn is None:
+        return "query_system_health skill not loaded."
+
+    raw = await fn(hours=24, include_synthesis_history=True, include_error_log=True)
+    data = _parse_why_json_payload(raw)
+    if data is None:
+        return raw
+
+    error_data = data.get("error_log", {})
+    synthesis_data = data.get("synthesis_history", {})
+    lines = [f"🩺 System Health (last {data.get('report_window_hours', 24)}h)", ""]
+
+    error_summary = error_data.get("summary", {})
+    total_errors = int(error_data.get("total_entries", 0) or 0)
+    if total_errors == 0:
+        lines.append("✅ Error log: clean (no WARNING/ERROR/CRITICAL entries)")
+    else:
+        summary_parts = [f"{lvl}: {cnt}" for lvl, cnt in sorted(error_summary.items())]
+        lines.append(f"⚠️  Error log: {' | '.join(summary_parts)}")
+        for e in error_data.get("entries", [])[:3]:
+            lines.append(f"   [{e.get('level', '?')}] {e.get('message_preview', '')[:80]}")
+
+    lines.append("")
+
+    synth_total = int(synthesis_data.get("total_runs", 0) or 0)
+    if synth_total == 0:
+        lines.append("🔧 Synthesis: no runs recorded")
+        return "\n".join(lines)
+
+    synth_summary = synthesis_data.get("summary", {})
+    summary_parts = [
+        f"{_STATUS_ICONS_MAP.get(status, status)}{status}: {count}"
+        for status, count in sorted(synth_summary.items())
+    ]
+    lines.append(f"🔧 Synthesis runs: {' | '.join(summary_parts)}")
+
+    blocked_runs = [
+        run for run in synthesis_data.get("runs", [])
+        if run.get("status") in ("blocked", "rejected")
+    ]
+    for run in blocked_runs[:2]:
+        lines.append(
+            f"   {run.get('status_icon', '?')} {run.get('tool_name', '?')}: "
+            f"{run.get('blocked_reason_preview', '')[:80]}"
+        )
+    return "\n".join(lines)
+
+
+# Status icon map for telegram_bot module scope
+_STATUS_ICONS_MAP = {
+    "approved": "✅ ",
+    "rejected": "❌ ",
+    "blocked": "🚫 ",
+    "in_progress": "🔄 ",
+    "pending_approval": "⏳ ",
+}
+
+
 # --- Session subcommand implementations ---
 
 async def _session_status(
@@ -1430,6 +1956,8 @@ def main() -> None:
         application.add_handler(CommandHandler("goals", goals))
         application.add_handler(CommandHandler("addgoal", addgoal))
         application.add_handler(CommandHandler("session", session_command))
+        application.add_handler(CommandHandler("why", why_command))
+        application.add_handler(CommandHandler("memory", memory_command))
         application.add_handler(CommandHandler("eval", eval_command))
         application.add_handler(CommandHandler("shutdown", shutdown))
         application.add_handler(CommandHandler("restart", restart))

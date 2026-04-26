@@ -12,9 +12,9 @@ class AgentState:
     user_input: str
     user_prompt: Dict[str, Any] = field(default_factory=dict)
     chat_history: List[Dict[str, str]] = field(default_factory=list)
-    active_session: Optional[Dict[str, Any]] = field(default_factory=lambda: None)
     current_plan: List[Any] = field(default_factory=list)
     worker_outputs: Dict[str, str] = field(default_factory=dict)
+    structured_outputs: Dict[str, Any] = field(default_factory=dict)
     final_response: str = ""
     iteration_count: int = 0
     admin_guidance: str = ""
@@ -37,7 +37,7 @@ class AgentState:
         user_id: str,
         user_input: str,
         *,
-        user_prompt: Dict[str, Any] | None = None,
+        user_prompt: Optional[Dict[str, Any]] = None,
     ) -> "AgentState":
         return cls(
             user_id=user_id,
@@ -53,6 +53,20 @@ class AgentState:
             if str(item).strip()
         ]
 
+    @staticmethod
+    def _clean_structured_outputs(raw: Any) -> Dict[str, Any]:
+        """Ensure structured_outputs values are JSON-safe plain dicts or None."""
+        if not isinstance(raw, dict):
+            return {}
+        result: Dict[str, Any] = {}
+        for key, value in raw.items():
+            if value is None or isinstance(value, dict):
+                result[str(key)] = value
+            else:
+                # Drop non-dict values to preserve JSON safety
+                result[str(key)] = None
+        return result
+
     @classmethod
     def from_dict(cls, raw: Dict[str, Any]) -> "AgentState":
         return cls(
@@ -60,9 +74,11 @@ class AgentState:
             user_input=str(raw.get("user_input", "")),
             user_prompt=dict(raw.get("user_prompt", {}) or {}),
             chat_history=list(raw.get("chat_history", []) or []),
-            active_session=raw.get("active_session") or None,
             current_plan=list(raw.get("current_plan", []) or []),
             worker_outputs=dict(raw.get("worker_outputs", {}) or {}),
+            structured_outputs=cls._clean_structured_outputs(
+                raw.get("structured_outputs", {})
+            ),
             final_response=str(raw.get("final_response", "") or ""),
             iteration_count=int(raw.get("iteration_count", 0) or 0),
             admin_guidance=str(raw.get("admin_guidance", "") or ""),
@@ -74,7 +90,9 @@ class AgentState:
             moral_audit_mode=str(raw.get("moral_audit_mode", "") or ""),
             moral_audit_trace=str(raw.get("moral_audit_trace", "") or ""),
             moral_audit_bypassed=bool(raw.get("moral_audit_bypassed", False)),
-            moral_remediation_constraints=cls._clean_string_list(raw.get("moral_remediation_constraints", [])),
+            moral_remediation_constraints=cls._clean_string_list(
+                raw.get("moral_remediation_constraints", [])
+            ),
             moral_halt_required=bool(raw.get("moral_halt_required", False)),
             moral_halt_summary=str(raw.get("moral_halt_summary", "") or ""),
             _turn_failed=bool(raw.get("_turn_failed", False)),

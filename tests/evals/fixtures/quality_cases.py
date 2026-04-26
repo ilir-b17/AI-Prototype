@@ -119,4 +119,34 @@ QUALITY_CASES = [
         must_not_contain=[_FORBIDDEN_WORKERS, "{", "tool_name", _FORBIDDEN_THINK],
         tags=["quality", "system_info", "conciseness"],
     ),
+    _qcase(
+        "quality_007",
+        "What do you know about how AIDEN manages its cognitive energy budget?",
+        rubric={
+            "relevance": "Response specifically discusses energy ROI, effort/value scores, or budget mechanics",
+            "accuracy": "Does not confuse energy system with unrelated topics",
+            "sourced": "References specific details like ROI threshold, heartbeat, or deferred tasks",
+            "format": "Response is prose, not raw JSON or ChromaDB output",
+        },
+        expected_tools=["search_archival_memory"],
+        must_not_contain=["WORKERS:", "distance:", "combined_score:"],
+        tags=["quality", "memory_retrieval", "reranking"],
+    ),
+    _qcase(
+        "quality_008",
+        "Search your archival memory for notes about AIDEN's energy system "
+        "and give me a structured breakdown of what you found",
+        rubric={
+            "uses_research": "Response shows evidence of actual memory retrieval",
+            "facts_cited": "Response cites specific facts (numbers, thresholds) "
+                           "not just vague summaries",
+            "gaps_acknowledged": "Response notes if information was incomplete "
+                                 "or not found",
+            "no_markup": "No <agent_output> tags or JSON visible in response",
+            "confidence_appropriate": "Response tone matches actual data quality found",
+        },
+        expected_tools=["search_archival_memory"],
+        must_not_contain=["<agent_output>", "agent_output", "extraction_failed"],
+        tags=["quality", "structured_protocol", "research"],
+    ),
 ]

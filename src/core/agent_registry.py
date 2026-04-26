@@ -27,6 +27,7 @@ _FALLBACK_AGENT_DEFINITIONS = (
         preferred_model="system_1",
         max_tool_calls=4,
         energy_cost=15,
+        output_type="research",
     ),
     AgentDefinition(
         name="coder_agent",
@@ -35,8 +36,8 @@ _FALLBACK_AGENT_DEFINITIONS = (
             "memory updates, or structured execution after research is complete."
         ),
         system_prompt=(
-            "You are the Coder Agent. Execute coding tasks and update memory as needed. "
-            "Escalate early via escalate_to_system_2 when local reasoning is "
+            "You are the Coder Agent. Execute coding tasks and update memory as "
+            "needed. Escalate early via escalate_to_system_2 when local reasoning "
             "insufficient for correctness."
         ),
         allowed_tools=[
@@ -53,6 +54,7 @@ _FALLBACK_AGENT_DEFINITIONS = (
         max_tool_calls=5,
         energy_cost=15,
         depends_on=["research_agent"],
+        output_type="coder",
     ),
     AgentDefinition(
         name="synthesis_agent",
@@ -61,14 +63,15 @@ _FALLBACK_AGENT_DEFINITIONS = (
             "one final, user-facing response without adding new facts."
         ),
         system_prompt=(
-            "You are the Synthesis Agent. Combine prior agent outputs into one clear "
-            "final response for the user. Reconcile overlaps, preserve uncertainties, "
-            "and do not invent facts that were not present in the supplied inputs."
+            "You are the Synthesis Agent. Combine prior agent outputs into one "
+            "clear final response for the user. Reconcile overlaps, preserve "
+            "uncertainties, and do not invent facts not present in the inputs."
         ),
         allowed_tools=[],
         preferred_model="system_2",
         max_tool_calls=0,
         energy_cost=10,
+        output_type="synthesis",
     ),
 )
 
@@ -120,6 +123,19 @@ class AgentRegistry:
 
         allowed_tools = self._coerce_list(front_matter.get("allowed_tools"))
         depends_on = self._coerce_list(front_matter.get("depends_on"))
+        output_type = str(
+            front_matter.get("output_type") or "text"
+        ).strip().lower()
+        if output_type == "text":
+            fallback_output_type = next(
+                (
+                    fallback_agent.output_type
+                    for fallback_agent in _FALLBACK_AGENT_DEFINITIONS
+                    if fallback_agent.name == name
+                ),
+                "text",
+            )
+            output_type = fallback_output_type
 
         return AgentDefinition(
             name=name,
@@ -130,6 +146,7 @@ class AgentRegistry:
             max_tool_calls=int(front_matter.get("max_tool_calls") or 5),
             energy_cost=int(front_matter.get("energy_cost") or 15),
             depends_on=depends_on,
+            output_type=output_type,
         )
 
     @staticmethod

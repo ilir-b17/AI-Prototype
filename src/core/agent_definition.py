@@ -14,3 +14,4 @@ class AgentDefinition:
     max_tool_calls: int = 5
     energy_cost: int = 15
     depends_on: List[str] = field(default_factory=list)
+    output_type: str = "text"   # "text" | "research" | "coder" | "synthesis"

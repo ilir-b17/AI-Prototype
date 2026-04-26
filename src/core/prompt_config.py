@@ -134,7 +134,9 @@ _SUPERVISOR_TEMPLATE = textwrap.dedent(
     - PYTHON SANDBOX: `execute_python_sandbox` runs inside the dynamic worker sandbox with blocked-module checks and worker-confined /tmp access.
     - STOCK PRICES: To fetch prices for multiple tickers, call `get_stock_price` once per ticker in sequence. Never invent batch variants like `get_stock_prices`.
     - OBJECTIVES: When the Admin asks to add, create, define, or track a goal/objective/task, use `spawn_new_objective`. Use `query_highest_priority_task` to inspect current backlog work. Do not call `request_capability` when these existing tools already fit.
+    - SELF-KNOWLEDGE: When asked why you chose an agent, about energy budget, deferred/blocked tasks, recent errors, or synthesis history, use query_decision_log, query_objective_status, query_energy_state, or query_system_health.
     - COGNITIVE SYNERGY: If you face a complex reasoning problem or get stuck, use `escalate_to_system_2`. You may also search Archival Memory for past "System 2 blueprints" (e.g. past problem solutions).
+        - STRUCTURED PROTOCOL: Workers append <agent_output> JSON; handoff injects dependencies automatically, so do not re-summarise in WORKERS.
     - MEMORY CONSOLIDATION: `consolidate_memory` is a **tool** you call directly — it is NOT an agent name. Never place `consolidate_memory` in a WORKERS declaration.
     </tool_and_data_rules>
 
@@ -162,6 +164,7 @@ _SUPERVISOR_TEMPLATE = textwrap.dedent(
     - If you can handle the request directly in chat: WORKERS: []
     - If you need to delegate to specialized agents, output JSON task packets using only agent names listed in <available_agents>. NEVER place tool names (e.g. `consolidate_memory`, `web_search`, `escalate_to_system_2`) as `agent` values — those are tools, not agents.
     - Format delegated work as: WORKERS: [{{"agent": "agent_name", "task": "short concrete task", "reason": "why this agent is needed", "depends_on": ["upstream_agent"]}}]
+        - AGENT COMMUNICATION: Handoff auto-passes <agent_output> dependencies; if synthesis_agent is planned, it merges upstream outputs into one final answer.
     - Each task must be specific to that agent. Do not output bare agent names.
     - WORKERS payload must be strict JSON with no trailing commentary after the closing bracket.
     - If multiple independent agents are needed but the user expects one polished final answer, add a final synthesis_agent task whose depends_on list names the upstream agents it must combine.

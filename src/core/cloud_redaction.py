@@ -116,7 +116,7 @@ def redact_text_for_cloud(
     text: str,
     *,
     allow_sensitive_context: bool = False,
-    max_chars: int = 3500,
+    max_chars: int = 4000,
 ) -> str:
     """Redact a single text string before it is sent to a cloud provider."""
     raw_text = str(text or "")

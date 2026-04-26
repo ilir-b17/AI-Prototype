@@ -242,6 +242,28 @@ class LedgerMemory:
                 )
             """)
             await self._db.execute("""
+                CREATE TABLE IF NOT EXISTS supervisor_decisions (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    user_id TEXT NOT NULL DEFAULT '',
+                    user_input TEXT NOT NULL DEFAULT '',
+                    plan_json TEXT NOT NULL DEFAULT '[]',
+                    is_direct INTEGER NOT NULL DEFAULT 0,
+                    reasoning TEXT NOT NULL DEFAULT '',
+                    energy_before INTEGER NOT NULL DEFAULT 0,
+                    worker_count INTEGER NOT NULL DEFAULT 0,
+                    session_id INTEGER,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            """)
+            await self._db.execute("""
+                CREATE INDEX IF NOT EXISTS idx_supervisor_decisions_user_created
+                ON supervisor_decisions(user_id, created_at DESC)
+            """)
+            await self._db.execute("""
+                CREATE INDEX IF NOT EXISTS idx_supervisor_decisions_created
+                ON supervisor_decisions(created_at DESC)
+            """)
+            await self._db.execute("""
                 CREATE TABLE IF NOT EXISTS conversation_sessions (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     name TEXT NOT NULL,
@@ -2356,6 +2378,265 @@ class LedgerMemory:
                 "DELETE FROM pending_mfa_states WHERE user_id=?", (user_id,)
             )
             await self._db.commit()
+
+    # -----------------------------------------------------------------
+    # Supervisor Decisions  (introspection log)
+    # -----------------------------------------------------------------
+
+    async def log_supervisor_decision(
+        self,
+        *,
+        user_id: str,
+        user_input: str,
+        plan_json: str,
+        is_direct: bool,
+        reasoning: str,
+        energy_before: int,
+        worker_count: int = 0,
+        session_id: Optional[int] = None,
+    ) -> int:
+        """Log one supervisor plan decision. Returns row id.
+
+        Called fire-and-forget from supervisor_node — must never raise.
+        """
+        try:
+            async with self._lock:
+                cursor = await self._db.execute(
+                    "INSERT INTO supervisor_decisions "
+                    "(user_id, user_input, plan_json, is_direct, reasoning, "
+                    "energy_before, worker_count, session_id) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        str(user_id or "")[:64],
+                        str(user_input or "")[:500],
+                        str(plan_json or "[]"),
+                        1 if is_direct else 0,
+                        str(reasoning or "")[:1000],
+                        max(0, int(energy_before)),
+                        max(0, int(worker_count)),
+                        session_id,
+                    ),
+                )
+                await self._db.commit()
+                return int(cursor.lastrowid)
+        except Exception as exc:
+            logger.warning("log_supervisor_decision failed: %s", exc)
+            return 0
+
+    async def get_recent_supervisor_decisions(
+        self,
+        user_id: Optional[str] = None,
+        limit: int = 10,
+    ) -> List[Dict[str, Any]]:
+        """Return recent supervisor decisions, most recent first."""
+        capped_limit = max(1, min(int(limit), 50))
+        async with self._lock:
+            if user_id is not None:
+                cursor = await self._db.execute(
+                    "SELECT id, user_id, user_input, plan_json, is_direct, "
+                    "reasoning, energy_before, worker_count, session_id, "
+                    "created_at FROM supervisor_decisions "
+                    "WHERE user_id = ? "
+                    "ORDER BY created_at DESC, id DESC LIMIT ?",
+                    (str(user_id), capped_limit),
+                )
+            else:
+                cursor = await self._db.execute(
+                    "SELECT id, user_id, user_input, plan_json, is_direct, "
+                    "reasoning, energy_before, worker_count, session_id, "
+                    "created_at FROM supervisor_decisions "
+                    "ORDER BY created_at DESC, id DESC LIMIT ?",
+                    (capped_limit,),
+                )
+            rows = await cursor.fetchall()
+
+        results = []
+        for row in rows:
+            item = dict(row)
+            item["is_direct"] = bool(item.get("is_direct"))
+            try:
+                item["plan"] = json.loads(str(item.get("plan_json") or "[]"))
+            except Exception:
+                item["plan"] = []
+            results.append(item)
+        return results
+
+    async def get_last_supervisor_decision(
+        self,
+        user_id: Optional[str] = None,
+    ) -> Optional[Dict[str, Any]]:
+        """Return the single most recent supervisor decision."""
+        results = await self.get_recent_supervisor_decisions(
+            user_id=user_id, limit=1
+        )
+        return results[0] if results else None
+
+    # -----------------------------------------------------------------
+    # Introspection Queries  (cross-table reads for skill layer)
+    # -----------------------------------------------------------------
+
+    async def get_deferred_tasks_with_energy_context(
+        self,
+        limit: int = 20,
+    ) -> List[Dict[str, Any]]:
+        """Return deferred tasks with their energy deferral details."""
+        capped = max(1, min(int(limit), 50))
+        async with self._lock:
+            cursor = await self._db.execute(
+                "SELECT id, tier, title, priority, estimated_energy, "
+                "defer_count, last_energy_eval_json, next_eligible_at, "
+                "acceptance_criteria, updated_at "
+                "FROM objective_backlog "
+                "WHERE status = 'deferred_due_to_energy' "
+                "ORDER BY priority ASC, defer_count DESC LIMIT ?",
+                (capped,),
+            )
+            rows = await cursor.fetchall()
+
+        result = []
+        for row in rows:
+            item = dict(row)
+            try:
+                eval_json = str(item.get("last_energy_eval_json") or "{}")
+                item["energy_eval"] = json.loads(eval_json) if eval_json else {}
+            except Exception:
+                item["energy_eval"] = {}
+            result.append(item)
+        return result
+
+    async def get_blocked_tasks(self, limit: int = 20) -> List[Dict[str, Any]]:
+        """Return blocked tasks with parent context."""
+        capped = max(1, min(int(limit), 50))
+        async with self._lock:
+            cursor = await self._db.execute(
+                "SELECT t.id, t.tier, t.title, t.priority, t.estimated_energy, "
+                "t.acceptance_criteria, t.updated_at, "
+                "p.title AS parent_title, p.tier AS parent_tier "
+                "FROM objective_backlog t "
+                "LEFT JOIN objective_backlog p ON t.parent_id = p.id "
+                "WHERE t.status = 'blocked' "
+                "ORDER BY t.priority ASC LIMIT ?",
+                (capped,),
+            )
+            rows = await cursor.fetchall()
+        return [dict(r) for r in rows]
+
+    async def get_recent_synthesis_runs(
+        self,
+        limit: int = 10,
+    ) -> List[Dict[str, Any]]:
+        """Return recent synthesis runs with status and outcome."""
+        capped = max(1, min(int(limit), 30))
+        async with self._lock:
+            cursor = await self._db.execute(
+                "SELECT id, user_id, suggested_tool_name, status, "
+                "total_attempts, max_retries, final_tool_name, "
+                "test_summary, blocked_reason, created_at, updated_at "
+                "FROM synthesis_runs "
+                "ORDER BY created_at DESC, id DESC LIMIT ?",
+                (capped,),
+            )
+            rows = await cursor.fetchall()
+        return [dict(r) for r in rows]
+
+    async def get_system_error_log(
+        self,
+        hours: int = 24,
+        limit: int = 30,
+    ) -> List[Dict[str, Any]]:
+        """Return WARNING/ERROR/CRITICAL log entries from the past N hours."""
+        capped_hours = max(1, min(int(hours), 168))
+        capped_limit = max(1, min(int(limit), 100))
+        cutoff_sql = f"-{capped_hours} hours"
+        async with self._lock:
+            cursor = await self._db.execute(
+                "SELECT id, log_level, message, timestamp, context "
+                "FROM system_logs "
+                "WHERE log_level IN ('WARNING', 'ERROR', 'CRITICAL') "
+                "AND datetime(timestamp) >= datetime('now', ?) "
+                "ORDER BY timestamp DESC, id DESC LIMIT ?",
+                (cutoff_sql, capped_limit),
+            )
+            rows = await cursor.fetchall()
+        return [dict(r) for r in rows]
+
+    async def get_moral_audit_summary(
+        self,
+        user_id: Optional[str] = None,
+        limit: int = 10,
+    ) -> List[Dict[str, Any]]:
+        """Return recent moral audit records with parsed decision data."""
+        capped = max(1, min(int(limit), 30))
+        async with self._lock:
+            if user_id is not None:
+                cursor = await self._db.execute(
+                    "SELECT id, user_id, audit_mode, audit_trace, "
+                    "critic_feedback, moral_decision_json, "
+                    "request_redacted, created_at "
+                    "FROM moral_audit_log "
+                    "WHERE user_id = ? "
+                    "ORDER BY created_at DESC, id DESC LIMIT ?",
+                    (str(user_id), capped),
+                )
+            else:
+                cursor = await self._db.execute(
+                    "SELECT id, user_id, audit_mode, audit_trace, "
+                    "critic_feedback, moral_decision_json, "
+                    "request_redacted, created_at "
+                    "FROM moral_audit_log "
+                    "ORDER BY created_at DESC, id DESC LIMIT ?",
+                    (capped,),
+                )
+            rows = await cursor.fetchall()
+
+        results = []
+        for row in rows:
+            item = dict(row)
+            try:
+                decision = json.loads(str(item.get("moral_decision_json") or "{}"))
+                item["is_approved"] = bool(decision.get("is_approved", True))
+                item["scores"] = dict(decision.get("scores", {}))
+                item["violated_tiers"] = list(decision.get("violated_tiers", []))
+                item["remediation_constraints"] = list(
+                    decision.get("remediation_constraints", [])
+                )
+            except Exception:
+                item["is_approved"] = True
+                item["scores"] = {}
+                item["violated_tiers"] = []
+                item["remediation_constraints"] = []
+            results.append(item)
+        return results
+
+    async def get_objective_counts_by_status(self) -> Dict[str, int]:
+        """Return count of objectives grouped by status."""
+        async with self._lock:
+            cursor = await self._db.execute(
+                "SELECT status, COUNT(*) AS cnt "
+                "FROM objective_backlog "
+                "GROUP BY status"
+            )
+            rows = await cursor.fetchall()
+        return {row["status"]: int(row["cnt"]) for row in rows}
+
+    async def count_supervisor_decisions(
+        self,
+        user_id: Optional[str] = None,
+    ) -> int:
+        """Return total supervisor decision count."""
+        async with self._lock:
+            if user_id:
+                cursor = await self._db.execute(
+                    "SELECT COUNT(*) AS cnt FROM supervisor_decisions "
+                    "WHERE user_id = ?",
+                    (str(user_id),),
+                )
+            else:
+                cursor = await self._db.execute(
+                    "SELECT COUNT(*) AS cnt FROM supervisor_decisions"
+                )
+            row = await cursor.fetchone()
+        return int(row["cnt"]) if row else 0
 
     # -----------------------------------------------------------------
     # Conversation Sessions

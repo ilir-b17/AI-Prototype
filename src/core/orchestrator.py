@@ -77,6 +77,18 @@ from src.core.nocturnal_consolidation import NocturnalConsolidationSlice1
 from src.core.goal_planner import GoalPlanner, PlanningResult
 from src.core.energy_judge import EnergyJudge, EnergyEvaluation
 from src.core.energy_roi_engine import EnergyROIEngine, EnergyDecision
+from src.core.memory_reranker import MemoryReranker, load_rerank_config
+from src.core.agent_output import (
+    AgentOutputType,
+    extract_structured_output,
+    format_structured_for_handoff,
+    get_display_text,
+    make_extraction_failed_result,
+    resolve_output_type,
+    strip_agent_output_block,
+    validate_agent_output,
+    OUTPUT_FORMAT_PROMPTS,
+)
 from src.core.moral_ledger import (
     MORAL_DIMENSIONS,
     MORAL_RUBRIC_VERSION,
@@ -285,6 +297,20 @@ class Orchestrator:
             )
             self.energy_judge = EnergyJudge()
             self.energy_roi_engine = EnergyROIEngine()
+            # -- Memory Reranker --------------------------------------------
+            _rerank_config = load_rerank_config()
+            self.memory_reranker = MemoryReranker(_rerank_config)
+            if _rerank_config.enabled:
+                logger.info(
+                    "MemoryReranker initialised: alpha=%.2f multiplier=%d "
+                    "max_candidates=%d timeout=%.1fs",
+                    _rerank_config.alpha,
+                    _rerank_config.recall_multiplier,
+                    _rerank_config.max_candidates,
+                    _rerank_config.timeout_seconds,
+                )
+            else:
+                logger.info("MemoryReranker disabled (ENABLE_MEMORY_RERANKING=false)")
             # Single energy account — drives both fast-path gating and graph node costs.
             _initial_budget = max(0, int(os.getenv("INITIAL_ENERGY_BUDGET", "100")))
             self._energy_budget: int = _initial_budget
@@ -351,7 +377,21 @@ class Orchestrator:
                 logger.warning("System 1 preload skipped: %s", _preload_err)
         self._compiled_graph = build_orchestrator_graph(self)
         await self._restore_consolidation_turn_counts()
-        set_runtime_context(self.ledger_memory, self.core_memory, self.vector_memory, self)
+        # Register the reranker callable in runtime_context so skills can
+        # call it without importing Orchestrator directly.
+        _reranker = getattr(self, "memory_reranker", None)
+        _reranker_callable = (
+            self._rerank_memories
+            if bool(getattr(_reranker, "enabled", False))
+            else None
+        )
+        set_runtime_context(
+            self.ledger_memory,
+            self.core_memory,
+            self.vector_memory,
+            self,
+            reranker_fn=_reranker_callable,
+        )
         # Record the host OS now that we're in an async context
         await self.core_memory.update("host_os", platform.system())
         # Startup pruning: remove stale chat_history rows
@@ -1059,6 +1099,88 @@ class Orchestrator:
         return True
 
     @staticmethod
+    def _is_introspection_query(user_message: str) -> bool:
+        """Return True if the message is asking AIDEN about itself."""
+        lowered = str(user_message or "").lower()
+
+        # Decision / reasoning introspection
+        decision_markers = (
+            "why did you", "why did aiden", "why was",
+            "why chose", "why choose", "why selected",
+            "what did you decide", "last turn", "last decision",
+            "previous response", "moral audit", "was it rejected",
+            "was my response", "was the output",
+        )
+        if any(m in lowered for m in decision_markers):
+            return True
+
+        # Objective / backlog introspection
+        backlog_markers = (
+            "what tasks", "which tasks", "pending tasks", "deferred tasks",
+            "blocked tasks", "show me tasks", "task backlog", "objectives",
+            "what is in the backlog", "what's in the backlog",
+            "show the backlog", "task queue",
+        )
+        if any(m in lowered for m in backlog_markers):
+            return True
+
+        # Energy introspection
+        energy_markers = (
+            "energy budget", "cognitive budget", "energy remaining",
+            "how much energy", "why was task deferred", "why was it deferred",
+            "why deferred", "energy state", "energy level",
+        )
+        if any(m in lowered for m in energy_markers):
+            return True
+
+        # Health / error introspection
+        health_markers = (
+            "system health", "recent errors", "any errors", "what went wrong",
+            "synthesis history", "tool synthesis", "why wasn't the tool",
+            "why didn't you create", "failed synthesis", "system log",
+            "system errors",
+        )
+        if any(m in lowered for m in health_markers):
+            return True
+
+        return False
+
+    @staticmethod
+    def _classify_introspection_type(user_message: str) -> Optional[str]:
+        """Classify what kind of introspection is being requested.
+
+        Returns one of: 'decision', 'backlog', 'energy', 'health', None.
+        Used by the fast-path to select the right introspection skill.
+        """
+        lowered = str(user_message or "").lower()
+
+        # Energy must be checked before backlog to avoid "energy task" ambiguity
+        if any(m in lowered for m in (
+            "energy", "budget", "deferred", "why deferred",
+        )):
+            return "energy"
+
+        if any(m in lowered for m in (
+            "why did you", "why chose", "why selected", "last turn",
+            "last decision", "moral audit", "rejected", "previous response",
+        )):
+            return "decision"
+
+        if any(m in lowered for m in (
+            "tasks", "backlog", "pending", "blocked", "objectives",
+            "task queue",
+        )):
+            return "backlog"
+
+        if any(m in lowered for m in (
+            "health", "error", "errors", "synthesis", "tool creation",
+            "system log", "what went wrong",
+        )):
+            return "health"
+
+        return None
+
+    @staticmethod
     def _is_skill_list_request(user_message: str) -> bool:
         """Return True when the user wants a full inventory list of AIDEN's skills/tools."""
         lowered = (user_message or "").lower()
@@ -1278,6 +1400,52 @@ class Orchestrator:
             return f"Yes. Your name is {name}."
         return "Not yet. You have not told me your name."
 
+    @staticmethod
+    def _meta_history_response(user_message: str, chat_history: List[Dict[str, str]]) -> Optional[str]:
+        if Orchestrator._is_last_reply_question(user_message):
+            return Orchestrator._recall_last_assistant_message(chat_history)
+
+        # Confirmatory follow-ups like "Did you search for it?" / "Have you found it?"
+        # should acknowledge the previous action, not re-trigger a tool.
+        if Orchestrator._is_confirmatory_followup(user_message):
+            return Orchestrator._recall_last_assistant_message(chat_history)
+
+        if Orchestrator._is_summary_request(user_message):
+            return Orchestrator._summarize_chat_history(chat_history)
+
+        return None
+
+    async def _maybe_introspection_meta_response(
+        self,
+        state: Dict[str, Any],
+        user_message: str,
+    ) -> Optional[str]:
+        if not self._is_introspection_query(user_message):
+            return None
+
+        introspection_type = self._classify_introspection_type(user_message)
+        if introspection_type is None:
+            return None
+
+        return await self._handle_introspection_fast_path(
+            user_message=user_message,
+            introspection_type=introspection_type,
+            state=state,
+        )
+
+    async def _maybe_capability_meta_response(self, user_message: str) -> Optional[str]:
+        if not self._should_use_intent_classifier(user_message):
+            return None
+
+        intent = await self._classify_user_intent(user_message)
+        if intent != "capability_query":
+            return None
+
+        return self._build_capability_response(
+            user_message,
+            classified_intent=intent,
+        )
+
     async def _build_profile_response(self, state: Dict[str, Any]) -> Optional[str]:
         user_message = (state.get("user_input") or "").strip()
         lowered = user_message.lower()
@@ -1313,31 +1481,198 @@ class Orchestrator:
         if profile_response:
             return profile_response
 
-        if self._is_last_reply_question(user_message):
-            return self._recall_last_assistant_message(chat_history)
-
-        # Confirmatory follow-ups like "Did you search for it?" / "Have you found it?"
-        # should acknowledge the previous action, not re-trigger a tool.
-        if self._is_confirmatory_followup(user_message):
-            last = self._recall_last_assistant_message(chat_history)
-            if last:
-                return last
-
-        if self._is_summary_request(user_message):
-            return self._summarize_chat_history(chat_history)
+        history_response = self._meta_history_response(user_message, chat_history)
+        if history_response:
+            return history_response
 
         if self._is_skill_list_request(user_message):
             return self._build_compact_skill_list_response()
 
-        if self._should_use_intent_classifier(user_message):
-            intent = await self._classify_user_intent(user_message)
-            if intent == "capability_query":
-                capability_response = self._build_capability_response(
-                    user_message,
-                    classified_intent=intent,
-                )
-                if capability_response:
-                    return capability_response
+        # ── Fast-path: introspection queries ──────────────────────────
+        # These are answered by calling introspection skills directly
+        # without supervisor planning overhead. Complexity is bounded
+        # because the skills are pure DB reads (no LLM iteration needed).
+        introspection_result = await self._maybe_introspection_meta_response(
+            state,
+            user_message,
+        )
+        if introspection_result is not None:
+            return introspection_result
+        # ── End fast-path introspection ───────────────────────────────
+
+        capability_response = await self._maybe_capability_meta_response(user_message)
+        if capability_response:
+            return capability_response
+
+        return None
+
+    @staticmethod
+    def _introspection_backlog_status_filter(user_message: str) -> str:
+        lowered = str(user_message or "").lower()
+        if "deferred" in lowered:
+            return "deferred"
+        if "blocked" in lowered:
+            return "blocked"
+        if "pending" in lowered:
+            return "pending"
+        if "active" in lowered:
+            return "active"
+        return "all"
+
+    @classmethod
+    def _build_introspection_skill_call(
+        cls,
+        *,
+        introspection_type: str,
+        user_message: str,
+        user_id: str,
+    ) -> Optional[tuple[str, Dict[str, Any]]]:
+        if introspection_type == "decision":
+            return "query_decision_log", {
+                "scope": "all",
+                "limit": 5,
+                "user_id": user_id or None,
+            }
+        if introspection_type == "backlog":
+            return "query_objective_status", {
+                "status_filter": cls._introspection_backlog_status_filter(user_message),
+                "include_energy_context": True,
+            }
+        if introspection_type == "energy":
+            return "query_energy_state", {
+                "include_deferred_tasks": True,
+                "include_blocked_tasks": True,
+            }
+        if introspection_type == "health":
+            return "query_system_health", {
+                "hours": 24,
+                "include_synthesis_history": True,
+            }
+        return None
+
+    @staticmethod
+    def _build_introspection_format_messages(
+        *,
+        user_message: str,
+        raw_result: str,
+        core_mem_str: str,
+    ) -> List[Dict[str, str]]:
+        return [
+            {
+                "role": "system",
+                "content": (
+                    "You are AIDEN, a local autonomous AI agent. "
+                    "The user has asked an introspective question about your own "
+                    "state, decisions, or history. You have retrieved the relevant "
+                    "data and must now present it in a clear, concise, natural "
+                    "language response. "
+                    "Rules: "
+                    "1. Summarise the key facts — do not dump raw JSON. "
+                    "2. For empty results, explain what the data means (e.g. 'no deferred tasks means energy is sufficient'). "
+                    "3. Keep responses under 400 words. "
+                    "4. Never fabricate data — only use what is in the skill output. "
+                    "5. Do not include JSON, XML tags, or WORKERS: in your response.\n\n"
+                    f"{core_mem_str}"
+                ),
+            },
+            {
+                "role": "user",
+                "content": (
+                    f"User question: {user_message}\n\n"
+                    f"Introspection data (JSON):\n{raw_result}"
+                ),
+            },
+        ]
+
+    async def _execute_introspection_skill(
+        self,
+        *,
+        user_message: str,
+        introspection_type: str,
+        state: Dict[str, Any],
+    ) -> Optional[str]:
+        skill_registry = self.cognitive_router.registry
+
+        try:
+            timeout = float(os.getenv("TOOL_EXEC_TIMEOUT_SECONDS", "30.0"))
+            user_id = str(state.get("user_id") or "")
+            skill_call = self._build_introspection_skill_call(
+                introspection_type=introspection_type,
+                user_message=user_message,
+                user_id=user_id,
+            )
+            if skill_call is None:
+                return None
+
+            skill_name, skill_args = skill_call
+            fn = skill_registry.get_function(skill_name)
+            if not fn:
+                return None
+
+            return await asyncio.wait_for(fn(**skill_args), timeout=timeout)
+        except asyncio.TimeoutError:
+            logger.warning("Introspection skill timed out for type=%s", introspection_type)
+            return None
+        except Exception as exc:
+            logger.warning("Introspection skill error: %s", exc)
+            return None
+
+    async def _safe_core_context_string(self) -> str:
+        try:
+            return await self.core_memory.get_context_string()
+        except Exception:
+            return ""
+
+    async def _handle_introspection_fast_path(
+        self,
+        user_message: str,
+        introspection_type: str,
+        state: Dict[str, Any],
+    ) -> Optional[str]:
+        """Execute an introspection skill and format the result with System 1.
+
+        Returns the formatted response string, or None if the skill fails
+        or System 1 cannot produce a useful response.
+        """
+        logger.info(
+            "Introspection fast-path triggered: type=%s message=%r",
+            introspection_type,
+            user_message[:80],
+        )
+
+        raw_result = await self._execute_introspection_skill(
+            user_message=user_message,
+            introspection_type=introspection_type,
+            state=state,
+        )
+
+        if not raw_result:
+            return None
+
+        # Ask System 1 to format the raw skill output into a natural
+        # language response. This is a lightweight formatting call —
+        # no tool usage, just text transformation.
+        core_mem_str = await self._safe_core_context_string()
+
+        messages = self._build_introspection_format_messages(
+            user_message=user_message,
+            raw_result=raw_result,
+            core_mem_str=core_mem_str,
+        )
+
+        result = await self._route_to_system_1(
+            messages,
+            allowed_tools=[],
+            deadline_seconds=45.0,
+            context="introspection_fast_path",
+        )
+
+        if (
+            result.status == "ok"
+            and result.content
+            and not result.content.startswith("[System 1 - Error]")
+        ):
+            return self.cognitive_router.sanitize_response(result.content)
 
         return None
 
@@ -1900,27 +2235,68 @@ class Orchestrator:
         session_id: Optional[int] = None,
         epic_id: Optional[int] = None,
     ) -> str:
-        """Retrieve top archival memory snippets relevant to the query.
-        Scoped to session/epic when provided."""
+        """Retrieve top archival memory snippets with two-stage retrieval.
+
+        Stage 1: Broad cosine recall (n_results * multiplier candidates).
+        Stage 2: LLM reranking to select the most relevant subset.
+        Falls back to cosine-only if reranker is disabled or fails.
+        """
         if not query:
             return ""
+
         _max_chunk = int(os.getenv("MAX_ARCHIVAL_CHUNK_CHARS", "2000"))
         _max_total = int(os.getenv("MAX_ARCHIVAL_TOTAL_CHARS", "6000"))
-
-        from src.skills.search_archival_memory import _build_where_clause
-        where = _build_where_clause(session_id, epic_id)
+        _final_n = 3  # final number of results to inject into prompt
+        _reranker = getattr(self, "memory_reranker", None)
+        _reranker_enabled = bool(getattr(_reranker, "enabled", False))
 
         try:
-            results = await self.vector_memory.query_memory_async(
-                query, n_results=3, where=where
+            # Build where clause for session scoping (from Direction 1)
+            where: Optional[Dict[str, Any]] = None
+            try:
+                from src.skills.search_archival_memory import _build_where_clause
+                where = _build_where_clause(session_id, epic_id)
+            except ImportError:
+                pass
+
+            # Stage 1: broad cosine recall
+            broad_n = (
+                _reranker.broad_n_results(_final_n)
+                if _reranker_enabled
+                else _final_n
             )
-            # Fall back to global if scoped returns nothing useful
-            if not results and where is not None:
-                results = await self.vector_memory.query_memory_async(
-                    query, n_results=3
+            try:
+                candidates = await self.vector_memory.query_memory_async(
+                    query, n_results=broad_n, where=where
                 )
-            if not results:
+            except Exception:
+                candidates = []
+
+            # Fallback: if scoped returns < 2 results, go global
+            if where is not None and len(candidates) < 2:
+                try:
+                    candidates = await self.vector_memory.query_memory_async(
+                        query, n_results=broad_n
+                    )
+                except Exception:
+                    candidates = []
+
+            if not candidates:
                 return ""
+
+            # Stage 2: rerank if we have more candidates than needed
+            if (
+                _reranker_enabled
+                and len(candidates) > _final_n
+            ):
+                results = await self._rerank_memories(query, candidates, _final_n)
+            else:
+                results = sorted(
+                    candidates,
+                    key=lambda c: float(c.get("distance") or 1.0),
+                )[:_final_n]
+
+            # Build the archival context XML block
             lines = ["<Archival_Memory>"]
             total = 0
             for item in results:
@@ -1929,18 +2305,95 @@ class Orchestrator:
                     continue
                 if total + len(snippet) > _max_total:
                     break
-                # Annotate scoped memories so the supervisor knows they are
-                # project-specific
+
+                # Annotate with session scope and rerank score when available
                 meta = item.get("metadata", {}) or {}
                 mem_session = int(meta.get("session_id") or 0)
-                scope_prefix = "[session] " if mem_session and mem_session == session_id else ""
-                lines.append(f"  <Memory>{scope_prefix}{snippet}</Memory>")
+                scope_tag = (
+                    " [session]"
+                    if mem_session and mem_session == session_id
+                    else ""
+                )
+
+                # Include rerank score annotation when reranking was applied
+                rerank_annotation = ""
+                if item.get("reranked"):
+                    rerank_annotation = (
+                        f" [relevance={item.get('combined_score', 0):.2f}]"
+                    )
+
+                tag_attrs = f"{scope_tag}{rerank_annotation}".strip()
+                open_tag = f"<Memory{(' ' + tag_attrs) if tag_attrs else ''}>"
+                close_tag = "</Memory>"
+                lines.append(f"  {open_tag}{snippet}{close_tag}")
                 total += len(snippet)
+
             lines.append("</Archival_Memory>")
             return "\n".join(lines)
+
         except Exception as e:
-            logger.warning(f"Archival memory lookup failed: {e}")
+            logger.warning("Archival memory lookup failed: %s", e)
             return ""
+
+    async def _rerank_memories(
+        self,
+        query: str,
+        candidates: List[Dict[str, Any]],
+        n_results: int,
+    ) -> List[Dict[str, Any]]:
+        """Two-stage retrieval: rerank VectorMemory candidates with System 1.
+
+        This is the callable registered in runtime_context for use by skills.
+        Fails safely - always returns a valid list (cosine-ordered on error).
+        """
+        _reranker = getattr(self, "memory_reranker", None)
+        if not bool(getattr(_reranker, "enabled", False)):
+            return candidates[:n_results]
+        try:
+            return await _reranker.rerank(
+                query=query,
+                candidates=candidates,
+                n_results=n_results,
+                route_to_system_1=self._route_memories_to_system_1,
+            )
+        except Exception as exc:
+            logger.warning(
+                "_rerank_memories failed (cosine fallback): %s", exc
+            )
+            return sorted(
+                candidates,
+                key=lambda c: float(c.get("distance") or 1.0),
+            )[:n_results]
+
+    async def _route_memories_to_system_1(
+        self,
+        messages: List[Dict[str, str]],
+        allowed_tools: Optional[List[str]] = None,
+        max_output_tokens: Optional[int] = None,
+    ):
+        """Lightweight System 1 routing for reranker scoring calls.
+
+        Uses a strict token cap (150 tokens) because reranker output
+        is always short JSON. Passes deadline_seconds from reranker config.
+        """
+        _reranker = getattr(self, "memory_reranker", None)
+        if _reranker is None:
+            return await self._route_to_system_1(
+                messages,
+                allowed_tools=[],
+                deadline_seconds=20.0,
+                context="memory_reranker",
+                max_output_tokens=max_output_tokens or 150,
+            )
+
+        deadline = _reranker.config.timeout_seconds
+        return await self._route_to_system_1(
+            messages,
+            allowed_tools=[],
+            deadline_seconds=deadline,
+            context="memory_reranker",
+            max_output_tokens=max_output_tokens or 150,
+        )
 
     @classmethod
     def _warn_deprecated_energy_replenish_turn_env_once(cls) -> None:
@@ -2568,6 +3021,21 @@ class Orchestrator:
                 return False
         return True
 
+    @staticmethod
+    def _enrich_display_text(
+        raw_text: str,
+        state: Dict[str, Any],
+        agent_name: Optional[str] = None,
+    ) -> str:
+        """Prefer structured display text over raw worker output string."""
+        if agent_name is not None:
+            structured = state.get("structured_outputs", {}).get(agent_name)
+            if structured is not None:
+                enriched = get_display_text(structured, raw_text)
+                if enriched and enriched != raw_text:
+                    return enriched
+        return raw_text
+
     def _get_output_to_evaluate(self, state: Dict[str, Any]) -> str:
         """Return the requested agent output, combining independent outputs when needed."""
         real_outputs = self._get_real_worker_outputs(state)
@@ -2583,13 +3051,18 @@ class Orchestrator:
 
         if not requested_outputs:
             last_worker = list(real_outputs.keys())[-1]
-            return real_outputs[last_worker]
+            return self._enrich_display_text(
+                real_outputs[last_worker], state, last_worker
+            )
 
         if len(requested_outputs) == 1 or not self._should_combine_requested_outputs(requested_steps):
-            return requested_outputs[-1][1]
+            _last_agent_name, _last_output = requested_outputs[-1]
+            return self._enrich_display_text(
+                _last_output, state, _last_agent_name
+            )
 
         return "\n\n".join(
-            f"{agent_name}:\n{output}"
+            f"{agent_name}:\n{self._enrich_display_text(output, state, agent_name)}"
             for agent_name, output in requested_outputs
         )
 
@@ -2884,13 +3357,26 @@ class Orchestrator:
 
         dependency_outputs = []
         for dependency in self._get_step_dependencies(task_packet, agent_def):
-            dependency_output = state.get("worker_outputs", {}).get(dependency, "")
-            if dependency_output:
-                dependency_outputs.append(f"{dependency}: {dependency_output}")
+            # Prefer structured dependency output when available
+            structured_dep = (
+                state.get("structured_outputs", {}).get(dependency)
+            )
+            if structured_dep is not None:
+                formatted = format_structured_for_handoff(structured_dep, dependency)
+                if formatted:
+                    dependency_outputs.append(formatted)
+                    continue
+            # Fallback to raw text
+            raw_dep = state.get("worker_outputs", {}).get(dependency, "")
+            if raw_dep:
+                dependency_outputs.append(
+                    f"[{dependency} raw output]\n{dependency}: {raw_dep}"
+                )
 
         if dependency_outputs:
-            lines.append("Relevant prior agent outputs:")
-            lines.extend(dependency_outputs)
+            lines.append("Prior agent outputs (use these to inform your work):")
+            for dep_output in dependency_outputs:
+                lines.append(dep_output)
 
         return "<supervisor_handoff>\n" + "\n".join(lines) + "\n</supervisor_handoff>"
 
@@ -3043,6 +3529,9 @@ class Orchestrator:
         snapshot["chat_history"] = list(state.get("chat_history", []) or [])
         snapshot["current_plan"] = list(state.get("current_plan", []) or [])
         snapshot["worker_outputs"] = dict(state.get("worker_outputs", {}) or {})
+        snapshot["structured_outputs"] = dict(
+            state.get("structured_outputs", {}) or {}
+        )
         return snapshot
 
     @staticmethod
@@ -3088,15 +3577,29 @@ class Orchestrator:
         results: List[Any],
         state: Dict[str, Any],
     ) -> Dict[str, Any]:
+        state.setdefault("structured_outputs", {})
         for (agent_def, _task_packet), result in zip(batch, results):
             if isinstance(result, Exception):
-                logger.error("Parallel agent %s failed with exception: %s", agent_def.name, result, exc_info=True)
-                state["worker_outputs"][agent_def.name] = f"Error: {agent_def.name} failed with exception: {result}"
+                logger.error(
+                    "Parallel agent %s failed: %s",
+                    agent_def.name, result, exc_info=True
+                )
+                state["worker_outputs"][agent_def.name] = (
+                    f"Error: {agent_def.name} failed: {result}"
+                )
+                state["structured_outputs"][agent_def.name] = None
                 continue
 
-            agent_output = dict(result.get("worker_outputs", {}) or {}).get(agent_def.name)
+            agent_output = dict(
+                result.get("worker_outputs", {}) or {}
+            ).get(agent_def.name)
             if agent_output is not None:
                 state["worker_outputs"][agent_def.name] = agent_output
+
+            structured = dict(
+                result.get("structured_outputs", {}) or {}
+            ).get(agent_def.name)
+            state["structured_outputs"][agent_def.name] = structured
         return state
 
     async def _run_parallel_agent_batch(
@@ -3230,6 +3733,7 @@ class Orchestrator:
         deduct_energy: bool = True,
     ) -> Dict[str, Any]:
         state = normalize_state(state)
+        state.setdefault("structured_outputs", {})
         if deduct_energy:
             state = self._deduct_energy(state, agent_def.energy_cost, agent_def.name)
         _agent_emitter = get_current_emitter()
@@ -3242,10 +3746,26 @@ class Orchestrator:
 
             capabilities_str = self._get_capabilities_string()
             handoff = self._build_agent_handoff(agent_def, state, task_packet=task_packet)
+            # Build system prompt with structured output format injection
+            _output_type = resolve_output_type(agent_def.output_type)
+            _structured_output_enabled = (
+                os.getenv("ENABLE_STRUCTURED_AGENT_OUTPUT", "true").strip().lower()
+                in {"1", "true", "yes", "on"}
+            )
+            _format_prompt = (
+                OUTPUT_FORMAT_PROMPTS.get(_output_type, "")
+                if _structured_output_enabled
+                else ""
+            )
+            _system_content = (
+                f"{agent_def.system_prompt}"
+                f"{_format_prompt}"
+                f"\n{self.charter_text}\n{core_mem_str}\n\n{capabilities_str}"
+            )
             messages = [
                 {
                     "role": "system",
-                    "content": f"{agent_def.system_prompt}\n{self.charter_text}\n{core_mem_str}\n\n{capabilities_str}",
+                    "content": _system_content,
                 },
                 {"role": "user", "content": handoff},
             ]
@@ -3275,10 +3795,12 @@ class Orchestrator:
                 state["worker_outputs"][agent_def.name] = (
                     f"Error: {agent_def.name} failed after System 1 error and System 2 fallback."
                 )
+                state["structured_outputs"][agent_def.name] = None
             else:
                 state["worker_outputs"][agent_def.name] = (
                     f"Error: {agent_def.name} failed and System 2 is not configured."
                 )
+                state["structured_outputs"][agent_def.name] = None
             if _agent_emitter is not None:
                 _dur = time.monotonic() - _agent_start_mono
                 await _agent_emitter.emit(
@@ -3289,6 +3811,19 @@ class Orchestrator:
         if router_result.status == "cognitive_escalation":
             solution = await self._handle_cognitive_escalation(state, router_result)
             state["worker_outputs"][agent_def.name] = solution
+            # Structured extraction for escalation result (synthesis-like)
+            if _structured_output_enabled and _output_type != AgentOutputType.TEXT:
+                _structured = validate_agent_output(
+                    extract_structured_output(solution),
+                    _output_type,
+                    agent_def.name,
+                    solution,
+                )
+                if _structured is None and _output_type != AgentOutputType.TEXT:
+                    _structured = make_extraction_failed_result(
+                        _output_type, agent_def.name, solution
+                    )
+                state["structured_outputs"][agent_def.name] = _structured
             if _agent_emitter is not None:
                 _dur = time.monotonic() - _agent_start_mono
                 await _agent_emitter.emit(
@@ -3300,6 +3835,31 @@ class Orchestrator:
             state[_BLOCKED_KEY] = router_result
         else:
             state["worker_outputs"][agent_def.name] = router_result.content
+            # Structured extraction from raw response
+            if _structured_output_enabled and _output_type != AgentOutputType.TEXT:
+                _raw_content = str(router_result.content or "")
+                _extracted = extract_structured_output(_raw_content)
+                _structured = validate_agent_output(
+                    _extracted, _output_type, agent_def.name, _raw_content
+                )
+                if _structured is None:
+                    _structured = make_extraction_failed_result(
+                        _output_type, agent_def.name, _raw_content
+                    )
+                state["structured_outputs"][agent_def.name] = _structured
+                # Store clean version (without <agent_output> block) as the raw output
+                _clean = strip_agent_output_block(_raw_content)
+                if _clean != _raw_content:
+                    state["worker_outputs"][agent_def.name] = _clean
+                logger.info(
+                    "Agent %s structured output: type=%s success=%s confidence=%.2f "
+                    "extraction_failed=%s",
+                    agent_def.name,
+                    _output_type.value,
+                    _structured.get("success"),
+                    float(_structured.get("confidence", 0)),
+                    _structured.get("extraction_failed", False),
+                )
             if _agent_emitter is not None:
                 _dur = time.monotonic() - _agent_start_mono
                 await _agent_emitter.emit(
@@ -4177,6 +4737,7 @@ class Orchestrator:
 
         state = self._deduct_energy(state, ENERGY_COST_SUPERVISOR, "supervisor")
         user_input = state["user_input"]
+        user_id = str(state.get("user_id") or "")
         core_mem_str = await self.core_memory.get_context_string()
         _sup_session = state.get("active_session")
         _sup_session_id = int(_sup_session.get("id") or 0) if _sup_session else 0
@@ -4287,6 +4848,57 @@ class Orchestrator:
                     )
                 elif state.get("final_response"):
                     await _sv_emitter2.emit(ProgressEvent.supervisor_direct())
+
+            # -- Supervisor decision logging for introspection -----------------
+            # Heartbeat tasks are never logged; they are background work,
+            # not user-initiated turns.
+            if user_id != "heartbeat":
+                _plan_for_log = list(state.get("current_plan", []) or [])
+                _reasoning_for_log = str(
+                    state.get("worker_outputs", {}).get("supervisor_context", "")
+                    or ""
+                )
+                # If no plan and a direct response was set, capture a snippet
+                # of it as the reasoning so introspection can explain it.
+                if not _plan_for_log and state.get("final_response"):
+                    _direct_preview = str(state["final_response"] or "")[:300]
+                    _reasoning_for_log = _reasoning_for_log or _direct_preview
+
+                _active_session_for_log = state.get("active_session")
+                _session_id_for_log: Optional[int] = None
+                if isinstance(_active_session_for_log, dict):
+                    _session_id_for_log = _active_session_for_log.get("id") or None
+
+                _log_supervisor_decision = getattr(
+                    self.ledger_memory,
+                    "log_supervisor_decision",
+                    None,
+                )
+                if callable(_log_supervisor_decision):
+                    self._fire_and_forget(
+                        _log_supervisor_decision(
+                            user_id=str(user_id),
+                            user_input=str(user_input or "")[:500],
+                            plan_json=json.dumps(
+                                [
+                                    {
+                                        "agent": step.get("agent", ""),
+                                        "task": str(step.get("task", ""))[:200],
+                                        "reason": str(step.get("reason", ""))[:200],
+                                    }
+                                    for step in _plan_for_log
+                                    if isinstance(step, dict)
+                                ]
+                            ),
+                            is_direct=not bool(_plan_for_log),
+                            reasoning=_reasoning_for_log[:1000],
+                            energy_before=int(state.get("energy_remaining", 0)),
+                            worker_count=len(_plan_for_log),
+                            session_id=_session_id_for_log,
+                        )
+                    )
+                    state["_supervisor_decision_logged"] = True
+            # -- End supervisor decision logging -------------------------------
 
         except asyncio.TimeoutError:
             logger.error("Supervisor node timeout (60s)")
@@ -5250,6 +5862,53 @@ class Orchestrator:
                         resolved_epic_id = int(raw_epic_id) if raw_epic_id else None
                     except (TypeError, ValueError):
                         resolved_epic_id = None
+
+        # Fast-path/direct turns bypass supervisor_node, so log a compact
+        # decision record here when no supervisor log entry exists yet.
+        if (
+            user_id != "heartbeat"
+            and not turn_failed
+            and isinstance(resolved_state, dict)
+            and not bool(resolved_state.get("_supervisor_decision_logged"))
+        ):
+            plan_for_log = list(resolved_state.get("current_plan", []) or [])
+            reasoning_for_log = str(
+                resolved_state.get("worker_outputs", {}).get("supervisor_context", "")
+                or ""
+            )
+            if not plan_for_log:
+                direct_preview = str(final_resp or "")[:300]
+                reasoning_for_log = reasoning_for_log or direct_preview
+
+            log_supervisor_decision = getattr(
+                self.ledger_memory,
+                "log_supervisor_decision",
+                None,
+            )
+            if callable(log_supervisor_decision):
+                self._fire_and_forget(
+                    log_supervisor_decision(
+                        user_id=str(user_id),
+                        user_input=str(user_message or "")[:500],
+                        plan_json=json.dumps(
+                            [
+                                {
+                                    "agent": step.get("agent", ""),
+                                    "task": str(step.get("task", ""))[:200],
+                                    "reason": str(step.get("reason", ""))[:200],
+                                }
+                                for step in plan_for_log
+                                if isinstance(step, dict)
+                            ]
+                        ),
+                        is_direct=not bool(plan_for_log),
+                        reasoning=reasoning_for_log[:1000],
+                        energy_before=int(resolved_state.get("energy_remaining", 0)),
+                        worker_count=len(plan_for_log),
+                        session_id=resolved_session_id,
+                    )
+                )
+                resolved_state["_supervisor_decision_logged"] = True
 
         await self._persist_chat_turns(
             user_id,

@@ -13,6 +13,7 @@ ddgs
 aiosqlite==0.20.0
 aiofiles==23.2.1
 pypdf>=4.0.0
+python-docx
 pdfplumber>=0.11.0
 pandas>=2.2.0
 trafilatura>=1.9.0
