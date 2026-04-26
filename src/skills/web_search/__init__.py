@@ -3,6 +3,12 @@ import logging
 
 logger = logging.getLogger(__name__)
 
+# The ddgs library logs per-backend fallback errors at INFO level (e.g. "Error in
+# engine yahoo: ...").  These are expected when a backend is temporarily unavailable
+# and ddgs silently retries other backends, so they add noise without signalling a
+# real failure.  Raising the ddgs logger threshold to WARNING hides them while still
+# surfacing genuine warnings and errors from the library.
+logging.getLogger("ddgs.ddgs").setLevel(logging.WARNING)
 
 import json
 import os
@@ -23,7 +29,7 @@ def _sync_web_search(query: str, max_results: int) -> str:
             parsed_results.append({
                 "title": r.get('title', 'No title'),
                 "url": r.get('href', 'N/A'),
-                "snippet": r.get('body', '')[:300]
+                "snippet": r.get('body', '')[:500]
             })
 
         return json.dumps({
@@ -40,7 +46,7 @@ def _sync_web_search(query: str, max_results: int) -> str:
         })
 
 
-async def web_search(query: str, max_results: int = 3) -> str:
+async def web_search(query: str, max_results: int = 5) -> str:
     logger.info(f"web_search: {query!r} (max={max_results})")
 
     if not isinstance(query, str) or not query.strip():

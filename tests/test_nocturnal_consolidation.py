@@ -4,7 +4,7 @@ import math
 
 import pytest
 
-from src.core.orchestrator import Orchestrator
+from src.core import cloud_redaction
 from src.core.nocturnal_consolidation import (
     ConsolidationCandidate,
     NocturnalConsolidationSlice1,
@@ -331,7 +331,7 @@ async def test_score_candidates_with_system2_uses_phase2_redaction_boundary():
     scored = await engine.score_candidates_with_system2(
         candidates,
         route_to_system_2=fake_route_to_system_2,
-        redactor=Orchestrator._redact_text_for_cloud,
+        redactor=cloud_redaction.redact_text_for_cloud,
     )
 
     assert len(scored) == 1

@@ -64,6 +64,52 @@ def _render_recent_rejections_block(
     return f"\n<recent_rejections>\n{body}\n</recent_rejections>"
 
 
+def _render_session_context_block(
+    active_session: Optional[Dict[str, Any]],
+    epic_rollup: Optional[Dict[str, Any]],
+) -> str:
+    """Render the <active_session> block for the supervisor prompt.
+
+    Returns empty string when no session is active.
+    The block is injected into the volatile turn context (not the stable
+    system prompt) so KV cache is not invalidated on every turn.
+    """
+    if not active_session or not active_session.get("id"):
+        return ""
+
+    lines = [
+        "<active_session>",
+        f"  Session: {active_session.get('name', 'Unnamed')} "
+        f"(id={active_session['id']})",
+    ]
+
+    description = str(active_session.get("description") or "").strip()
+    if description:
+        lines.append(f"  Context: {description}")
+
+    turn_count = int(active_session.get("turn_count") or 0)
+    memory_count = int(active_session.get("memory_count") or 0)
+    lines.append(
+        f"  Turns in session: {turn_count} | "
+        f"Memories tagged: {memory_count}"
+    )
+
+    if epic_rollup:
+        completed = int(epic_rollup.get("completed_tasks") or 0)
+        total = int(epic_rollup.get("total_tasks") or 0)
+        active_t = int(epic_rollup.get("active_tasks") or 0)
+        pending_t = int(epic_rollup.get("pending_tasks") or 0)
+        lines.append(
+            f"  Linked Epic: {epic_rollup.get('title', 'Unknown')} "
+            f"[{epic_rollup.get('status', '')}] "
+            f"— {completed}/{total} tasks complete, "
+            f"{active_t} active, {pending_t} pending"
+        )
+
+    lines.append("</active_session>")
+    return "\n".join(lines)
+
+
 _SUPERVISOR_TEMPLATE = textwrap.dedent(
     """\
     <system_identity>
@@ -82,13 +128,14 @@ _SUPERVISOR_TEMPLATE = textwrap.dedent(
     <tool_and_data_rules>
     - FILE SYSTEM: Your primary downloads directory is `{downloads_dir}`. Prefer using the `manage_file_system` tool for OS-agnostic exploration.
     - PDF HANDLING: To read or summarize a PDF, you MUST first execute the `extract_pdf_text` tool.
-    - WEB HANDLING: After performing a `web_search`, you MUST call `extract_web_article` on the target URL before attempting to summarize it.
+    - WEB HANDLING: After performing a `web_search`, if the returned snippets are insufficient to fully answer the user's question — especially for factual data such as sports scores, live weather details, news articles, financial results, or any query where a snippet is clearly truncated — you MUST call `extract_web_article` on the top result URL to retrieve the full content before composing your answer. Do not answer from incomplete snippets when full content is readily accessible.
     - DATA HANDLING: For CSV/Excel files, do not read raw text. Use the `analyze_table_file` tool.
     - SHELL COMMANDS: `run_terminal_command` executes without a shell and only for allowlisted first-token commands. Do not propose shell chaining, redirects, or command substitution.
     - PYTHON SANDBOX: `execute_python_sandbox` runs inside the dynamic worker sandbox with blocked-module checks and worker-confined /tmp access.
     - STOCK PRICES: To fetch prices for multiple tickers, call `get_stock_price` once per ticker in sequence. Never invent batch variants like `get_stock_prices`.
     - OBJECTIVES: When the Admin asks to add, create, define, or track a goal/objective/task, use `spawn_new_objective`. Use `query_highest_priority_task` to inspect current backlog work. Do not call `request_capability` when these existing tools already fit.
     - COGNITIVE SYNERGY: If you face a complex reasoning problem or get stuck, use `escalate_to_system_2`. You may also search Archival Memory for past "System 2 blueprints" (e.g. past problem solutions).
+    - MEMORY CONSOLIDATION: `consolidate_memory` is a **tool** you call directly — it is NOT an agent name. Never place `consolidate_memory` in a WORKERS declaration.
     </tool_and_data_rules>
 
     <agent_charter>
@@ -96,8 +143,9 @@ _SUPERVISOR_TEMPLATE = textwrap.dedent(
     </agent_charter>
 
     <context_and_memory>
-    --- Core Memory ---
+    <Core_Working_Memory>
     {core_mem_str}
+    </Core_Working_Memory>
     {recent_rejections_block}
     </context_and_memory>
 
@@ -112,7 +160,7 @@ _SUPERVISOR_TEMPLATE = textwrap.dedent(
     <output_formatting>
     CRITICAL: Every response MUST end with a strict worker declaration on the very last line, outside of any <think> blocks.
     - If you can handle the request directly in chat: WORKERS: []
-    - If you need to delegate to specialized agents, output JSON task packets using only agent names listed in <available_agents>.
+    - If you need to delegate to specialized agents, output JSON task packets using only agent names listed in <available_agents>. NEVER place tool names (e.g. `consolidate_memory`, `web_search`, `escalate_to_system_2`) as `agent` values — those are tools, not agents.
     - Format delegated work as: WORKERS: [{{"agent": "agent_name", "task": "short concrete task", "reason": "why this agent is needed", "depends_on": ["upstream_agent"]}}]
     - Each task must be specific to that agent. Do not output bare agent names.
     - WORKERS payload must be strict JSON with no trailing commentary after the closing bracket.
@@ -151,12 +199,22 @@ def build_supervisor_turn_context(
     *,
     sensory_context: str,
     archival_block: str,
+    active_session: Optional[Dict[str, Any]] = None,
+    epic_rollup: Optional[Dict[str, Any]] = None,
 ) -> str:
     sections = []
     if str(sensory_context or "").strip():
-        sections.append(f"--- Sensory Context ---\n{str(sensory_context).strip()}")
+        sections.append(
+            f"--- Sensory Context ---\n{str(sensory_context).strip()}"
+        )
     if str(archival_block or "").strip():
-        sections.append(f"--- Archival Memory ---\n{str(archival_block).strip()}")
+        sections.append(
+            f"--- Archival Memory ---\n{str(archival_block).strip()}"
+        )
+    session_block = _render_session_context_block(active_session, epic_rollup)
+    if session_block:
+        sections.append(session_block)
+
     if not sections:
         return ""
     return "<turn_context>\n" + "\n\n".join(sections) + "\n</turn_context>"

@@ -1,0 +1,73 @@
+name: AIDEN Eval Suite
+
+'on':
+  push:
+    branches: [main, develop]
+    paths:
+      - 'src/core/orchestrator.py'
+      - 'src/core/routing_assessor.py'
+      - 'src/core/energy_roi_engine.py'
+      - 'src/core/energy_judge.py'
+      - 'src/core/moral_ledger.py'
+      - 'src/core/skill_manager.py'
+      - 'src/skills/**'
+      - 'tests/evals/**'
+      - 'scripts/run_evals.py'
+      - 'pytest.ini'
+  pull_request:
+    branches: [main]
+  schedule:
+    - cron: '0 2 * * *'
+  workflow_dispatch:
+    inputs:
+      include_tier3:
+        description: Include Tier 3 LLM evals (requires runner with Ollama)
+        type: boolean
+        default: false
+
+jobs:
+  fast-evals:
+    name: Fast Evals (Tier 1 + Tier 2)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: |
+          pip install -r requirements.txt
+
+      - name: Run Tier 1 + Tier 2 evals
+        run: |
+          python scripts/run_evals.py --check-regression
+        env:
+          ENERGY_ROI_THRESHOLD: '1.25'
+          ENERGY_MIN_RESERVE: '10'
+          ENERGY_MULTIPLIER: '3'
+          FAIRNESS_BOOST_MULTIPLIER: '0.15'
+          MAX_DEFER_COUNT: '5'
+
+      - name: Upload eval results
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: eval-results-${{ github.sha }}
+          path: tests/evals/results/
+          retention-days: 30
+
+  unit-tests:
+    name: Unit Tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+      - run: pip install -r requirements.txt
+      - run: python -m pytest tests/ -q --timeout=30 --ignore=tests/evals

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os as _os
 import re
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -66,6 +67,7 @@ _LEDGER_HINTS = (
     "moral",
     "violation",
 )
+_NOCTURNAL_CORE_FACTS_MAX = int(_os.getenv("MAX_NOCTURNAL_CORE_FACTS", "60"))
 
 
 @dataclass
@@ -617,6 +619,16 @@ class NocturnalConsolidationSlice1:
 
         new_fact_texts = [scored.candidate.text for scored in core_candidates]
         merged_facts = self._merge_unique(existing_facts, new_fact_texts)
+
+        # Keep the most recently appended facts and evict stale head entries.
+        if len(merged_facts) > _NOCTURNAL_CORE_FACTS_MAX:
+            evicted = len(merged_facts) - _NOCTURNAL_CORE_FACTS_MAX
+            merged_facts = merged_facts[evicted:]
+            logger.info(
+                "nocturnal_core_facts evicted %d stale facts (cap=%d, remaining=%d)",
+                evicted, _NOCTURNAL_CORE_FACTS_MAX, len(merged_facts),
+            )
+
         await core_memory.update("nocturnal_core_facts", merged_facts)
 
         preference_lines = [

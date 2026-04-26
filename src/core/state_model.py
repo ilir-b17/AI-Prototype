@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 
 @dataclass
@@ -12,6 +12,7 @@ class AgentState:
     user_input: str
     user_prompt: Dict[str, Any] = field(default_factory=dict)
     chat_history: List[Dict[str, str]] = field(default_factory=list)
+    active_session: Optional[Dict[str, Any]] = field(default_factory=lambda: None)
     current_plan: List[Any] = field(default_factory=list)
     worker_outputs: Dict[str, str] = field(default_factory=dict)
     final_response: str = ""
@@ -59,6 +60,7 @@ class AgentState:
             user_input=str(raw.get("user_input", "")),
             user_prompt=dict(raw.get("user_prompt", {}) or {}),
             chat_history=list(raw.get("chat_history", []) or []),
+            active_session=raw.get("active_session") or None,
             current_plan=list(raw.get("current_plan", []) or []),
             worker_outputs=dict(raw.get("worker_outputs", {}) or {}),
             final_response=str(raw.get("final_response", "") or ""),

@@ -8,7 +8,7 @@ critic until complete, blocked for HITL/MFA, or exhausted.
 Energy model reference (operator-facing):
 - Sources:
     - Per-turn state budget in state["energy_remaining"] for the current user turn.
-    - Cross-turn predictive budget in _predictive_energy_budget_remaining used for
+    - Cross-turn shared budget account used for
         pacing ad-hoc and heartbeat execution.
 - Sinks:
     - _deduct_energy charges per-turn budget for supervisor/worker/critic/tool work.
@@ -42,15 +42,13 @@ import logging
 import json
 import hashlib
 import asyncio
+import inspect
 import math
 import re
-import sys
-import tempfile
 import time
 import weakref
 from collections import OrderedDict
 import xml.etree.ElementTree as ET
-from dataclasses import dataclass
 from datetime import datetime
 from typing import Dict, Any, List, Optional
 
@@ -63,6 +61,10 @@ except ImportError:
 from src.memory.vector_db import VectorMemory
 from src.memory.ledger_db import LedgerMemory
 from src.memory.core_memory import CoreMemory
+from src.core import cloud_redaction
+from src.core.synthesis_pipeline import SynthesisPipeline
+from src.core.routing_assessor import RoutingAssessor, _FAST_PATH_SINGLE_TOOL_ALLOWLIST, _ROUTING_STOPWORDS
+from src.core.routing_assessor import _ROUTING_TOKEN_RE
 from src.core.agent_definition import AgentDefinition
 from src.core.agent_registry import AgentRegistry
 from src.core.llm_router import CognitiveRouter, RouterResult, RequiresHITLError, RequiresMFAError
@@ -90,6 +92,15 @@ try:
     from google.api_core.exceptions import ResourceExhausted
 except ImportError:
     ResourceExhausted = Exception
+
+from src.core.progress import (
+    ProgressEmitter,
+    ProgressEvent,
+    ProgressCallback,
+    get_current_emitter,
+    reset_emitter,
+    set_current_emitter,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -129,60 +140,24 @@ class _UserLockLease:
         self._released = True
         await self._owner._release_user_lock_lease(self._user_id, self._slot)
 
-
-@dataclass
-class _ApprovalOutcome:
-    reply_text: str
-    follow_up_input: Optional[Any] = None
-
 # Energy costs per operation
 ENERGY_COST_SUPERVISOR = 10
 ENERGY_COST_WORKER = 15
 ENERGY_COST_CRITIC = 10
 ENERGY_COST_TOOL = 5
+# When the remaining budget exceeds this floor and the only reason for deferral is
+# a borderline ROI ("ROI too low"), ad-hoc conversational requests are approved
+# unconditionally so that energy accounting never blocks normal user interaction
+# while resources are plentiful.  Configurable via AD_HOC_COMFORTABLE_BUDGET_FLOOR.
+_AD_HOC_COMFORTABLE_BUDGET_FLOOR = int(os.getenv("AD_HOC_COMFORTABLE_BUDGET_FLOOR", "50"))
 HEARTBEAT_INTERVAL = int(os.getenv("HEARTBEAT_INTERVAL_SECONDS", "1800"))  # default 30 minutes
 MEMORY_SAVE_THRESHOLD = int(os.getenv("MEMORY_SAVE_THRESHOLD", "120"))
 MEMORY_CONSOLIDATION_INTERVAL = int(os.getenv("MEMORY_CONSOLIDATION_INTERVAL", "21600"))  # 6 hours
 # How long an unanswered MFA/HITL/tool-approval entry stays alive before auto-expiry
 _PENDING_STATE_TTL_SECONDS = int(os.getenv("PENDING_STATE_TTL_SECONDS", "86400"))  # 24 hours
-_SYNTHESIS_SELF_TEST_TIMEOUT_DEFAULT_SECONDS = 12.0
-_MAX_SYNTHESIS_RETRIES = int(os.getenv("MAX_SYNTHESIS_RETRIES", "3"))
 _CONSOLIDATION_TRIGGER_TURNS = int(os.getenv("CONSOLIDATION_TRIGGER_TURNS", "10"))
-_SAFE_ENV_KEYS = {"PATH", "PYTHONPATH", "SYSTEMROOT", "TEMP", "TMP", "HOME", "USER", "LANG", "LC_ALL"}
 _SYNTHESIS_LOCKOUT_TTL_SECONDS = int(os.getenv("SYNTHESIS_LOCKOUT_TTL_SECONDS", "600"))
-_BLOCKED_ENV_PREFIXES = ("TELEGRAM_", "GROQ_", "GEMINI_", "ANTHROPIC_", "OPENAI_", "OLLAMA_CLOUD_", "ADMIN_")
 _SYSTEM_1_ERROR_PREFIX = "[System 1 - Error]"
-_ROUTING_STOPWORDS = {
-    "a", "an", "and", "are", "at", "be", "can", "could", "do", "for", "from",
-    "hello", "hey", "hi", "i", "in", "is", "it", "me", "my", "now", "of",
-    "on", "or", "please", "right", "tell", "the", "this", "to", "today", "what",
-    "would", "you", "your",
-    # Generic action verbs — too common to discriminate between tools
-    "get", "give", "find", "show", "fetch", "list", "like", "have", "has",
-    "want", "need", "also", "just", "did", "how",
-    # Common discourse words that appear in tool descriptions but carry no routing signal
-    "that", "which", "where", "when", "there", "then", "them", "they",
-    "these", "those", "with", "been", "will", "use", "not",
-}
-_NON_UTILITY_TOOL_PREFIXES = ("update_", "request_", "spawn_", "run_", "execute_")
-_NON_UTILITY_TOOL_NAMES = {
-    "ask_admin_for_guidance",
-    "consolidate_memory",
-    "manage_file_system",
-    "query_highest_priority_task",
-    # Archival memory search requires supervisor-level reasoning about WHEN to use it;
-    # auto-selecting it in fast-path on any message with 'memory' or 'information' is wrong.
-    "search_archival_memory",
-}
-_ROUTING_TOKEN_RE = r"[a-z0-9]+"
-_DIRECT_ROUTE_MAX_COMPLEXITY = 0
-_SINGLE_TOOL_MAX_COMPLEXITY = 2
-_SINGLE_TOOL_MIN_SCORE = 1.5
-_SINGLE_TOOL_MIN_MARGIN = 0.75
-_FAST_PATH_DIRECT_MAX_TOKENS = 12
-_FAST_PATH_SINGLE_TOOL_MAX_TOKENS = 14
-_FAST_PATH_SINGLE_TOOL_ALLOWLIST = frozenset({"get_system_info", "get_stock_price", "web_search"})
-_FINANCE_INTENT_RE = re.compile(r"\b(?:prices?|quotes?|stocks?|tickers?|shares?|markets?|trading)\b", re.IGNORECASE)
 _MORAL_TRIVIALITY_READ_ONLY_HINTS = (
     "time",
     "date",
@@ -229,60 +204,8 @@ _EXPLICIT_MEMORY_REQUEST_RE = re.compile(
     flags=re.IGNORECASE,
 )
 _VOICE_NOTE_PLACEHOLDER_RE = re.compile(r"^\[Voice note · \d+ bytes · [^\]]+\]$")
-_REDACTED_CONTEXT_BLOCK = "[REDACTED_CONTEXT_BLOCK]"
-_REDACTED_SENSORY_STATE = "[REDACTED_SENSORY_STATE]"
-_REDACTED_EMPTY_PAYLOAD = "[REDACTED_EMPTY_PAYLOAD]"
-_CLOUD_REDACTION_BLOCK_PATTERNS = (
-    r"<Core_Working_Memory>.*?</Core_Working_Memory>",
-    r"<Archival_Memory>.*?</Archival_Memory>",
-    r"<chat_history>.*?</chat_history>",
-)
-_CLOUD_REDACTION_LINE_PATTERNS = (
-    (r"\[Machine Context[^\]]*\].*?(?=\n\s*\n|$)", _REDACTED_SENSORY_STATE),
-    (
-        r"^\s*(Host[_ ]?OS|OS|CPU(?:[_ ]?usage)?|CWD|Platform|Memory Usage|Disk Usage)\s*[:=].*$",
-        _REDACTED_SENSORY_STATE,
-    ),
-    (
-        r"<\s*(host_os|os|cpu_usage|cwd|machine|platform)\s*>.*?<\s*/\s*(host_os|os|cpu_usage|cwd|machine|platform)\s*>",
-        _REDACTED_SENSORY_STATE,
-    ),
-)
-_CLOUD_REDACTION_PII_PATTERNS = (
-    (r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b", "[REDACTED_EMAIL]"),
-    (r"\+?\d[\d\-\s().]{7,}\d", "[REDACTED_PHONE]"),
-    (
-        r"\b\d{1,5}\s+[A-Za-z0-9.\- ]+\s(?:Street|St|Avenue|Ave|Road|Rd|Boulevard|Blvd|Lane|Ln|Drive|Dr)\b",
-        "[REDACTED_ADDRESS]",
-    ),
-    (r"\b(?:my name is|i am|i'm)\s+[A-Za-z][A-Za-z'\-]+(?:\s+[A-Za-z][A-Za-z'\-]+){0,2}\b", "[REDACTED_NAME]"),
-    (r"\b(?:i live in|located in|from)\s+[A-Za-z][A-Za-z'\-]+(?:[\s,]+[A-Za-z][A-Za-z'\-]+){0,2}\b", "[REDACTED_LOCATION]"),
-    (r"\b(?:user[_ ]?id|ssn|social security|passport|account number)\b[^\n]*", "[REDACTED_PII_FIELD]"),
-    (r"[A-Za-z]:\\[^\n]*", "[REDACTED_PATH]"),
-)
 _CHARTER_TIER_TAGS = ("Tier_1_Axioms", "Tier_2_Strategic", "Tier_3_Operational")
 _CHARTER_PARSE_ERROR_KEY = "__charter_parse_error__"
-_CLOUD_CONTEXT_AND_MEMORY_BLOCK_RE = re.compile(
-    r"(<context_and_memory>)(.*?)(</context_and_memory>)",
-    flags=re.IGNORECASE | re.DOTALL,
-)
-_SAFE_REDACTED_CONTEXT_HEADER_RE = re.compile(
-    r"---\s*(Sensory Context|Core Memory|Archival Memory)\s*---",
-    flags=re.IGNORECASE,
-)
-_SAFE_REDACTED_MARKER_RE = re.compile(r"\[REDACTED_[A-Z_]+\]")
-_CLOUD_REDACTION_BLOCK_REGEXES = tuple(
-    re.compile(pattern, flags=re.IGNORECASE | re.DOTALL)
-    for pattern in _CLOUD_REDACTION_BLOCK_PATTERNS
-)
-_CLOUD_REDACTION_LINE_REGEXES = tuple(
-    (re.compile(pattern, flags=re.IGNORECASE | re.DOTALL | re.MULTILINE), replacement)
-    for pattern, replacement in _CLOUD_REDACTION_LINE_PATTERNS
-)
-_CLOUD_REDACTION_PII_REGEXES = tuple(
-    (re.compile(pattern, flags=re.IGNORECASE), replacement)
-    for pattern, replacement in _CLOUD_REDACTION_PII_PATTERNS
-)
 _MULTI_BLANK_LINES_RE = re.compile(r"\n{3,}")
 
 # Key used in the state dict to signal a blocked (non-ok) router result
@@ -309,20 +232,6 @@ def _format_voice_placeholder(audio_bytes: bytes, mime_type: str) -> str:
 
 def _is_voice_placeholder_text(text: str) -> bool:
     return bool(_VOICE_NOTE_PLACEHOLDER_RE.fullmatch(str(text or "").strip()))
-
-
-def _build_safe_subprocess_env() -> Dict[str, str]:
-    safe_env: Dict[str, str] = {}
-    for key, value in os.environ.items():
-        if key in _SAFE_ENV_KEYS:
-            safe_env[key] = value
-            continue
-        if any(key.startswith(prefix) for prefix in _BLOCKED_ENV_PREFIXES):
-            continue
-        safe_env[key] = value
-    # Ensure Python can find packages
-    safe_env.setdefault("PYTHONPATH", os.getcwd())
-    return safe_env
 
 
 class Orchestrator:
@@ -357,6 +266,7 @@ class Orchestrator:
             self.ledger_memory = LedgerMemory(db_path=ledger_db_path)
             self.core_memory = CoreMemory(memory_file_path=core_memory_path)
             self.cognitive_router = CognitiveRouter(model_name=gemini_model, local_model=local_model)
+            self.routing_assessor = RoutingAssessor(self.cognitive_router.registry)
             self._capabilities_string_cache: Optional[str] = None
             self._enable_local_skill_discovery_gate = (
                 str(os.getenv("ENABLE_LOCAL_SKILL_DISCOVERY_GATE", "true")).strip().lower()
@@ -375,12 +285,10 @@ class Orchestrator:
             )
             self.energy_judge = EnergyJudge()
             self.energy_roi_engine = EnergyROIEngine()
-            self._predictive_energy_budget_remaining = max(
-                0,
-                int(os.getenv("INITIAL_ENERGY_BUDGET", "100")),
-            )
-            self._predictive_energy_budget_lock: asyncio.Lock = asyncio.Lock()
-            self._predictive_energy_budget_last_replenished_at = time.time()
+            # Single energy account — drives both fast-path gating and graph node costs.
+            _initial_budget = max(0, int(os.getenv("INITIAL_ENERGY_BUDGET", "100")))
+            self._energy_budget: int = _initial_budget
+            self._energy_budget_lock: asyncio.Lock = asyncio.Lock()
             self._warn_deprecated_energy_replenish_turn_env_once()
 
             self.charter_text = self._load_charter()
@@ -456,6 +364,20 @@ class Orchestrator:
                 logger.info("Startup pruning: removed %d stale chat_history rows.", deleted)
         except Exception as _prune_err:
             logger.warning("Startup chat history pruning failed: %s", _prune_err)
+
+        self.synthesis_pipeline = SynthesisPipeline(
+            cognitive_router=self.cognitive_router,
+            ledger_memory=self.ledger_memory,
+            core_memory=self.core_memory,
+            pending_tool_approval=self.pending_tool_approval,
+            on_tools_changed=self._invalidate_capabilities_cache,
+            process_message_fn=self.process_message,
+            route_to_system_2_redacted=self._route_to_system_2_redacted,
+            fire_and_forget=self._fire_and_forget,
+            notify_admin=self._notify_admin,
+            outbound_queue=self.outbound_queue,
+        )
+        self.synthesis_pipeline._synthesis_in_progress = self._synthesis_in_progress
 
         self._enforce_charter_policy()
         self._ready.set()
@@ -572,297 +494,6 @@ class Orchestrator:
             f"CPU: {s.get('cpu_usage', 'unknown')} | "
             f"CWD: {s.get('cwd', 'unknown')}]"
         )
-
-    @staticmethod
-    def _routing_keywords(text: str) -> set:
-        return {
-            token for token in re.findall(_ROUTING_TOKEN_RE, (text or "").lower())
-            if len(token) > 2 and token not in _ROUTING_STOPWORDS
-        }
-
-    def _estimate_request_complexity(self, text: str) -> int:
-        lowered = (text or "").lower()
-        tokens = re.findall(_ROUTING_TOKEN_RE, lowered)
-        score = 0
-
-        if len(tokens) > 12:
-            score += 1
-        if len(tokens) > 24:
-            score += 1
-        if len(re.findall(r"[?.!]", text or "")) > 1:
-            score += 1
-        if any(marker in (text or "") for marker in ("\n", "```", ":", ";")):
-            score += 1
-        if re.search(r"\b(and|then|after|before|also|plus|compare|step|steps|plan)\b", lowered):
-            score += 1
-        if re.search(
-            r"\b(build|create|implement|debug|fix|refactor|analyze|analyse|review|modify|update|delete|write|open|extract|read|summari[sz]e|code)\b",
-            lowered,
-        ):
-            score += 1
-
-        return score
-
-    @staticmethod
-    def _is_utility_tool_schema(schema: Dict[str, Any]) -> bool:
-        name = schema.get("name", "")
-        if not name or name in _NON_UTILITY_TOOL_NAMES or name.startswith(_NON_UTILITY_TOOL_PREFIXES):
-            return False
-        params = schema.get("parameters", {}) or {}
-        required = list(params.get("required", []) or [])
-        if len(required) > 1:
-            return False
-        if not required:
-            return True
-        # "ticker" is also handled by _prepare_utility_tool_arguments
-        return required[0] in {"query", "url", "ticker"}
-
-    @staticmethod
-    def _tool_schema_keywords(schema: Dict[str, Any]) -> Dict[str, set]:
-        params = (schema.get("parameters") or {}).get("properties", {}) or {}
-        name_tokens = Orchestrator._routing_keywords(schema.get("name", "").replace("_", " "))
-        desc_tokens = Orchestrator._routing_keywords(schema.get("description", ""))
-        param_tokens = set()
-        for param_name, param_schema in params.items():
-            param_tokens |= Orchestrator._routing_keywords(param_name.replace("_", " "))
-            param_tokens |= Orchestrator._routing_keywords(param_schema.get("description", ""))
-        return {
-            "name": name_tokens,
-            "description": desc_tokens,
-            "parameters": param_tokens,
-        }
-
-    # Uppercase tokens that are common words, not ticker symbols.
-    _TICKER_STOPWORDS: frozenset = frozenset({
-        "A", "I", "AN", "AT", "BE", "BY", "DO", "GO", "IF", "IN", "IS", "IT",
-        "ME", "MY", "NO", "OF", "OK", "ON", "OR", "SO", "TO", "UP", "WE",
-        "AND", "ARE", "BUT", "CAN", "FOR", "GET", "HAS", "HIM", "HIS", "HOW",
-        "ITS", "MAY", "NOT", "NOW", "OFF", "OLD", "OUR", "OUT", "OWN", "THE",
-        "TOO", "TWO", "USE", "WAS", "WHO", "WHY", "YES", "YET", "YOU",
-        "ALSO", "BEEN", "BOTH", "DOES", "DONE", "EACH", "FROM", "GIVE",
-        "GOOD", "HAVE", "HERE", "HIGH", "JUST", "KNOW", "LAST", "LIKE", "LIVE",
-        "LONG", "LOOK", "MAKE", "MANY", "MORE", "MOST", "MUCH", "NEED", "NEXT",
-        "ONCE", "ONLY", "OPEN", "OVER", "PAST", "REAL", "SAME", "SEND", "SHOW",
-        "SOME", "SUCH", "SURE", "TAKE", "TELL", "THAN", "THAT", "THEM", "THEN",
-        "THEY", "THIS", "TIME", "TOLD", "VERY", "WANT", "WELL", "WERE", "WHAT",
-        "WHEN", "WITH", "WORK", "YEAR", "YOUR",
-    })
-
-    @staticmethod
-    def _extract_multiple_tickers(user_message: str) -> List[str]:
-        """Return all valid uppercase ticker symbols found in the message (2+ expected for multi-ticker path)."""
-        text = str(user_message or "")
-        if not _FINANCE_INTENT_RE.search(text):
-            return []
-
-        candidates = [
-            tok for tok in re.findall(r'\b([A-Z]{1,5})\b', text)
-            if tok not in Orchestrator._TICKER_STOPWORDS
-        ]
-        if len(candidates) < 2:
-            return []
-
-        lowercase_tokens = set(re.findall(r"\b([a-z]{1,5})\b", text))
-        if any(candidate.lower() in lowercase_tokens for candidate in candidates):
-            return []
-        return candidates
-
-    @staticmethod
-    def _strip_optional_tool_fallback_clause(user_message: str) -> str:
-        text = (user_message or "").strip()
-        stripped = re.sub(
-            r"(?:[,.!?]\s*|\s+)(?:please\s+)?(?:search|browse|check|look(?:\s+up)?|find|get|use)\s+(?:the\s+)?(?:web|internet|online)\b[^.?!]*?\bif\s+(?:you\s+)?(?:must|need(?:\s+to)?|have\s+to|required|necessary)\b.*$",
-            "",
-            text,
-            flags=re.IGNORECASE,
-        ).strip(" ,.!?;")
-        return stripped or text
-
-    def _prepare_utility_tool_arguments(
-        self,
-        schema: Dict[str, Any],
-        user_message: str,
-        chat_history: Optional[List[Dict[str, str]]] = None,
-    ) -> Optional[Dict[str, Any]]:
-        params = schema.get("parameters", {}) or {}
-        properties = params.get("properties", {}) or {}
-        required = list(params.get("required", []) or [])
-
-        if not required:
-            return {}
-
-        if len(required) != 1:
-            return None
-
-        field_name = required[0]
-        if field_name == "query":
-            cleaned = re.sub(
-                r"^(can|could|would|please|hey|hi|hello|nice|ok|okay|what about)\b[\s,]*",
-                "",
-                user_message.strip(),
-                flags=re.IGNORECASE,
-            ).strip(" ?!.,")
-            # Strip residual "you [action-verb] [for/about]?" prefix left after removing
-            # polite openers. e.g. "Can you search for X" → "you search for X" → "X"
-            cleaned = re.sub(
-                r"^you\s+(?:search|look|find|browse|check|tell|get|show|fetch|look up|search for)\s+(?:for\s+|about\s+|up\s+)?",
-                "",
-                cleaned,
-                flags=re.IGNORECASE,
-            ).strip(" ?!.,")
-            if not cleaned:
-                cleaned = user_message.strip()
-            # If reduced to a bare action verb (e.g. "Please search" → "search"),
-            # look back at the last substantive user turn for the real topic.
-            _bare_verbs = {"search", "find", "look", "do", "go", "try", "run", "proceed", "continue"}
-            if cleaned.lower() in _bare_verbs and chat_history:
-                for turn in reversed(chat_history):
-                    if turn.get("role") == "user":
-                        prev = turn.get("content", "").strip()
-                        if len(prev) > 15:
-                            cleaned = prev
-                            break
-            args = {"query": cleaned}
-            if "max_results" in properties:
-                args["max_results"] = 3
-            return args
-
-        if field_name == "url":
-            url_match = re.search(r"https?://\S+", user_message)
-            if not url_match:
-                return None
-            return {"url": url_match.group(0)}
-
-        if field_name == "ticker":
-            # Extract uppercase ticker symbols (1–5 chars), excluding common words.
-            candidates = [
-                tok for tok in re.findall(r'\b([A-Z]{1,5})\b', user_message)
-                if tok not in Orchestrator._TICKER_STOPWORDS
-            ]
-            if len(candidates) == 1:
-                return {"ticker": candidates[0]}
-            # Zero or multiple tickers: let the supervisor handle it.
-            return None
-
-        return None
-
-    def _score_tool_for_request(self, user_message: str, schema: Dict[str, Any]) -> float:
-        query_keywords = self._routing_keywords(user_message)
-        if not query_keywords:
-            return 0.0
-        schema_keywords = self._tool_schema_keywords(schema)
-        score = 0.0
-        score += 2.5 * len(query_keywords & schema_keywords["name"])
-        score += 1.5 * len(query_keywords & schema_keywords["description"])
-        score += 0.75 * len(query_keywords & schema_keywords["parameters"])
-        if not (schema.get("parameters", {}) or {}).get("required"):
-            score += 0.25
-        return score
-
-    @staticmethod
-    def _is_trivial_direct_intent(user_message: str) -> bool:
-        lowered = (user_message or "").strip().lower()
-        if not lowered:
-            return False
-
-        if re.fullmatch(
-            r"(?:hi|hello|hey)(?:\s+[a-z0-9]{1,20})?[!.? ]*|(?:thanks|thank you|ok|okay|good morning|good evening|good night)[!.? ]*",
-            lowered,
-        ):
-            return True
-
-        token_count = len(re.findall(_ROUTING_TOKEN_RE, lowered))
-        if token_count > _FAST_PATH_DIRECT_MAX_TOKENS:
-            return False
-
-        return bool(re.search(r"\b(what is|what's|who is|define|meaning of)\b", lowered))
-
-    @staticmethod
-    def _is_trivial_single_tool_intent(tool_name: str, user_message: str, complexity: int) -> bool:
-        if tool_name not in _FAST_PATH_SINGLE_TOOL_ALLOWLIST:
-            return False
-        if complexity > _SINGLE_TOOL_MAX_COMPLEXITY:
-            return False
-
-        lowered = (user_message or "").lower()
-        token_count = len(re.findall(_ROUTING_TOKEN_RE, lowered))
-        if token_count > _FAST_PATH_SINGLE_TOOL_MAX_TOKENS:
-            return False
-
-        if re.search(r"\b(and then|then|after|before|also|plus|compare|step|steps|plan)\b", lowered):
-            return False
-
-        if tool_name == "get_system_info":
-            return bool(re.search(r"\b(time|date|timezone|system info|system information|platform|cpu|memory|os)\b", lowered))
-        if tool_name == "get_stock_price":
-            return bool(re.search(r"\b(stock|price|quote|ticker|market)\b", lowered))
-        if tool_name == "web_search":
-            return bool(re.search(r"\b(weather|news|latest|current|today|now|headline|score)\b", lowered))
-
-        return False
-
-    def _assess_request_route(
-        self,
-        user_message: str,
-        chat_history: Optional[List[Dict[str, str]]] = None,
-    ) -> Dict[str, Any]:
-        routing_message = self._strip_optional_tool_fallback_clause(user_message)
-        complexity = self._estimate_request_complexity(routing_message)
-
-        # Multi-ticker: two or more valid stock symbols → sequential get_stock_price calls.
-        # Checked before general scoring so the supervisor never sees this pattern.
-        tickers = self._extract_multiple_tickers(routing_message)
-        if len(tickers) >= 2:
-            return {
-                "mode": "multi_ticker",
-                "tickers": tickers,
-                "complexity": complexity,
-            }
-
-        candidates = []
-
-        for schema in self.cognitive_router.registry.get_schemas():
-            if not self._is_utility_tool_schema(schema):
-                continue
-            arguments = self._prepare_utility_tool_arguments(schema, routing_message, chat_history)
-            if arguments is None:
-                continue
-            score = self._score_tool_for_request(routing_message, schema)
-            if score <= 0:
-                continue
-            candidates.append({
-                "tool_name": schema.get("name", ""),
-                "arguments": arguments,
-                "score": score,
-            })
-
-        candidates.sort(key=lambda item: item["score"], reverse=True)
-        top = candidates[0] if candidates else None
-        next_score = candidates[1]["score"] if len(candidates) > 1 else 0.0
-        trivial_direct = self._is_trivial_direct_intent(routing_message)
-
-        if (
-            top
-            and complexity <= _SINGLE_TOOL_MAX_COMPLEXITY
-            and top["score"] >= _SINGLE_TOOL_MIN_SCORE
-            and (top["score"] - next_score) >= _SINGLE_TOOL_MIN_MARGIN
-            and self._is_trivial_single_tool_intent(top["tool_name"], routing_message, complexity)
-        ):
-            return {
-                "mode": "single_tool",
-                "complexity": complexity,
-                "tool_name": top["tool_name"],
-                "arguments": top["arguments"],
-            }
-
-        if (
-            trivial_direct
-            and complexity <= _DIRECT_ROUTE_MAX_COMPLEXITY
-            and (not top or top["score"] < _SINGLE_TOOL_MIN_SCORE)
-        ):
-            return {"mode": "direct", "complexity": complexity}
-
-        return {"mode": "graph", "complexity": complexity}
 
     @staticmethod
     def _coerce_fast_path_state(
@@ -1065,6 +696,107 @@ class Orchestrator:
         profiles = dict(core_state.get("user_profiles", {}) or {})
         return dict(profiles.get(user_id, {}) or {})
 
+    # ------------------------------------------------------------------
+    # Session management helpers
+    # ------------------------------------------------------------------
+
+    async def _load_active_session_from_core(self) -> Optional[Dict[str, Any]]:
+        """Fast path: read active session from core memory (no DB query)."""
+        try:
+            state = await self.core_memory.get_all()
+            session = state.get("active_session")
+            if not isinstance(session, dict):
+                return None
+            if not session.get("id"):
+                return None
+            return session
+        except Exception as exc:
+            logger.warning("Could not read active session from core memory: %s", exc)
+            return None
+
+    async def _sync_active_session_to_core(
+        self, session_row: Optional[Dict[str, Any]]
+    ) -> None:
+        """Write active session summary to core memory for fast reads."""
+        try:
+            if session_row is None:
+                await self.core_memory.update("active_session", None)
+                return
+            # Only store the fields needed by the supervisor prompt and
+            # context loading. Do not store full chat history here.
+            summary = {
+                "id": int(session_row.get("id") or 0),
+                "name": str(session_row.get("name") or ""),
+                "description": str(session_row.get("description") or ""),
+                "epic_id": session_row.get("epic_id"),
+                "turn_count": int(session_row.get("turn_count") or 0),
+                "memory_count": int(session_row.get("memory_count") or 0),
+                "started_at": str(session_row.get("created_at") or ""),
+            }
+            await self.core_memory.update("active_session", summary)
+        except Exception as exc:
+            logger.warning("Could not sync active session to core memory: %s", exc)
+
+    async def _get_active_session(self) -> Optional[Dict[str, Any]]:
+        """Return active session from core memory cache (fast, no DB call)."""
+        return await self._load_active_session_from_core()
+
+    async def _get_session_epic_rollup(
+        self, epic_id: Optional[int]
+    ) -> Optional[Dict[str, Any]]:
+        """Return Epic title and story/task counts for session context block."""
+        if not epic_id:
+            return None
+        try:
+            rollups = await self.ledger_memory.get_objective_hierarchy_rollup(epic_id)
+            # Find the epic-level rollup
+            epic_rollup = next(
+                (r for r in rollups if r.get("tier") == "Epic" and r.get("id") == epic_id),
+                None,
+            )
+            if not epic_rollup:
+                # Fall back to just the title from the backlog
+                tree = await self.ledger_memory.get_active_objective_tree(epic_id)
+                epic_node = next(
+                    (n for n in tree if n.get("tier") == "Epic"), None
+                )
+                if epic_node:
+                    return {
+                        "title": str(epic_node.get("title") or ""),
+                        "status": str(epic_node.get("status") or ""),
+                        "total_tasks": 0,
+                        "completed_tasks": 0,
+                        "pending_tasks": 0,
+                        "active_tasks": 0,
+                    }
+                return None
+            return {
+                "title": str(epic_rollup.get("title") or ""),
+                "status": str(epic_rollup.get("status") or ""),
+                "total_tasks": int(epic_rollup.get("total_tasks") or 0),
+                "completed_tasks": int(epic_rollup.get("completed_tasks") or 0),
+                "pending_tasks": int(epic_rollup.get("pending_tasks") or 0),
+                "active_tasks": int(epic_rollup.get("active_tasks") or 0),
+            }
+        except Exception as exc:
+            logger.warning("Could not fetch epic rollup for session: %s", exc)
+            return None
+
+    async def _activate_session(self, session_id: int) -> Optional[Dict[str, Any]]:
+        """Activate a session in the DB and sync to core memory.
+        Returns the session row or None if not found."""
+        row = await self.ledger_memory.activate_session(session_id)
+        if row is not None:
+            await self._sync_active_session_to_core(row)
+            logger.info("Session activated: id=%s name=%r", row["id"], row["name"])
+        return row
+
+    async def _deactivate_session(self) -> None:
+        """Deactivate all sessions and clear core memory cache."""
+        await self.ledger_memory.deactivate_all_sessions()
+        await self._sync_active_session_to_core(None)
+        logger.info("Session deactivated (no active session)")
+
     async def _remember_assistant_identity(self, user_message: str) -> Optional[str]:
         if not hasattr(self, "core_memory"):
             return None
@@ -1179,7 +911,7 @@ class Orchestrator:
             return "capability_query"
         if Orchestrator._extract_user_profile_updates(user_message) or Orchestrator._extract_assistant_identity_update(user_message):
             return "profile_update"
-        if Orchestrator._is_trivial_direct_intent(user_message):
+        if RoutingAssessor._is_trivial_direct_intent(user_message):
             return "casual"
         if Orchestrator._looks_like_task_request(lowered):
             return "task"
@@ -1325,6 +1057,48 @@ class Orchestrator:
         if Orchestrator._looks_like_task_request(lowered):
             return False
         return True
+
+    @staticmethod
+    def _is_skill_list_request(user_message: str) -> bool:
+        """Return True when the user wants a full inventory list of AIDEN's skills/tools."""
+        lowered = (user_message or "").lower()
+        # Exclude clear task-search requests like "search for a list of tools for woodworking"
+        if re.search(r"\b(?:search|find|look up|fetch)\b.{0,30}\bfor\b", lowered):
+            return False
+        # Must mention skills/tools/capabilities
+        if not re.search(r"\b(?:skills?|tools?|capabilit\w+|commands?)\b", lowered):
+            return False
+        # Inventory/listing intent phrases
+        if re.search(r"\blist\s+of\b", lowered):
+            return True
+        if re.search(r"\b(?:list|show|display|enumerate)\b", lowered):
+            return True
+        if re.search(r"\bwhat\b.{0,30}\b(?:skills?|tools?|capabilit\w+)\b", lowered):
+            return True
+        if re.search(r"\ball\s+(?:your\s+|of\s+your\s+)", lowered):
+            return True
+        return False
+
+    def _build_compact_skill_list_response(self) -> str:
+        """Return a compact bulleted list of registered skills with brief descriptions."""
+        entries = self._load_capability_catalog_entries()
+        if not entries:
+            return "I don't have any registered skills at the moment."
+
+        lines: List[str] = []
+        for item in sorted(entries, key=lambda e: str(e.get("name") or "").lower()):
+            name = str(item.get("name") or "").strip()
+            if not name:
+                continue
+            desc = str(item.get("description") or "").strip()
+            if desc and len(desc) > 70:
+                cut = desc[:70].rsplit(" ", 1)[0]
+                desc = cut + "\u2026"
+            lines.append(f"\u2022 {name}" + (f" \u2014 {desc}" if desc else ""))
+
+        total = len(lines)
+        header = f"I have {total} registered skill{'s' if total != 1 else ''}:"
+        return header + "\n\n" + "\n".join(lines)
 
     def _build_capability_response(self, user_message: str, *, classified_intent: Optional[str] = None) -> Optional[str]:
         if classified_intent != "capability_query" and not self._is_capability_question(user_message):
@@ -1552,6 +1326,9 @@ class Orchestrator:
         if self._is_summary_request(user_message):
             return self._summarize_chat_history(chat_history)
 
+        if self._is_skill_list_request(user_message):
+            return self._build_compact_skill_list_response()
+
         if self._should_use_intent_classifier(user_message):
             intent = await self._classify_user_intent(user_message)
             if intent == "capability_query":
@@ -1588,7 +1365,9 @@ class Orchestrator:
         if meta_response:
             return meta_response
 
-        assessment = self._assess_request_route(user_message, state.get("chat_history", []))
+        assessment = self.routing_assessor.assess_request_route(
+            user_message, state.get("chat_history", [])
+        )
         core_mem_str = ""
         if hasattr(self, "core_memory"):
             core_mem_str = await self.core_memory.get_context_string()
@@ -1712,6 +1491,7 @@ class Orchestrator:
                 "content": (
                     "You are AIDEN. One trusted tool has already been executed. "
                     "Using only the tool output provided, answer the user's request clearly and concisely. "
+                    "Reply in 1-3 sentences unless a list or table is clearly more appropriate. "
                     "Do not call tools. If the tool output is inconclusive, say so explicitly.\n\n"
                     f"{core_mem_str}\n\n{capabilities_str}"
                 ),
@@ -1998,130 +1778,6 @@ class Orchestrator:
             and result.content.startswith((_SYSTEM_2_ERROR_PREFIX, _SYSTEM_2_EMPTY_PREFIX))
         )
 
-    @staticmethod
-    def _is_safe_redacted_context_line(line: str) -> bool:
-        stripped = line.strip()
-        if not stripped:
-            return True
-        if _SAFE_REDACTED_CONTEXT_HEADER_RE.fullmatch(stripped):
-            return True
-        return bool(_SAFE_REDACTED_MARKER_RE.fullmatch(stripped))
-
-    @staticmethod
-    def _redact_context_and_memory_contents(text: str) -> str:
-        def _replace(match: re.Match) -> str:
-            opening, inner, closing = match.group(1), match.group(2), match.group(3)
-            redacted_inner = inner
-            for pattern in _CLOUD_REDACTION_BLOCK_REGEXES:
-                redacted_inner = pattern.sub(_REDACTED_CONTEXT_BLOCK, redacted_inner)
-            for pattern, replacement in _CLOUD_REDACTION_LINE_REGEXES:
-                redacted_inner = pattern.sub(replacement, redacted_inner)
-
-            kept_lines = []
-            dropped_content = False
-            for line in redacted_inner.splitlines():
-                if Orchestrator._is_safe_redacted_context_line(line):
-                    kept_lines.append(line)
-                else:
-                    dropped_content = True
-
-            if dropped_content:
-                kept_lines.append(_REDACTED_CONTEXT_BLOCK)
-            safe_inner = "\n".join(kept_lines).strip()
-            return f"{opening}\n{safe_inner}\n{closing}"
-
-        return _CLOUD_CONTEXT_AND_MEMORY_BLOCK_RE.sub(_replace, text)
-
-    @staticmethod
-    def _redact_text_for_cloud(
-        text: str,
-        *,
-        allow_sensitive_context: bool = False,
-        max_chars: int = 3500,
-    ) -> str:
-        raw_text = str(text or "")
-        if not raw_text:
-            return ""
-
-        if allow_sensitive_context:
-            compact = raw_text.strip()
-            if len(compact) > max_chars:
-                return compact[:max_chars].rstrip() + "\n[TRUNCATED_FOR_SIZE]"
-            return compact
-
-        redacted = Orchestrator._redact_context_and_memory_contents(raw_text)
-        for pattern in _CLOUD_REDACTION_BLOCK_REGEXES:
-            redacted = pattern.sub(_REDACTED_CONTEXT_BLOCK, redacted)
-
-        for pattern, replacement in _CLOUD_REDACTION_LINE_REGEXES:
-            redacted = pattern.sub(replacement, redacted)
-
-        for pattern, replacement in _CLOUD_REDACTION_PII_REGEXES:
-            redacted = pattern.sub(replacement, redacted)
-
-        redacted = _MULTI_BLANK_LINES_RE.sub("\n\n", redacted).strip()
-        if not redacted:
-            return _REDACTED_EMPTY_PAYLOAD
-        if len(redacted) > max_chars:
-            return redacted[:max_chars].rstrip() + "\n[TRUNCATED_FOR_PRIVACY]"
-        return redacted
-
-    def _redact_messages_for_cloud(
-        self,
-        messages: List[Dict[str, str]],
-        *,
-        allow_sensitive_context: bool = False,
-    ) -> List[Dict[str, str]]:
-        if not messages:
-            return [{"role": "user", "content": _REDACTED_EMPTY_PAYLOAD}]
-
-        source_messages: List[Dict[str, Any]]
-        if allow_sensitive_context:
-            source_messages = list(messages)
-        else:
-            system_messages = [msg for msg in messages if str(msg.get("role", "")).lower() == "system"]
-            user_messages = [msg for msg in messages if str(msg.get("role", "")).lower() == "user"]
-
-            source_messages = []
-            if system_messages:
-                source_messages.append(system_messages[0])
-                if len(system_messages) > 1:
-                    source_messages.append(system_messages[-1])
-            if user_messages:
-                source_messages.append(user_messages[-1])
-            elif messages:
-                source_messages.append(messages[-1])
-
-        sanitized: List[Dict[str, str]] = []
-        seen: set[tuple[str, str]] = set()
-        for message in source_messages:
-            role = str(message.get("role") or "user")
-            content = self._redact_text_for_cloud(
-                str(message.get("content") or ""),
-                allow_sensitive_context=allow_sensitive_context,
-            )
-            if not content:
-                continue
-            key = (role, content)
-            if key in seen:
-                continue
-            seen.add(key)
-            sanitized.append({"role": role, "content": content})
-
-        return sanitized or [{"role": "user", "content": _REDACTED_EMPTY_PAYLOAD}]
-
-    @staticmethod
-    def _cloud_payload_audit_sha256(
-        messages: List[Dict[str, str]],
-        allowed_tools: Optional[List[str]],
-    ) -> str:
-        payload = {
-            "messages": list(messages or []),
-            "allowed_tools": list(allowed_tools or []),
-        }
-        serialized = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
-        return hashlib.sha256(serialized.encode("utf-8")).hexdigest()
-
     async def _append_cloud_payload_audit_if_supported(
         self,
         *,
@@ -2154,7 +1810,7 @@ class Orchestrator:
         purpose: str = "system_2",
         allow_sensitive_context: bool = False,
     ) -> RouterResult:
-        minimized_messages = self._redact_messages_for_cloud(
+        minimized_messages = cloud_redaction.redact_messages_for_cloud(
             messages,
             allow_sensitive_context=allow_sensitive_context,
         )
@@ -2169,7 +1825,7 @@ class Orchestrator:
             message_count_before=len(messages),
             message_count_after=len(minimized_messages),
             allow_sensitive_context=allow_sensitive_context,
-            payload_sha256=self._cloud_payload_audit_sha256(minimized_messages, allowed_tools),
+            payload_sha256=cloud_redaction.compute_payload_sha256(minimized_messages, allowed_tools),
         )
         return await self.cognitive_router.route_to_system_2(
             minimized_messages,
@@ -2238,14 +1894,31 @@ class Orchestrator:
             after_metrics = self._get_system_1_gate_metrics()
             self._log_system_1_gate_pressure(context, before_metrics, after_metrics)
 
-    async def _get_archival_context(self, query: str) -> str:
-        """Retrieve top archival memory snippets relevant to the user query."""
+    async def _get_archival_context(
+        self,
+        query: str,
+        session_id: Optional[int] = None,
+        epic_id: Optional[int] = None,
+    ) -> str:
+        """Retrieve top archival memory snippets relevant to the query.
+        Scoped to session/epic when provided."""
         if not query:
             return ""
         _max_chunk = int(os.getenv("MAX_ARCHIVAL_CHUNK_CHARS", "2000"))
         _max_total = int(os.getenv("MAX_ARCHIVAL_TOTAL_CHARS", "6000"))
+
+        from src.skills.search_archival_memory import _build_where_clause
+        where = _build_where_clause(session_id, epic_id)
+
         try:
-            results = await self.vector_memory.query_memory_async(query, n_results=3)
+            results = await self.vector_memory.query_memory_async(
+                query, n_results=3, where=where
+            )
+            # Fall back to global if scoped returns nothing useful
+            if not results and where is not None:
+                results = await self.vector_memory.query_memory_async(
+                    query, n_results=3
+                )
             if not results:
                 return ""
             lines = ["<Archival_Memory>"]
@@ -2256,21 +1929,18 @@ class Orchestrator:
                     continue
                 if total + len(snippet) > _max_total:
                     break
-                lines.append(f"  <Memory>{snippet}</Memory>")
+                # Annotate scoped memories so the supervisor knows they are
+                # project-specific
+                meta = item.get("metadata", {}) or {}
+                mem_session = int(meta.get("session_id") or 0)
+                scope_prefix = "[session] " if mem_session and mem_session == session_id else ""
+                lines.append(f"  <Memory>{scope_prefix}{snippet}</Memory>")
                 total += len(snippet)
             lines.append("</Archival_Memory>")
             return "\n".join(lines)
         except Exception as e:
             logger.warning(f"Archival memory lookup failed: {e}")
             return ""
-
-    def _energy_gate_available(self) -> bool:
-        return (
-            getattr(self, "energy_judge", None) is not None
-            and getattr(self, "energy_roi_engine", None) is not None
-            and getattr(self, "_predictive_energy_budget_lock", None) is not None
-            and hasattr(self, "_predictive_energy_budget_remaining")
-        )
 
     @classmethod
     def _warn_deprecated_energy_replenish_turn_env_once(cls) -> None:
@@ -2312,93 +1982,31 @@ class Orchestrator:
             amount = _HEARTBEAT_REPLENISH_ENV_DEFAULT
         return max(0, amount)
 
-    def _apply_predictive_energy_tick_locked(self, amount: int) -> int:
-        if amount <= 0 or not self._predictive_budget_tracking_available():
-            return 0
-
-        cap = max(0, int(os.getenv("INITIAL_ENERGY_BUDGET", "100")))
-        before = max(0, int(self._predictive_energy_budget_remaining))
-        after = min(cap, before + int(amount))
-        self._predictive_energy_budget_remaining = after
-        return after - before
-
     async def _tick_predictive_energy_budget(self, amount: int, reason: str) -> int:
-        if amount <= 0 or not self._predictive_budget_tracking_available():
+        if amount <= 0:
             return 0
 
-        async with self._predictive_energy_budget_lock:
-            applied = self._apply_predictive_energy_tick_locked(int(amount))
-            remaining = max(0, int(self._predictive_energy_budget_remaining))
-
-        if applied > 0:
-            logger.info(
-                "Predictive energy budget replenished: +%s (%s). Remaining=%s",
-                applied,
-                reason,
-                remaining,
-            )
+        before = await self._get_predictive_energy_budget_remaining()
+        await self._refund_predictive_energy_budget(int(amount), reason)
+        after = await self._get_predictive_energy_budget_remaining()
+        applied = max(0, after - before)
         return applied
 
-    def _compute_predictive_energy_replenishment_points_wallclock_locked(
-        self,
-        *,
-        now: Optional[float] = None,
-    ) -> int:
-        if not self._predictive_budget_tracking_available():
-            return 0
-
-        current_time = float(time.time() if now is None else now)
-        last_replenished_at = float(
-            getattr(self, "_predictive_energy_budget_last_replenished_at", current_time)
-        )
-        if current_time <= last_replenished_at:
-            return 0
-
-        replenish_per_hour = self._resolve_energy_replenish_per_hour()
-        if replenish_per_hour <= 0:
-            self._predictive_energy_budget_last_replenished_at = current_time
-            return 0
-
-        elapsed_seconds = current_time - last_replenished_at
-        replenishment_points = int(math.floor((elapsed_seconds / 3600.0) * replenish_per_hour))
-        if replenishment_points <= 0:
-            return 0
-
-        consumed_seconds = (float(replenishment_points) / replenish_per_hour) * 3600.0
-        self._predictive_energy_budget_last_replenished_at = last_replenished_at + consumed_seconds
-        return replenishment_points
-
-    def _replenish_predictive_energy_budget_wallclock_locked(self, *, now: Optional[float] = None) -> int:
-        replenishment_points = self._compute_predictive_energy_replenishment_points_wallclock_locked(now=now)
-        return self._apply_predictive_energy_tick_locked(replenishment_points)
-
     async def _get_predictive_energy_budget_remaining(self) -> int:
-        if not self._energy_gate_available():
-            return max(0, int(os.getenv("INITIAL_ENERGY_BUDGET", "100")))
-        async with self._predictive_energy_budget_lock:
-            return max(0, int(self._predictive_energy_budget_remaining))
-
-    def _predictive_budget_tracking_available(self) -> bool:
-        return (
-            getattr(self, "_predictive_energy_budget_lock", None) is not None
-            and hasattr(self, "_predictive_energy_budget_remaining")
-        )
+        async with self._energy_budget_lock:
+            return max(0, int(self._energy_budget))
 
     async def _refund_predictive_energy_budget(self, amount: int, reason: str) -> None:
-        if amount <= 0 or not self._predictive_budget_tracking_available():
+        if amount <= 0:
             return
 
-        async with self._predictive_energy_budget_lock:
-            applied = self._apply_predictive_energy_tick_locked(int(amount))
-            remaining = max(0, int(self._predictive_energy_budget_remaining))
-
-        if applied > 0:
-            logger.info(
-                "Predictive energy budget refunded: +%s (%s). Remaining=%s",
-                applied,
-                reason,
-                remaining,
-            )
+        cap = max(0, int(os.getenv("INITIAL_ENERGY_BUDGET", "100")))
+        async with self._energy_budget_lock:
+            self._energy_budget = min(cap, self._energy_budget + int(amount))
+        logger.info(
+            "Energy budget refunded: +%s (%s). Remaining=%s",
+            amount, reason, self._energy_budget,
+        )
 
     async def _try_reserve_predictive_energy_budget(
         self,
@@ -2407,23 +2015,17 @@ class Orchestrator:
         min_reserve: int,
         reason: str,
     ) -> bool:
-        if not self._energy_gate_available():
-            return True
-
         cost = max(0, int(predicted_cost))
         reserve = max(0, int(min_reserve))
-        async with self._predictive_energy_budget_lock:
-            remaining = max(0, int(self._predictive_energy_budget_remaining))
-            if remaining - cost < reserve:
+        async with self._energy_budget_lock:
+            if self._energy_budget - cost < reserve:
                 return False
-            self._predictive_energy_budget_remaining = remaining - cost
-            logger.info(
-                "Predictive energy budget reserved: -%s (%s). Remaining=%s",
-                cost,
-                reason,
-                self._predictive_energy_budget_remaining,
-            )
-            return True
+            self._energy_budget -= cost
+        logger.info(
+            "Energy budget reserved: -%s (%s). Remaining=%s",
+            cost, reason, self._energy_budget,
+        )
+        return True
 
     @staticmethod
     def _build_energy_evaluation_record(
@@ -2494,7 +2096,7 @@ class Orchestrator:
         state: Dict[str, Any],
     ) -> Dict[str, Optional[Dict[str, Any]]]:
         user_message = str(state.get("user_input") or "").strip()
-        complexity = max(1, self._estimate_request_complexity(user_message) + 1)
+        complexity = max(1, self.routing_assessor._estimate_request_complexity(user_message) + 1)
         history_context = self._build_goal_planning_context(state)
 
         task = {
@@ -2542,9 +2144,6 @@ class Orchestrator:
         *,
         dispatch_context: str,
     ) -> Optional[str]:
-        if not self._energy_gate_available():
-            return None
-
         user_id = str(state.get("user_id") or "")
         if user_id == "heartbeat":
             return None
@@ -2562,16 +2161,34 @@ class Orchestrator:
         )
 
         if not decision.should_execute:
-            message = self._format_ad_hoc_energy_deferral_message(
-                decision=decision,
-                available_energy=available_energy,
-            )
-            logger.warning(
-                "Ad-hoc dispatch deferred by energy gate (%s): %s",
-                dispatch_context,
-                message,
-            )
-            return message
+            # Comfort-budget floor bypass: when more than half the starting budget
+            # remains and the sole reason for deferral is a borderline ROI (not an
+            # actual reserve shortage), approve the request unconditionally.  This
+            # prevents the energy gate from creating friction during normal interactive
+            # sessions where resources are genuinely plentiful.
+            if (
+                decision.reason == "ROI too low"
+                and available_energy > _AD_HOC_COMFORTABLE_BUDGET_FLOOR
+            ):
+                logger.info(
+                    "Ad-hoc dispatch approved by comfort-budget floor (%s): "
+                    "ROI=%.2f below threshold but budget=%s > floor=%s",
+                    dispatch_context,
+                    decision.roi,
+                    available_energy,
+                    _AD_HOC_COMFORTABLE_BUDGET_FLOOR,
+                )
+            else:
+                message = self._format_ad_hoc_energy_deferral_message(
+                    decision=decision,
+                    available_energy=available_energy,
+                )
+                logger.warning(
+                    "Ad-hoc dispatch deferred by energy gate (%s): %s",
+                    dispatch_context,
+                    message,
+                )
+                return message
 
         reserved = await self._try_reserve_predictive_energy_budget(
             predicted_cost=decision.predicted_cost,
@@ -2639,7 +2256,7 @@ class Orchestrator:
         if self._is_explicit_epic_request(text):
             return True
 
-        complexity = self._estimate_request_complexity(text)
+        complexity = self.routing_assessor._estimate_request_complexity(text)
         if complexity < _GOAL_PLANNER_COMPLEXITY_THRESHOLD:
             return False
 
@@ -2729,7 +2346,7 @@ class Orchestrator:
                 context=planning_context,
                 route_to_system_2=_route,
                 ledger_memory=self.ledger_memory,
-                redactor=self._redact_text_for_cloud,
+                redactor=cloud_redaction.redact_text_for_cloud,
                 origin=f"User:{user_id}",
             )
         except Exception as e:
@@ -2743,6 +2360,9 @@ class Orchestrator:
             result.story_count,
             result.task_count,
         )
+        _gp_emitter = get_current_emitter()
+        if _gp_emitter is not None:
+            await _gp_emitter.emit(ProgressEvent.goal_planning())
         return self._format_goal_planner_ack(result)
 
     def _deduct_energy(self, state: Dict[str, Any], amount: int, reason: str) -> Dict[str, Any]:
@@ -2881,10 +2501,11 @@ class Orchestrator:
 
     @staticmethod
     def _get_real_worker_outputs(state: Dict[str, Any]) -> Dict[str, str]:
+        _INTERNAL_OUTPUT_KEYS = {"supervisor_context", "_s2_blueprint"}
         return {
             name: output
             for name, output in dict(state.get("worker_outputs", {}) or {}).items()
-            if name != "supervisor_context"
+            if name not in _INTERNAL_OUTPUT_KEYS
         }
 
     def _get_step_dependencies(
@@ -3035,7 +2656,7 @@ class Orchestrator:
 
     def _try_route_assessment_triviality_bypass(self, user_input: str) -> Optional[MoralDecision]:
         try:
-            assessment = self._assess_request_route(user_input)
+            assessment = self.routing_assessor.assess_request_route(user_input)
         except Exception:
             return None
 
@@ -3046,7 +2667,7 @@ class Orchestrator:
                 return build_triviality_bypass_decision(
                     f"single_tool_read_only:{tool_name}"
                 )
-        if mode == "direct" and self._is_trivial_direct_intent(user_input):
+        if mode == "direct" and RoutingAssessor._is_trivial_direct_intent(user_input):
             return build_triviality_bypass_decision("direct_trivial_read_only")
         return None
 
@@ -3241,6 +2862,18 @@ class Orchestrator:
         supervisor_context = state.get("worker_outputs", {}).get("supervisor_context", "")
         if supervisor_context:
             lines.append(f"Supervisor context: {supervisor_context}")
+
+        # Inject session context so agents can scope their tool calls
+        session = state.get("active_session")
+        if isinstance(session, dict) and session.get("id"):
+            session_line = (
+                f"Active session: {session.get('name')} "
+                f"(session_id={session['id']}"
+            )
+            if session.get("epic_id"):
+                session_line += f", epic_id={session['epic_id']}"
+            session_line += ")"
+            lines.append(session_line)
 
         task_text = str(task_packet.get("task", "")).strip()
         reason_text = str(task_packet.get("reason", "")).strip()
@@ -3599,6 +3232,11 @@ class Orchestrator:
         state = normalize_state(state)
         if deduct_energy:
             state = self._deduct_energy(state, agent_def.energy_cost, agent_def.name)
+        _agent_emitter = get_current_emitter()
+        _agent_start_mono = time.monotonic()
+        if _agent_emitter is not None:
+            _agent_emitter.record_agent_start(agent_def.name)
+            await _agent_emitter.emit(ProgressEvent.agent_start(agent_def.name))
         try:
             core_mem_str = await self.core_memory.get_context_string()
 
@@ -3611,6 +3249,9 @@ class Orchestrator:
                 },
                 {"role": "user", "content": handoff},
             ]
+            if _agent_emitter is not None:
+                if "synthesis" in agent_def.name.lower():
+                    await _agent_emitter.emit(ProgressEvent.synthesis_start())
             router_result, attempted_system_2 = await self._route_agent_request(
                 messages,
                 agent_def,
@@ -3620,6 +3261,11 @@ class Orchestrator:
         except Exception as _agent_exc:
             if deduct_energy:
                 state = self._refund_energy(state, agent_def.energy_cost, f"{agent_def.name}_exception")
+            if _agent_emitter is not None:
+                _dur = time.monotonic() - _agent_start_mono
+                await _agent_emitter.emit(
+                    ProgressEvent.agent_done(agent_def.name, _dur)
+                )
             raise _agent_exc
 
         if router_result is None:
@@ -3633,17 +3279,32 @@ class Orchestrator:
                 state["worker_outputs"][agent_def.name] = (
                     f"Error: {agent_def.name} failed and System 2 is not configured."
                 )
+            if _agent_emitter is not None:
+                _dur = time.monotonic() - _agent_start_mono
+                await _agent_emitter.emit(
+                    ProgressEvent.agent_done(agent_def.name, _dur)
+                )
             return state
 
         if router_result.status == "cognitive_escalation":
             solution = await self._handle_cognitive_escalation(state, router_result)
             state["worker_outputs"][agent_def.name] = solution
+            if _agent_emitter is not None:
+                _dur = time.monotonic() - _agent_start_mono
+                await _agent_emitter.emit(
+                    ProgressEvent.agent_done(agent_def.name, _dur)
+                )
             return state
 
         if router_result.status != "ok":
             state[_BLOCKED_KEY] = router_result
         else:
             state["worker_outputs"][agent_def.name] = router_result.content
+            if _agent_emitter is not None:
+                _dur = time.monotonic() - _agent_start_mono
+                await _agent_emitter.emit(
+                    ProgressEvent.agent_done(agent_def.name, _dur)
+                )
 
         return state
 
@@ -4162,21 +3823,32 @@ class Orchestrator:
             context="nocturnal_scoring_local",
         )
 
-    async def _save_memory_async(self, text: str) -> None:
-        """Fire-and-forget memory storage gated by response length.
-
-        Skips trivial exchanges (short greetings, one-liners).
-        Threshold: combined user+assistant text must exceed MEMORY_SAVE_THRESHOLD.
-        Uses asyncio.to_thread() so the blocking ChromaDB call does not
-        stall the event loop.
-        """
+    async def _save_memory_async(
+        self,
+        text: str,
+        session_id: Optional[int] = None,
+        epic_id: Optional[int] = None,
+    ) -> None:
+        """Fire-and-forget memory storage with optional session/epic tagging."""
         try:
             if len(text) < MEMORY_SAVE_THRESHOLD:
                 return
-            await self.vector_memory.add_memory_async(
-                text=text,
-                metadata={"type": "conversation", "timestamp": datetime.now().isoformat()}
-            )
+            metadata: Dict[str, Any] = {
+                "type": "conversation",
+                "timestamp": datetime.now().isoformat(),
+                # ChromaDB requires scalar values; 0 means "no session/epic"
+                "session_id": int(session_id) if session_id else 0,
+                "epic_id": int(epic_id) if epic_id else 0,
+            }
+            await self.vector_memory.add_memory_async(text=text, metadata=metadata)
+            if session_id:
+                increment_memory_count = getattr(
+                    self.ledger_memory,
+                    "increment_session_memory_count",
+                    None,
+                )
+                if callable(increment_memory_count) and inspect.iscoroutinefunction(increment_memory_count):
+                    self._fire_and_forget(increment_memory_count(session_id))
         except Exception as e:
             logger.warning(f"Async memory save failed: {e}")
 
@@ -4465,737 +4137,6 @@ class Orchestrator:
                 self._user_locks[user_id] = weakref.ref(slot)
             self._evict_idle_user_lock_refs(_max)
 
-    @staticmethod
-    def _get_synthesis_self_test_timeout_seconds() -> float:
-        """Return a bounded timeout for generated-tool self-tests."""
-        raw_value = os.getenv(
-            "SYNTHESIS_SELF_TEST_TIMEOUT_SECONDS",
-            str(_SYNTHESIS_SELF_TEST_TIMEOUT_DEFAULT_SECONDS),
-        )
-        try:
-            timeout_seconds = float(raw_value)
-        except ValueError:
-            timeout_seconds = _SYNTHESIS_SELF_TEST_TIMEOUT_DEFAULT_SECONDS
-        # Keep timeout strict to avoid orchestration hangs from infinite loops.
-        return min(max(timeout_seconds, 1.0), 15.0)
-
-    @staticmethod
-    def _get_max_syntheses_per_user_per_hour() -> int:
-        raw_value = os.getenv("MAX_SYNTHESES_PER_USER_PER_HOUR", "5")
-        try:
-            budget = int(raw_value)
-        except ValueError:
-            budget = 5
-        return max(1, budget)
-
-    @staticmethod
-    def _extract_pytest_counts(output_text: str) -> Dict[str, int]:
-        """Extract pass/fail/error counts from pytest textual output."""
-        counts = {
-            "passed": 0,
-            "failed": 0,
-            "errors": 0,
-            "skipped": 0,
-        }
-        patterns = {
-            "passed": r"(\d+)\s+passed",
-            "failed": r"(\d+)\s+failed",
-            "errors": r"(\d+)\s+error(?:s)?",
-            "skipped": r"(\d+)\s+skipped",
-        }
-        for key, pattern in patterns.items():
-            match = re.search(pattern, output_text)
-            if match:
-                counts[key] = int(match.group(1))
-        return counts
-
-    @staticmethod
-    def _write_text_file(path: str, content: str) -> None:
-        with open(path, "w", encoding="utf-8", newline="\n") as file_obj:
-            file_obj.write(content)
-
-    @staticmethod
-    def _compute_synthesis_proof_sha256(tool_code: str, pytest_code: str) -> str:
-        """Return SHA-256 digest for the exact tool+test artifact pair."""
-        normalized_tool = str(tool_code or "").replace("\r\n", "\n").replace("\r", "\n")
-        normalized_pytest = str(pytest_code or "").replace("\r\n", "\n").replace("\r", "\n")
-        proof_payload = (
-            "SYNTHESIZED_TOOL_CODE\n"
-            f"{normalized_tool}\n\n"
-            "SYNTHESIZED_PYTEST_CODE\n"
-            f"{normalized_pytest}\n"
-        )
-        return hashlib.sha256(proof_payload.encode("utf-8")).hexdigest()
-
-    @staticmethod
-    def _build_synthesis_test_summary(
-        attempt_number: int,
-        max_retries: int,
-        self_test_result: Dict[str, Any],
-    ) -> str:
-        status = str(self_test_result.get("status") or "failed").upper()
-        passed = int(self_test_result.get("passed") or 0)
-        failed = int(self_test_result.get("failed") or 0)
-        errors = int(self_test_result.get("errors") or 0)
-        duration_ms = int(self_test_result.get("duration_ms") or 0)
-        return (
-            f"{status} on attempt {attempt_number}/{max_retries} "
-            f"(passed={passed}, failed={failed}, errors={errors}, duration={duration_ms} ms)"
-        )
-
-    @staticmethod
-    def _extract_synthesis_failure_trace(self_test_result: Dict[str, Any], max_chars: int = 3000) -> str:
-        stderr_text = str(self_test_result.get("stderr") or "").strip()
-        stdout_text = str(self_test_result.get("stdout") or "").strip()
-        error_text = str(self_test_result.get("error") or "").strip()
-
-        trace_text = "\n\n".join(
-            chunk for chunk in [stderr_text, stdout_text, error_text] if chunk
-        ).strip()
-        if not trace_text:
-            return "(no traceback captured)"
-        if len(trace_text) > max_chars:
-            return trace_text[-max_chars:]
-        return trace_text
-
-    @staticmethod
-    def _build_synthesis_generation_failure_result(error_message: str) -> Dict[str, Any]:
-        return {
-            "status": "failed",
-            "timed_out": False,
-            "timeout_seconds": 0,
-            "exit_code": None,
-            "duration_ms": 0,
-            "passed": 0,
-            "failed": 0,
-            "errors": 1,
-            "skipped": 0,
-            "stdout": "",
-            "stderr": "",
-            "error": str(error_message or "Tool generation failed."),
-        }
-
-    async def _create_synthesis_run_if_supported(
-        self,
-        *,
-        user_id: str,
-        gap_description: str,
-        suggested_tool_name: str,
-        original_input: str,
-        max_retries: int,
-    ) -> Optional[int]:
-        creator = getattr(self.ledger_memory, "create_synthesis_run", None)
-        if not callable(creator):
-            return None
-        try:
-            return await creator(
-                user_id=user_id,
-                gap_description=gap_description,
-                suggested_tool_name=suggested_tool_name,
-                original_input=original_input,
-                max_retries=max_retries,
-            )
-        except Exception as e:
-            logger.warning("Could not create synthesis run record: %s", e)
-            return None
-
-    async def _append_synthesis_attempt_if_supported(
-        self,
-        *,
-        run_id: Optional[int],
-        attempt_number: int,
-        phase: str,
-        synthesis_payload: Dict[str, Any],
-        self_test_result: Dict[str, Any],
-        code_sha256: str,
-    ) -> None:
-        if run_id is None:
-            return
-        appender = getattr(self.ledger_memory, "append_synthesis_attempt", None)
-        if not callable(appender):
-            return
-        try:
-            await appender(
-                run_id=run_id,
-                attempt_number=attempt_number,
-                phase=phase,
-                synthesis_payload=synthesis_payload,
-                self_test_result=self_test_result,
-                code_sha256=code_sha256,
-            )
-        except Exception as e:
-            logger.warning("Could not append synthesis attempt %s for run %s: %s", attempt_number, run_id, e)
-
-    async def _update_synthesis_run_status_if_supported(
-        self,
-        run_id: Optional[int],
-        **kwargs: Any,
-    ) -> None:
-        if run_id is None:
-            return
-        updater = getattr(self.ledger_memory, "update_synthesis_run_status", None)
-        if not callable(updater):
-            return
-        try:
-            await updater(run_id, **kwargs)
-        except Exception as e:
-            logger.warning("Could not update synthesis run %s status: %s", run_id, e)
-
-    async def _run_synthesis_self_test(self, synthesis: Dict[str, Any]) -> Dict[str, Any]:
-        """Run generated pytest code in an isolated subprocess with a hard timeout."""
-        tool_name = synthesis["tool_name"]
-        tool_code = synthesis["code"]
-        pytest_code = synthesis["pytest_code"]
-        timeout_seconds = self._get_synthesis_self_test_timeout_seconds()
-        started = time.perf_counter()
-
-        tool_file_name = f"{tool_name}.py"
-        test_file_name = f"test_{tool_name}.py"
-
-        process = None
-        stdout_text = ""
-        stderr_text = ""
-
-        try:
-            tmp_dir_obj = tempfile.TemporaryDirectory(prefix="synth_selftest_")
-            try:
-                temp_dir = tmp_dir_obj.name
-                tool_path = os.path.join(temp_dir, tool_file_name)
-                test_path = os.path.join(temp_dir, test_file_name)
-
-                await asyncio.to_thread(self._write_text_file, tool_path, tool_code)
-                await asyncio.to_thread(self._write_text_file, test_path, pytest_code)
-
-                process = await asyncio.create_subprocess_exec(
-                    sys.executable,
-                    "-m",
-                    "pytest",
-                    "-q",
-                    test_file_name,
-                    cwd=temp_dir,
-                    env=_build_safe_subprocess_env(),
-                    stdout=asyncio.subprocess.PIPE,
-                    stderr=asyncio.subprocess.PIPE,
-                )
-
-                try:
-                    stdout_bytes, stderr_bytes = await asyncio.wait_for(
-                        process.communicate(), timeout=timeout_seconds
-                    )
-                    stdout_text = stdout_bytes.decode(errors="replace")
-                    stderr_text = stderr_bytes.decode(errors="replace")
-                except asyncio.TimeoutError:
-                    if process.returncode is None:
-                        process.kill()
-                    stdout_bytes, stderr_bytes = await process.communicate()
-                    stdout_text = stdout_bytes.decode(errors="replace")
-                    stderr_text = stderr_bytes.decode(errors="replace")
-                    elapsed_ms = int((time.perf_counter() - started) * 1000)
-                    counts = self._extract_pytest_counts(f"{stdout_text}\n{stderr_text}")
-                    return {
-                        "status": "timeout",
-                        "timed_out": True,
-                        "timeout_seconds": timeout_seconds,
-                        "exit_code": process.returncode,
-                        "duration_ms": elapsed_ms,
-                        "passed": counts["passed"],
-                        "failed": counts["failed"],
-                        "errors": counts["errors"],
-                        "skipped": counts["skipped"],
-                        "stdout": stdout_text,
-                        "stderr": stderr_text,
-                        "error": (
-                            f"Sandboxed self-test timed out after {timeout_seconds:.1f}s "
-                            f"(possible infinite loop or blocking operation)."
-                        ),
-                    }
-            finally:
-                try:
-                    tmp_dir_obj.cleanup()
-                except Exception as cleanup_err:
-                    logger.debug("Temp dir cleanup failed (non-fatal): %s", cleanup_err)
-        except Exception as exc:
-            elapsed_ms = int((time.perf_counter() - started) * 1000)
-            return {
-                "status": "failed",
-                "timed_out": False,
-                "timeout_seconds": timeout_seconds,
-                "exit_code": process.returncode if process is not None else None,
-                "duration_ms": elapsed_ms,
-                "passed": 0,
-                "failed": 0,
-                "errors": 1,
-                "skipped": 0,
-                "stdout": stdout_text,
-                "stderr": stderr_text,
-                "error": f"Sandboxed self-test harness crashed: {exc}",
-            }
-
-        elapsed_ms = int((time.perf_counter() - started) * 1000)
-        counts = self._extract_pytest_counts(f"{stdout_text}\n{stderr_text}")
-        passed = process.returncode == 0
-
-        return {
-            "status": "passed" if passed else "failed",
-            "timed_out": False,
-            "timeout_seconds": timeout_seconds,
-            "exit_code": process.returncode,
-            "duration_ms": elapsed_ms,
-            "passed": counts["passed"],
-            "failed": counts["failed"],
-            "errors": counts["errors"],
-            "skipped": counts["skipped"],
-            "stdout": stdout_text,
-            "stderr": stderr_text,
-            "error": "" if passed else "Sandboxed self-test reported pytest failures.",
-        }
-
-    @staticmethod
-    def _build_synthesis_fallback_payload(
-        failed_candidate: Optional[Dict[str, Any]],
-        suggested_tool_name: str,
-    ) -> Dict[str, Any]:
-        if isinstance(failed_candidate, dict):
-            return dict(failed_candidate)
-        return {
-            "tool_name": suggested_tool_name,
-            "description": "",
-            "code": "",
-            "pytest_code": "",
-            "schema_json": "",
-            "test_manifest_json": "",
-        }
-
-    async def _request_synthesis_candidate(
-        self,
-        *,
-        attempt_number: int,
-        suggested_tool_name: str,
-        redacted_gap_description: str,
-        redacted_user_query: str,
-        failed_candidate: Optional[Dict[str, Any]],
-        last_failure_summary: str,
-        last_failure_trace: str,
-    ) -> Dict[str, Any]:
-        if attempt_number == 1:
-            return await asyncio.wait_for(
-                self.cognitive_router.synthesize_tool(
-                    gap_description=redacted_gap_description,
-                    suggested_tool_name=suggested_tool_name,
-                    user_query=redacted_user_query,
-                ),
-                timeout=60.0,
-            )
-
-        if failed_candidate is None:
-            raise RuntimeError("Repair loop missing failed candidate payload.")
-
-        redacted_failure_summary = self._redact_text_for_cloud(
-            last_failure_summary,
-            allow_sensitive_context=False,
-            max_chars=1200,
-        )
-        redacted_failure_trace = self._redact_text_for_cloud(
-            last_failure_trace,
-            allow_sensitive_context=False,
-            max_chars=2800,
-        )
-
-        return await asyncio.wait_for(
-            self.cognitive_router.repair_synthesized_tool(
-                gap_description=redacted_gap_description,
-                suggested_tool_name=suggested_tool_name,
-                user_query=redacted_user_query,
-                previous_tool_name=str(failed_candidate.get("tool_name") or suggested_tool_name),
-                previous_code=str(failed_candidate.get("code") or ""),
-                previous_pytest_code=str(failed_candidate.get("pytest_code") or ""),
-                failure_summary=redacted_failure_summary,
-                failure_trace=redacted_failure_trace,
-            ),
-            timeout=60.0,
-        )
-
-    async def _run_single_synthesis_attempt(
-        self,
-        *,
-        run_id: Optional[int],
-        attempt_number: int,
-        max_retries: int,
-        suggested_tool_name: str,
-        redacted_gap_description: str,
-        redacted_user_query: str,
-        failed_candidate: Optional[Dict[str, Any]],
-        last_failure_summary: str,
-        last_failure_trace: str,
-    ) -> Dict[str, Any]:
-        phase = "synthesis" if attempt_number == 1 else "repair"
-        try:
-            candidate = await self._request_synthesis_candidate(
-                attempt_number=attempt_number,
-                suggested_tool_name=suggested_tool_name,
-                redacted_gap_description=redacted_gap_description,
-                redacted_user_query=redacted_user_query,
-                failed_candidate=failed_candidate,
-                last_failure_summary=last_failure_summary,
-                last_failure_trace=last_failure_trace,
-            )
-        except Exception as e:
-            error_message = (
-                f"{phase.capitalize()} generation failed on attempt {attempt_number}/{max_retries}: {e}"
-            )
-            logger.warning(error_message)
-            failure_result = self._build_synthesis_generation_failure_result(error_message)
-            await self._append_synthesis_attempt_if_supported(
-                run_id=run_id,
-                attempt_number=attempt_number,
-                phase=phase,
-                synthesis_payload=self._build_synthesis_fallback_payload(
-                    failed_candidate,
-                    suggested_tool_name,
-                ),
-                self_test_result=failure_result,
-                code_sha256="",
-            )
-            return {
-                "status": "generation_failed",
-                "candidate": failed_candidate,
-                "test_result": failure_result,
-                "failure_summary": error_message,
-                "failure_trace": error_message,
-            }
-
-        test_result = await self._run_synthesis_self_test(candidate)
-        proof_sha256 = self._compute_synthesis_proof_sha256(
-            candidate.get("code", ""),
-            candidate.get("pytest_code", ""),
-        )
-        test_summary = self._build_synthesis_test_summary(
-            attempt_number,
-            max_retries,
-            test_result,
-        )
-        candidate["self_test_result"] = test_result
-        candidate["self_test_summary"] = test_summary
-        candidate["synthesis_proof_sha256"] = proof_sha256
-
-        await self._append_synthesis_attempt_if_supported(
-            run_id=run_id,
-            attempt_number=attempt_number,
-            phase=phase,
-            synthesis_payload=candidate,
-            self_test_result=test_result,
-            code_sha256=proof_sha256,
-        )
-
-        if str(test_result.get("status") or "") == "passed":
-            return {
-                "status": "passed",
-                "candidate": candidate,
-                "test_result": test_result,
-                "proof_sha256": proof_sha256,
-                "test_summary": test_summary,
-            }
-
-        return {
-            "status": "failed",
-            "candidate": candidate,
-            "test_result": test_result,
-            "failure_summary": f"{test_summary}. {str(test_result.get('error') or '').strip()}".strip(),
-            "failure_trace": self._extract_synthesis_failure_trace(test_result),
-        }
-
-    async def _build_blocked_synthesis_result(
-        self,
-        *,
-        run_id: Optional[int],
-        attempts_used: int,
-        max_retries: int,
-        failed_candidate: Optional[Dict[str, Any]],
-        last_test_result: Dict[str, Any],
-    ) -> Dict[str, Any]:
-        trace_excerpt = self._extract_synthesis_failure_trace(last_test_result)
-        blocked_reason = (
-            f"Synthesis run blocked after {attempts_used}/{max_retries} attempts; no passing candidate produced."
-        )
-        blocked_message = (
-            "System 2 synthesis run was blocked after bounded repair attempts. "
-            "The main orchestrator remains active.\n\n"
-            f"Attempts: {attempts_used}/{max_retries}\n"
-            f"Last status: {str(last_test_result.get('status') or 'failed')}\n"
-            f"Details: {str(last_test_result.get('error') or blocked_reason)}\n\n"
-            f"Trace excerpt:\n{trace_excerpt}"
-        )
-        await self._update_synthesis_run_status_if_supported(
-            run_id,
-            status="blocked",
-            total_attempts=attempts_used,
-            blocked_reason=blocked_reason,
-            synthesis_payload=failed_candidate,
-        )
-        return {
-            "status": "blocked",
-            "run_id": run_id,
-            "attempts_used": attempts_used,
-            "max_retries": max_retries,
-            "synthesis": failed_candidate,
-            "self_test_result": last_test_result,
-            "blocked_reason": blocked_reason,
-            "blocked_message": blocked_message,
-        }
-
-    async def _execute_synthesis_repair_loop(
-        self,
-        *,
-        user_id: str,
-        gap_description: str,
-        suggested_tool_name: str,
-        user_input: str,
-    ) -> Dict[str, Any]:
-        """Run synthesis + bounded repair retries until tests pass or run is blocked."""
-        max_retries = max(1, int(_MAX_SYNTHESIS_RETRIES))
-        run_id = await self._create_synthesis_run_if_supported(
-            user_id=user_id,
-            gap_description=gap_description,
-            suggested_tool_name=suggested_tool_name,
-            original_input=user_input,
-            max_retries=max_retries,
-        )
-
-        redacted_gap_description = self._redact_text_for_cloud(gap_description)
-        redacted_user_query = self._redact_text_for_cloud(user_input)
-
-        failed_candidate: Optional[Dict[str, Any]] = None
-        last_test_result: Dict[str, Any] = {}
-        last_failure_summary = ""
-        last_failure_trace = ""
-        attempts_used = 0
-
-        for attempt_number in range(1, max_retries + 1):
-            attempts_used = attempt_number
-            attempt_result = await self._run_single_synthesis_attempt(
-                run_id=run_id,
-                attempt_number=attempt_number,
-                max_retries=max_retries,
-                suggested_tool_name=suggested_tool_name,
-                redacted_gap_description=redacted_gap_description,
-                redacted_user_query=redacted_user_query,
-                failed_candidate=failed_candidate,
-                last_failure_summary=last_failure_summary,
-                last_failure_trace=last_failure_trace,
-            )
-
-            status = str(attempt_result.get("status") or "failed")
-            if status == "passed":
-                return {
-                    "status": "passed",
-                    "run_id": run_id,
-                    "attempts_used": attempt_number,
-                    "max_retries": max_retries,
-                    "proof_sha256": str(attempt_result.get("proof_sha256") or ""),
-                    "test_summary": str(attempt_result.get("test_summary") or ""),
-                    "synthesis": dict(attempt_result.get("candidate") or {}),
-                    "self_test_result": dict(attempt_result.get("test_result") or {}),
-                }
-
-            failed_candidate = dict(attempt_result.get("candidate") or failed_candidate or {})
-            last_test_result = dict(attempt_result.get("test_result") or {})
-            last_failure_summary = str(attempt_result.get("failure_summary") or "")
-            last_failure_trace = str(attempt_result.get("failure_trace") or "")
-            if status == "generation_failed":
-                break
-
-        return await self._build_blocked_synthesis_result(
-            run_id=run_id,
-            attempts_used=attempts_used,
-            max_retries=max_retries,
-            failed_candidate=failed_candidate,
-            last_test_result=last_test_result,
-        )
-
-    async def _count_prior_failed_synthesis_runs(self, suggested_tool_name: str) -> tuple[int, int]:
-        exact_counter = getattr(self.ledger_memory, "count_synthesis_runs_by_tool_status", None)
-        fuzzy_counter = getattr(self.ledger_memory, "count_synthesis_failures_fuzzy", None)
-
-        exact_count = 0
-        if callable(exact_counter):
-            try:
-                exact_count = int(
-                    await exact_counter(
-                        suggested_tool_name=str(suggested_tool_name or ""),
-                        statuses=["blocked", "rejected"],
-                    )
-                )
-            except Exception as exc:
-                logger.warning("Could not query exact prior synthesis failures for %s: %s", suggested_tool_name, exc)
-
-        fuzzy_count = 0
-        if callable(fuzzy_counter):
-            try:
-                fuzzy_count = int(
-                    await fuzzy_counter(
-                        str(suggested_tool_name or ""),
-                        threshold=0.75,
-                        window_hours=24,
-                    )
-                )
-            except Exception as exc:
-                logger.warning("Could not query fuzzy prior synthesis failures for %s: %s", suggested_tool_name, exc)
-
-        return max(0, exact_count), max(0, fuzzy_count)
-
-    async def _count_recent_synthesis_runs_for_user(self, user_id: str, *, window_hours: int = 1) -> int:
-        counter = getattr(self.ledger_memory, "count_synthesis_runs_for_user_window", None)
-        if not callable(counter):
-            return 0
-        try:
-            return int(
-                await counter(
-                    user_id=str(user_id or ""),
-                    window_hours=max(1, int(window_hours or 1)),
-                )
-            )
-        except Exception as exc:
-            logger.warning("Could not query per-user synthesis budget usage for %s: %s", user_id, exc)
-            return 0
-
-    async def tool_synthesis_node(
-        self,
-        state: Dict[str, Any],
-        router_result: RouterResult,
-    ) -> Any:
-        """
-        Cognitive handoff: router flagged a gap → System 2 synthesises a tool
-        → Admin approves via HITL → tool registered → original query retried.
-
-        Returns a HITL prompt string, or an outbound payload dict when the code
-        must be attached as a document. The orchestrator stores the synthesis
-        payload in pending_tool_approval until the Admin replies.
-        """
-        user_id = state["user_id"]
-        gap_description = router_result.gap_description
-        suggested_tool_name = router_result.suggested_tool_name
-        logger.info(f"Tool synthesis triggered: gap='{gap_description}'")
-
-        if not self.cognitive_router.get_system_2_available():
-            return (
-                "System 1 identified a capability gap but System 2 is offline — "
-                "cannot synthesise a new tool right now. Please configure GROQ_API_KEY."
-            )
-
-        hourly_budget = self._get_max_syntheses_per_user_per_hour()
-        recent_runs = await self._count_recent_synthesis_runs_for_user(user_id, window_hours=1)
-        if recent_runs >= hourly_budget:
-            return (
-                "HITL REQUIRED: Per-user synthesis budget exhausted "
-                f"({hourly_budget} per hour). Manual intervention needed."
-            )
-
-        exact_failed_runs, fuzzy_failed_runs = await self._count_prior_failed_synthesis_runs(suggested_tool_name)
-        prior_failed_runs = max(exact_failed_runs, fuzzy_failed_runs)
-        if prior_failed_runs >= 2:
-            return (
-                "HITL REQUIRED: This capability has been attempted "
-                f"{prior_failed_runs} times without success. Manual intervention needed."
-            )
-
-        loop_result = await self._execute_synthesis_repair_loop(
-            user_id=user_id,
-            gap_description=gap_description,
-            suggested_tool_name=suggested_tool_name,
-            user_input=str(state.get("user_input") or ""),
-        )
-        if loop_result.get("status") != "passed":
-            return str(loop_result.get("blocked_message") or "Tool synthesis run blocked.")
-
-        synthesis = dict(loop_result["synthesis"])
-        proof_sha256 = str(loop_result.get("proof_sha256") or "")
-        attempts_used = int(loop_result.get("attempts_used") or 1)
-        max_retries = int(loop_result.get("max_retries") or 1)
-        test_summary = str(loop_result.get("test_summary") or "")
-        synthesis_run_id = loop_result.get("run_id")
-
-        synthesis["synthesis_run_id"] = synthesis_run_id
-        synthesis["synthesis_attempts_used"] = attempts_used
-        synthesis["synthesis_max_retries"] = max_retries
-        synthesis["synthesis_proof_sha256"] = proof_sha256
-        synthesis["self_test_summary"] = test_summary
-
-        await self._update_synthesis_run_status_if_supported(
-            synthesis_run_id,
-            status="pending_approval",
-            total_attempts=attempts_used,
-            successful_attempt=attempts_used,
-            final_tool_name=str(synthesis.get("tool_name") or ""),
-            code_sha256=proof_sha256,
-            test_summary=test_summary,
-            synthesis_payload=synthesis,
-        )
-
-        # Store payload for approval resumption (in-memory + persisted to DB)
-        self.pending_tool_approval[user_id] = {
-            "synthesis": synthesis,
-            "original_state": state,
-            "synthesis_run_id": synthesis_run_id,
-            "_created_at": time.time(),
-        }
-        await self.ledger_memory.save_pending_approval(
-            user_id, synthesis, state["user_input"]
-        )
-
-        # Build Admin-facing HITL prompt with the proposed code
-        hitl_msg = (
-            f"🔧 TOOL SYNTHESIS REQUEST\n\n"
-            f"System 1 could not answer: \"{state['user_input']}\"\n"
-            f"Gap identified: {gap_description}\n\n"
-            f"System 2 has drafted the following tool:\n"
-            f"─────────────────────────────\n"
-            f"Name: {synthesis['tool_name']}\n"
-            f"Description: {synthesis['description']}\n\n"
-            f"Sandboxed self-test: {test_summary}\n"
-            f"Cryptographic proof (SHA-256 tool+tests): {proof_sha256}\n"
-            f"Audit run id: {synthesis_run_id if synthesis_run_id is not None else 'n/a'}\n\n"
-            f"Code:\n```python\n{synthesis['code']}\n```\n"
-            f"─────────────────────────────\n"
-            f"Reply YES to approve and deploy, or NO to reject."
-        )
-        if len(hitl_msg) > 3500:
-            attachment_path = self._write_synthesis_code_attachment(synthesis)
-            attachment_name = os.path.basename(attachment_path)
-            metadata_msg = (
-                "TOOL SYNTHESIS REQUEST\n\n"
-                f"System 1 could not answer: \"{state['user_input']}\"\n"
-                f"Gap identified: {gap_description}\n\n"
-                f"Name: {synthesis['tool_name']}\n"
-                f"Description: {synthesis['description']}\n\n"
-                f"Sandboxed self-test: {test_summary}\n"
-                f"Cryptographic proof (SHA-256 tool+tests): {proof_sha256}\n"
-                f"Audit run id: {synthesis_run_id if synthesis_run_id is not None else 'n/a'}\n"
-                f"Repair attempt: {attempts_used}/{max_retries}\n\n"
-                f"Code attached as Telegram document: {attachment_name}\n"
-                "Reply YES to approve and deploy, or NO to reject."
-            )
-            return {
-                "text": metadata_msg[:3500],
-                "document_path": attachment_path,
-                "document_filename": attachment_name,
-                "delete_after_send": True,
-            }
-        return hitl_msg
-
-    @staticmethod
-    def _write_synthesis_code_attachment(synthesis: Dict[str, Any]) -> str:
-        tool_name = re.sub(r"[^A-Za-z0-9_.-]+", "_", str(synthesis.get("tool_name") or "tool"))
-        with tempfile.NamedTemporaryFile(
-            "w",
-            encoding="utf-8",
-            suffix=f"_{tool_name}.py",
-            prefix="aiden_synth_",
-            delete=False,
-        ) as temp_file:
-            temp_file.write(str(synthesis.get("code") or ""))
-            temp_file.write("\n")
-            return temp_file.name
-
     def _extract_router_content(self, result: RouterResult) -> Optional[str]:
         """
         Return the string content from an "ok" RouterResult, or None if it is
@@ -5219,6 +4160,9 @@ class Orchestrator:
     async def supervisor_node(self, state: Dict[str, Any]) -> Dict[str, Any]:
         """Plans execution. Tries System 1 (local) first per Directive 1.3; escalates to System 2 only on failure."""
         state = normalize_state(state)
+        _sv_emitter = get_current_emitter()
+        if _sv_emitter is not None:
+            await _sv_emitter.emit(ProgressEvent.supervisor_planning())
 
         if not state.get("_energy_gate_cleared"):
             deferred = await self._try_ad_hoc_dispatch_energy_gate(
@@ -5234,7 +4178,14 @@ class Orchestrator:
         state = self._deduct_energy(state, ENERGY_COST_SUPERVISOR, "supervisor")
         user_input = state["user_input"]
         core_mem_str = await self.core_memory.get_context_string()
-        archival_context = await self._get_archival_context(user_input)
+        _sup_session = state.get("active_session")
+        _sup_session_id = int(_sup_session.get("id") or 0) if _sup_session else 0
+        _sup_epic_id = int(_sup_session.get("epic_id") or 0) if _sup_session else 0
+        archival_context = await self._get_archival_context(
+            user_input,
+            session_id=_sup_session_id or None,
+            epic_id=_sup_epic_id or None,
+        )
         capabilities_str = self._get_capabilities_string()
         archival_block = f"{archival_context}\n\n" if archival_context else ""
         recent_rejections = await self._get_recent_moral_rejections_for_supervisor(
@@ -5258,10 +4209,26 @@ class Orchestrator:
             len(system_prompt.encode("utf-8")),
         )
 
+        # Inject any in-turn blueprint from prior System 2 escalations
+        _blueprint = (state.get("worker_outputs") or {}).get("_s2_blueprint", "")
+        _blueprint_section = (
+            f"\n<s2_in_turn_blueprint>\n{_blueprint}\n</s2_in_turn_blueprint>"
+            if _blueprint else ""
+        )
+
+        # Fetch epic rollup for session context block (non-blocking, best-effort)
+        _sup_epic_rollup: Optional[Dict[str, Any]] = None
+        if _sup_session and _sup_session.get("epic_id"):
+            _sup_epic_rollup = await self._get_session_epic_rollup(
+                _sup_session.get("epic_id")
+            )
+
         turn_context = build_supervisor_turn_context(
             sensory_context=self._get_sensory_context(),
             archival_block=archival_block,
-        )
+            active_session=_sup_session if _sup_session else None,
+            epic_rollup=_sup_epic_rollup,
+        ) + _blueprint_section
         user_prompt_message = self._build_user_prompt_message(state)
         if turn_context:
             user_prompt_message = dict(user_prompt_message)
@@ -5307,6 +4274,19 @@ class Orchestrator:
                 return state
 
             state = self._parse_supervisor_response(response, state)
+            _sv_emitter2 = get_current_emitter()
+            if _sv_emitter2 is not None:
+                _plan_names = [
+                    step["agent"]
+                    for step in state.get("current_plan", [])
+                    if isinstance(step, dict) and step.get("agent")
+                ]
+                if _plan_names:
+                    await _sv_emitter2.emit(
+                        ProgressEvent.supervisor_done(_plan_names)
+                    )
+                elif state.get("final_response"):
+                    await _sv_emitter2.emit(ProgressEvent.supervisor_direct())
 
         except asyncio.TimeoutError:
             logger.error("Supervisor node timeout (60s)")
@@ -5456,22 +4436,22 @@ class Orchestrator:
         tier_2 = self._extract_charter_tier_block("Tier_2_Strategic")
         tier_3 = self._extract_charter_tier_block("Tier_3_Operational")
 
-        redacted_user_input = self._redact_text_for_cloud(
+        redacted_user_input = cloud_redaction.redact_text_for_cloud(
             str(state.get("user_input") or ""),
             allow_sensitive_context=False,
             max_chars=1600,
         )
-        redacted_plan = self._redact_text_for_cloud(
+        redacted_plan = cloud_redaction.redact_text_for_cloud(
             self._summarize_plan_for_moral_audit(state),
             allow_sensitive_context=False,
             max_chars=1200,
         )
-        redacted_output = self._redact_text_for_cloud(
+        redacted_output = cloud_redaction.redact_text_for_cloud(
             str(output_to_eval or ""),
             allow_sensitive_context=False,
             max_chars=2200,
         )
-        redacted_critic_instructions = self._redact_text_for_cloud(
+        redacted_critic_instructions = cloud_redaction.redact_text_for_cloud(
             str(state.get("critic_instructions") or ""),
             allow_sensitive_context=False,
             max_chars=600,
@@ -5536,12 +4516,12 @@ class Orchestrator:
                 audit_trace=str(state.get("moral_audit_trace") or decision.get("reasoning") or ""),
                 critic_feedback=str(state.get("critic_feedback") or ""),
                 moral_decision=decision,
-                request_redacted=self._redact_text_for_cloud(
+                request_redacted=cloud_redaction.redact_text_for_cloud(
                     str(state.get("user_input") or ""),
                     allow_sensitive_context=False,
                     max_chars=1600,
                 ),
-                output_redacted=self._redact_text_for_cloud(
+                output_redacted=cloud_redaction.redact_text_for_cloud(
                     str(output_to_eval or ""),
                     allow_sensitive_context=False,
                     max_chars=2200,
@@ -5812,6 +4792,10 @@ class Orchestrator:
             await self._persist_moral_audit_log(state, output_to_eval)
             return state
 
+        _critic_emitter = get_current_emitter()
+        if _critic_emitter is not None and output_to_eval:
+            await _critic_emitter.emit(ProgressEvent.critic_start())
+
         if not self._should_run_critic_review(state, output_to_eval):
             self._store_moral_decision_trace(
                 state,
@@ -5909,7 +4893,7 @@ class Orchestrator:
             scored_candidates = await self.nocturnal_consolidation.score_candidates_with_system2(
                 filtered_candidates,
                 route_to_system_2=self._score_nocturnal_candidates,
-                redactor=self._redact_text_for_cloud,
+                redactor=cloud_redaction.redact_text_for_cloud,
                 threshold=float(os.getenv("NOCTURNAL_Q_THRESHOLD", "3.0")),
             )
             write_result = await self.nocturnal_consolidation.write_back_scored_candidates(
@@ -5969,203 +4953,6 @@ class Orchestrator:
             blocked_state,
         )
 
-    async def _pop_pending_tool_approval_payload(self, user_id: str) -> Optional[Dict[str, Any]]:
-        if user_id not in self.pending_tool_approval:
-            return None
-        payload = self.pending_tool_approval[user_id]
-        age = time.time() - payload.get("_created_at", 0)
-        if age > _PENDING_STATE_TTL_SECONDS:
-            self.pending_tool_approval.pop(user_id, None)
-            await self.ledger_memory.clear_pending_approval(user_id)
-            logger.info("Expired stale pending_tool_approval for %s (age %.0fs).", user_id, age)
-            return None
-        self.pending_tool_approval.pop(user_id, None)
-        await self.ledger_memory.clear_pending_approval(user_id)
-        return payload
-
-    async def _reject_synthesized_tool(
-        self,
-        *,
-        user_id: str,
-        synthesis_run_id: Optional[int],
-        attempts_used: int,
-        synthesis: Dict[str, Any],
-    ) -> str:
-        logger.info("Admin rejected tool synthesis for user %s", user_id)
-        await self._update_synthesis_run_status_if_supported(
-            synthesis_run_id,
-            status="rejected",
-            total_attempts=attempts_used if attempts_used > 0 else None,
-            final_tool_name=str(synthesis.get("tool_name") or ""),
-            code_sha256=str(synthesis.get("synthesis_proof_sha256") or ""),
-            test_summary=str(synthesis.get("self_test_summary") or ""),
-            blocked_reason="Rejected by admin during HITL approval.",
-            synthesis_payload=synthesis,
-        )
-        return f"Tool proposal rejected. The capability gap remains: {synthesis['description']}"
-
-    async def _verify_synthesis_payload_digest(
-        self,
-        *,
-        synthesis: Dict[str, Any],
-        synthesis_run_id: Optional[int],
-        attempts_used: int,
-        tool_name: str,
-    ) -> Optional[str]:
-        expected_digest = str(synthesis.get("synthesis_proof_sha256") or "").strip()
-        if not expected_digest:
-            return None
-
-        actual_digest = self._compute_synthesis_proof_sha256(
-            str(synthesis.get("code") or ""),
-            str(synthesis.get("pytest_code") or ""),
-        )
-        if actual_digest == expected_digest:
-            return None
-
-        mismatch_reason = (
-            "Tool approval blocked: synthesis proof digest mismatch between sandbox-passed "
-            "artifact and pending deployment payload."
-        )
-        await self._update_synthesis_run_status_if_supported(
-            synthesis_run_id,
-            status="blocked",
-            total_attempts=attempts_used if attempts_used > 0 else None,
-            final_tool_name=str(tool_name),
-            code_sha256=actual_digest,
-            test_summary=str(synthesis.get("self_test_summary") or ""),
-            blocked_reason=mismatch_reason,
-            synthesis_payload=synthesis,
-        )
-        logger.error(mismatch_reason)
-        return mismatch_reason
-
-    async def _deploy_approved_synthesized_tool(
-        self,
-        *,
-        user_id: str,
-        tool_name: str,
-        synthesis: Dict[str, Any],
-        synthesis_run_id: Optional[int],
-        attempts_used: int,
-        original_state: Dict[str, Any],
-    ) -> _ApprovalOutcome:
-        await self.cognitive_router.register_dynamic_tool(tool_name, synthesis["code"], synthesis["schema_json"])
-        self._invalidate_capabilities_cache()
-        await self.ledger_memory.register_tool(
-            name=tool_name,
-            description=synthesis["description"],
-            code=synthesis["code"],
-            schema_json=synthesis["schema_json"],
-        )
-        await self.ledger_memory.approve_tool(tool_name)
-        await self._update_synthesis_run_status_if_supported(
-            synthesis_run_id,
-            status="approved",
-            total_attempts=attempts_used if attempts_used > 0 else None,
-            successful_attempt=attempts_used if attempts_used > 0 else None,
-            final_tool_name=str(tool_name),
-            code_sha256=str(synthesis.get("synthesis_proof_sha256") or ""),
-            test_summary=str(synthesis.get("self_test_summary") or ""),
-            synthesis_payload=synthesis,
-        )
-        core = await self.core_memory.get_all()
-        caps = core.get("known_capabilities", "")
-        await self.core_memory.update("known_capabilities", f"{caps}, {tool_name}".lstrip(", "))
-        logger.info("Tool '%s' approved, registered, and logged to core memory", tool_name)
-
-        retry_payload = self._coerce_user_prompt_payload(
-            original_state.get("user_prompt", original_state.get("user_input", ""))
-        )
-        retry_message = str(retry_payload.get("text") or "").strip()
-        if not retry_message and bool(self._extract_audio_bytes(retry_payload)):
-            retry_message = _format_voice_placeholder(
-                self._extract_audio_bytes(retry_payload),
-                str(retry_payload.get("audio_mime_type") or "audio/ogg"),
-            )
-            retry_payload["text"] = retry_message
-        elif not retry_message:
-            retry_message = str(original_state.get("user_input") or "").strip()
-            retry_payload["text"] = retry_message
-
-        return _ApprovalOutcome(
-            reply_text=f"✅ Tool '{tool_name}' deployed.",
-            follow_up_input=retry_payload,
-        )
-
-    async def _handle_synthesized_tool_deploy_failure(
-        self,
-        *,
-        tool_name: str,
-        synthesis: Dict[str, Any],
-        synthesis_run_id: Optional[int],
-        attempts_used: int,
-        error: Exception,
-    ) -> str:
-        await self._update_synthesis_run_status_if_supported(
-            synthesis_run_id,
-            status="blocked",
-            total_attempts=attempts_used if attempts_used > 0 else None,
-            final_tool_name=str(tool_name),
-            code_sha256=str(synthesis.get("synthesis_proof_sha256") or ""),
-            test_summary=str(synthesis.get("self_test_summary") or ""),
-            blocked_reason=f"Deployment failed after approval: {error}",
-            synthesis_payload=synthesis,
-        )
-        logger.error("Tool registration failed: %s", error, exc_info=True)
-        return f"Error deploying tool '{tool_name}': {error}"
-
-    async def _try_resume_tool_approval(self, user_id: str, user_message: str) -> Optional[_ApprovalOutcome]:
-        """Handle YES/NO tool synthesis approval. Returns approval outcome, or None if not pending."""
-        payload = await self._pop_pending_tool_approval_payload(user_id)
-        if payload is None:
-            return None
-
-        synthesis = payload["synthesis"]
-        original_state = payload["original_state"]
-        synthesis_run_id = payload.get("synthesis_run_id") or synthesis.get("synthesis_run_id")
-        attempts_used = int(synthesis.get("synthesis_attempts_used") or 0)
-        tool_name = str(synthesis.get("tool_name") or "")
-
-        if not user_message.strip().upper().startswith("YES"):
-            return _ApprovalOutcome(
-                reply_text=await self._reject_synthesized_tool(
-                    user_id=user_id,
-                    synthesis_run_id=synthesis_run_id,
-                    attempts_used=attempts_used,
-                    synthesis=synthesis,
-                )
-            )
-
-        mismatch = await self._verify_synthesis_payload_digest(
-            synthesis=synthesis,
-            synthesis_run_id=synthesis_run_id,
-            attempts_used=attempts_used,
-            tool_name=tool_name,
-        )
-        if mismatch:
-            return _ApprovalOutcome(reply_text=mismatch)
-
-        try:
-            return await self._deploy_approved_synthesized_tool(
-                user_id=user_id,
-                tool_name=tool_name,
-                synthesis=synthesis,
-                synthesis_run_id=synthesis_run_id,
-                attempts_used=attempts_used,
-                original_state=original_state,
-            )
-        except Exception as e:
-            return _ApprovalOutcome(
-                reply_text=await self._handle_synthesized_tool_deploy_failure(
-                    tool_name=tool_name,
-                    synthesis=synthesis,
-                    synthesis_run_id=synthesis_run_id,
-                    attempts_used=attempts_used,
-                    error=e,
-                )
-            )
-
     async def _load_state(
         self,
         user_id: str,
@@ -6209,16 +4996,40 @@ class Orchestrator:
                 state["energy_remaining"] = min(state.get("energy_remaining", 0) + 50, 75)
                 self._apply_hitl_resume_limits(state, user_id)
                 return normalize_state(state)
-        state = self._new_state(user_id, user_message, user_prompt=user_prompt)
+        state = AgentState.new(user_id=user_id, user_input=user_message, user_prompt=user_prompt).to_dict()
+        state["energy_remaining"] = await self._get_predictive_energy_budget_remaining()
         state["user_prompt"] = dict(user_prompt or {})
         if user_id != "heartbeat":
             try:
-                state["chat_history"] = await self.ledger_memory.get_chat_history(
-                    user_id,
-                    limit=_RECENT_CHAT_HISTORY_LIMIT,
+                active_session = await self._get_active_session()
+                get_session_history = getattr(
+                    self.ledger_memory,
+                    "get_session_chat_history",
+                    None,
                 )
+                if (
+                    active_session
+                    and active_session.get("id")
+                    and callable(get_session_history)
+                    and inspect.iscoroutinefunction(get_session_history)
+                ):
+                    state["chat_history"] = (
+                        await get_session_history(
+                            user_id=user_id,
+                            session_id=int(active_session["id"]),
+                            limit=max(_RECENT_CHAT_HISTORY_LIMIT, 20),
+                        )
+                    )
+                    state["active_session"] = active_session
+                else:
+                    state["chat_history"] = await self.ledger_memory.get_chat_history(
+                        user_id,
+                        limit=_RECENT_CHAT_HISTORY_LIMIT,
+                    )
+                    state["active_session"] = None
             except Exception as e:
                 logger.warning(f"Failed to load chat history for {user_id}: {e}")
+                state["active_session"] = None
         return normalize_state(state)
 
     @staticmethod
@@ -6309,12 +5120,40 @@ class Orchestrator:
         user_message: str,
         final_resp: str,
         turn_failed: bool = False,
+        session_id: Optional[int] = None,
     ) -> None:
         if user_id == "heartbeat" or turn_failed:
             return
         try:
-            await self.ledger_memory.save_chat_turn(user_id, "user", user_message)
-            await self.ledger_memory.save_chat_turn(user_id, "assistant", final_resp)
+            save_with_session = getattr(
+                self.ledger_memory,
+                "save_chat_turn_with_session",
+                None,
+            )
+            if callable(save_with_session) and inspect.iscoroutinefunction(save_with_session):
+                await save_with_session(
+                    user_id,
+                    "user",
+                    user_message,
+                    session_id=session_id,
+                )
+                await save_with_session(
+                    user_id,
+                    "assistant",
+                    final_resp,
+                    session_id=session_id,
+                )
+            else:
+                await self.ledger_memory.save_chat_turn(user_id, "user", user_message)
+                await self.ledger_memory.save_chat_turn(user_id, "assistant", final_resp)
+            if session_id:
+                increment_turn_count = getattr(
+                    self.ledger_memory,
+                    "increment_session_turn_count",
+                    None,
+                )
+                if callable(increment_turn_count) and inspect.iscoroutinefunction(increment_turn_count):
+                    self._fire_and_forget(increment_turn_count(session_id))
         except Exception as e:
             logger.warning(f"Failed to save chat turn for {user_id}: {e}")
 
@@ -6337,10 +5176,42 @@ class Orchestrator:
             self._persist_consolidation_turn_count_async(user_id, 0)
             self._fire_and_forget(self._consolidate_memory(user_id))
 
-    def _schedule_response_memory_save(self, user_message: str, final_resp: str) -> None:
+    def _schedule_response_memory_save(
+        self,
+        user_message: str,
+        final_resp: str,
+        session_id: Optional[int] = None,
+        epic_id: Optional[int] = None,
+    ) -> None:
         self._fire_and_forget(
-            self._save_memory_async(f"User: {user_message}\nAssistant: {final_resp}")
+            self._save_memory_async(
+                f"User: {user_message}\nAssistant: {final_resp}",
+                session_id=session_id,
+                epic_id=epic_id,
+            )
         )
+
+    async def _call_finalize_user_response(
+        self,
+        user_id: str,
+        user_message: str,
+        response: str,
+        *,
+        state: Optional[Dict[str, Any]] = None,
+    ) -> str:
+        """Call _finalize_user_response with backward-compatible positional args only.
+
+        Some tests monkeypatch _finalize_user_response with the legacy 3-arg
+        callable signature. Session context is provided via an internal state
+        hint so the default implementation can still resolve session metadata.
+        """
+        previous_hint = getattr(self, "_finalize_state_hint", None)
+        if isinstance(state, dict):
+            self._finalize_state_hint = state
+        try:
+            return await self._finalize_user_response(user_id, user_message, response)
+        finally:
+            self._finalize_state_hint = previous_hint
 
     async def _finalize_user_response(
         self,
@@ -6348,18 +5219,51 @@ class Orchestrator:
         user_message: str,
         response: str,
         state: Optional[Dict[str, Any]] = None,
+        session_id: Optional[int] = None,
+        epic_id: Optional[int] = None,
     ) -> str:
         final_resp = self.cognitive_router.sanitize_response(response)
-        turn_failed = bool((state or {}).get("_turn_failed", False))
-        if state is None:
+        resolved_state: Optional[Dict[str, Any]] = state if isinstance(state, dict) else None
+        if resolved_state is None:
+            hinted_state = getattr(self, "_finalize_state_hint", None)
+            if isinstance(hinted_state, dict):
+                resolved_state = hinted_state
+
+        turn_failed = bool((resolved_state or {}).get("_turn_failed", False))
+        if resolved_state is None:
             turn_failed = bool(getattr(self, "_finalizing_turn_failed", False))
+
+        resolved_session_id = session_id
+        resolved_epic_id = epic_id
+        if isinstance(resolved_state, dict):
+            active_session = resolved_state.get("active_session")
+            if isinstance(active_session, dict):
+                if resolved_session_id is None:
+                    raw_session_id = active_session.get("id")
+                    try:
+                        resolved_session_id = int(raw_session_id) if raw_session_id else None
+                    except (TypeError, ValueError):
+                        resolved_session_id = None
+                if resolved_epic_id is None:
+                    raw_epic_id = active_session.get("epic_id")
+                    try:
+                        resolved_epic_id = int(raw_epic_id) if raw_epic_id else None
+                    except (TypeError, ValueError):
+                        resolved_epic_id = None
+
         await self._persist_chat_turns(
             user_id,
             user_message,
             final_resp,
             turn_failed=turn_failed,
+            session_id=resolved_session_id,
         )
-        self._schedule_response_memory_save(user_message, final_resp)
+        self._schedule_response_memory_save(
+            user_message,
+            final_resp,
+            session_id=resolved_session_id,
+            epic_id=resolved_epic_id,
+        )
         return final_resp
 
     async def _run_graph_loop(self, state: Dict[str, Any], user_id: str, user_message: str) -> str:
@@ -6393,7 +5297,12 @@ class Orchestrator:
         self._ensure_final_response(state, max_iterations)
         self._finalizing_turn_failed = bool(state.get("_turn_failed", False))
         try:
-            return await self._finalize_user_response(user_id, user_message, state["final_response"])
+            return await self._call_finalize_user_response(
+                user_id,
+                user_message,
+                state["final_response"],
+                state=state,
+            )
         finally:
             self._finalizing_turn_failed = False
 
@@ -6427,11 +5336,21 @@ class Orchestrator:
         if not has_audio_prompt:
             reply = await self._try_goal_planning_response(state)
             if reply is not None:
-                return await self._finalize_user_response(effective_user_id, user_message, reply)
+                return await self._call_finalize_user_response(
+                    effective_user_id,
+                    user_message,
+                    reply,
+                    state=state,
+                )
 
             reply = await self._try_fast_path_response(state)
             if reply is not None:
-                return await self._finalize_user_response(effective_user_id, user_message, reply)
+                return await self._call_finalize_user_response(
+                    effective_user_id,
+                    user_message,
+                    reply,
+                    state=state,
+                )
 
         try:
             response = await self._run_graph_loop(state, effective_user_id, user_message)
@@ -6440,6 +5359,9 @@ class Orchestrator:
                     await self._finalize_resumed_heartbeat_task(heartbeat_task_id, response)
             return response
         except RequiresHITLError as hitl_err:
+            _hitl_emitter = get_current_emitter()
+            if _hitl_emitter is not None:
+                await _hitl_emitter.emit_immediate(ProgressEvent.hitl_raised())
             state["_hitl_question"] = str(hitl_err)
             state["_hitl_created_at"] = time.time()
             pending_user_id = self._pending_owner_for_heartbeat_origin(user_id, state)
@@ -6455,12 +5377,18 @@ class Orchestrator:
             state["_turn_failed"] = True
             return "An internal error occurred."
 
-    async def process_message(self, user_message: Any, user_id: str) -> str:
+    async def process_message(
+        self,
+        user_message: Any,
+        user_id: str,
+        *,
+        progress_callback: Optional[ProgressCallback] = None,
+    ) -> str:
         """Main entry point: State Graph execution with Energy Budget."""
         user_prompt = self._coerce_user_prompt_payload(user_message)
         normalized_user_message = str(user_prompt.get("text") or "").strip()
         has_audio_prompt = bool(self._extract_audio_bytes(user_prompt))
-        approval_outcome: Optional[_ApprovalOutcome] = None
+        approval_outcome: Optional[Any] = None
 
         if not normalized_user_message and has_audio_prompt:
             normalized_user_message = _format_voice_placeholder(
@@ -6472,74 +5400,70 @@ class Orchestrator:
         if not normalized_user_message and not has_audio_prompt:
             return "Error: Invalid message"
 
-        if not hasattr(self, "_ready"):
-            self._ready = asyncio.Event()
-            self._ready.set()
+        _emitter_token: Optional[object] = None
+        _emitter: Optional[ProgressEmitter] = None
+        if progress_callback is not None and str(user_id or "").strip() != "heartbeat":
+            _emitter = ProgressEmitter(progress_callback)
+            _emitter_token = set_current_emitter(_emitter)
 
-        if not self._ready.is_set():
-            try:
-                await asyncio.wait_for(self._ready.wait(), timeout=30.0)
-            except asyncio.TimeoutError:
-                return "System is still initializing. Please try again in a moment."
+        try:
+            if not hasattr(self, "_ready"):
+                self._ready = asyncio.Event()
+                self._ready.set()
 
-        # Serialise concurrent messages for the same user_id to prevent
-        # race conditions on pending_mfa / pending_hitl_state / pending_tool_approval
-        # dicts (ISSUE-012).  Different users are still processed concurrently.
-        lock = await self._get_user_lock(user_id)
-        async with lock:
-            if not hasattr(self, "_predictive_energy_budget_lock"):
-                self._predictive_energy_budget_lock = asyncio.Lock()
-            if not hasattr(self, "_predictive_energy_budget_remaining"):
-                self._predictive_energy_budget_remaining = max(
-                    0,
-                    int(os.getenv("INITIAL_ENERGY_BUDGET", "100")),
+            if not self._ready.is_set():
+                try:
+                    await asyncio.wait_for(self._ready.wait(), timeout=30.0)
+                except asyncio.TimeoutError:
+                    return "System is still initializing. Please try again in a moment."
+
+            # Serialise concurrent messages for the same user_id to prevent
+            # race conditions on pending_mfa / pending_hitl_state / pending_tool_approval
+            # dicts (ISSUE-012).  Different users are still processed concurrently.
+            lock = await self._get_user_lock(user_id)
+            async with lock:
+                if str(user_id or "").strip() != "heartbeat":
+                    async with self._energy_budget_lock:
+                        replenishment = int(os.getenv("ENERGY_REPLENISH_PER_TURN", "5"))
+                        cap = int(os.getenv("INITIAL_ENERGY_BUDGET", "100"))
+                        self._energy_budget = min(self._energy_budget + replenishment, cap)
+
+                reply = await self._try_resume_mfa(user_id, normalized_user_message)
+                if reply is not None:
+                    return reply
+
+                reply = await self.synthesis_pipeline.try_resume_tool_approval(
+                    user_id, normalized_user_message
                 )
-            if not hasattr(self, "_predictive_energy_budget_last_replenished_at"):
-                self._predictive_energy_budget_last_replenished_at = time.time()
-
-            replenished = 0
-            if str(user_id or "").strip() != "heartbeat":
-                async with self._predictive_energy_budget_lock:
-                    replenishment_points = (
-                        self._compute_predictive_energy_replenishment_points_wallclock_locked()
+                if reply is not None:
+                    approval_outcome = reply
+                else:
+                    return await self._run_user_turn_locked(
+                        user_id=user_id,
+                        user_message=normalized_user_message,
+                        user_prompt=user_prompt,
                     )
-                replenished = await self._tick_predictive_energy_budget(
-                    replenishment_points,
-                    reason="user_turn_wallclock",
-                )
-                if replenished > 0:
-                    logger.info(
-                        "Predictive energy budget replenished by wall clock: +%s. Remaining=%s",
-                        replenished,
-                        await self._get_predictive_energy_budget_remaining(),
-                    )
 
-            reply = await self._try_resume_mfa(user_id, normalized_user_message)
-            if reply is not None:
-                return reply
+            if approval_outcome is None:
+                return "An internal error occurred."
 
-            reply = await self._try_resume_tool_approval(user_id, normalized_user_message)
-            if reply is not None:
-                approval_outcome = reply
-            else:
-                return await self._run_user_turn_locked(
-                    user_id=user_id,
-                    user_message=normalized_user_message,
-                    user_prompt=user_prompt,
-                )
+            follow_up_input = approval_outcome.follow_up_input
+            if follow_up_input is None:
+                return approval_outcome.reply_text
 
-        if approval_outcome is None:
-            return "An internal error occurred."
-
-        follow_up_input = approval_outcome.follow_up_input
-        if follow_up_input is None:
-            return approval_outcome.reply_text
-
-        follow_up_response = await self.process_message(follow_up_input, user_id)
-        reply_text = str(approval_outcome.reply_text or "").strip()
-        if not reply_text:
-            return follow_up_response
-        return f"{reply_text}\n\n{follow_up_response}"
+            follow_up_response = await self.process_message(
+                follow_up_input,
+                user_id,
+            )
+            reply_text = str(approval_outcome.reply_text or "").strip()
+            if not reply_text:
+                return follow_up_response
+            return f"{reply_text}\n\n{follow_up_response}"
+        finally:
+            if _emitter is not None:
+                await _emitter.flush_pending()
+            if _emitter_token is not None:
+                reset_emitter(_emitter_token)
 
     async def _handle_blocked_result(
         self,
@@ -6567,6 +5491,9 @@ class Orchestrator:
             self._fire_and_forget(
                 self.ledger_memory.save_mfa_state(pending_owner_id, result.mfa_tool_name, result.mfa_arguments)
             )
+            _mfa_emitter = get_current_emitter()
+            if _mfa_emitter is not None:
+                await _mfa_emitter.emit_immediate(ProgressEvent.mfa_required())
             return "SECURITY LOCK: Provide the authorization passphrase to continue."
 
         if result.status == "hitl_required":
@@ -6620,7 +5547,12 @@ class Orchestrator:
 
             # Run synthesis in the background via _fire_and_forget which holds
             # a strong GC-safe reference (ISSUE-002).
-            self._fire_and_forget(self._async_tool_synthesis(user_id, result, state))
+            self._fire_and_forget(
+                self.synthesis_pipeline.async_tool_synthesis(user_id, result, state)
+            )
+            _gap_emitter = get_current_emitter()
+            if _gap_emitter is not None:
+                await _gap_emitter.emit_immediate(ProgressEvent.capability_gap())
             return (
                 f"I identified a capability gap: {result.gap_description}. "
                 f"Requesting tool synthesis from System 2..."
@@ -6628,6 +5560,24 @@ class Orchestrator:
 
         # Fallback
         return f"An unexpected router status was received: {result.status}"
+
+    @staticmethod
+    def _inject_in_turn_s2_blueprint(
+        state: Dict[str, Any],
+        escalation_problem: str,
+        blueprint_text: str,
+    ) -> None:
+        worker_outputs = state.get("worker_outputs")
+        if not isinstance(worker_outputs, dict):
+            return
+
+        existing = worker_outputs.get("_s2_blueprint", "")
+        separator = "\n\n---\n\n" if existing else ""
+        worker_outputs["_s2_blueprint"] = (
+            f"{existing}{separator}"
+            f"System 2 Blueprint ({escalation_problem[:80]}):\n"
+            f"{blueprint_text}"
+        )
 
     async def _handle_cognitive_escalation(
         self,
@@ -6639,12 +5589,11 @@ class Orchestrator:
         Extracts the solution and blueprint, saves blueprint to memory async,
         and returns the solution string.
         """
-        _ = state
-        escalation_problem = self._redact_text_for_cloud(
+        escalation_problem = cloud_redaction.redact_text_for_cloud(
             router_result.escalation_problem,
             allow_sensitive_context=False,
         )
-        escalation_context = self._redact_text_for_cloud(
+        escalation_context = cloud_redaction.redact_text_for_cloud(
             router_result.escalation_context,
             allow_sensitive_context=False,
         )
@@ -6676,6 +5625,14 @@ class Orchestrator:
         blueprint_text = blueprint_match.group(1).strip() if blueprint_match else None
 
         if blueprint_text:
+            # Inject into current turn so downstream nodes can use it.
+            # Use a reserved key so it never collides with real agent names.
+            self._inject_in_turn_s2_blueprint(
+                state,
+                router_result.escalation_problem,
+                blueprint_text,
+            )
+
             logger.info("System 2 blueprint extracted. Triggering non-blocking save to Archival Memory.")
             doc_text = f"System 2 Reasoning Blueprint for: {router_result.escalation_problem}\nBlueprint: {blueprint_text}"
             meta = {"type": "system_2_learned_pattern"}
@@ -6695,42 +5652,6 @@ class Orchestrator:
             self._fire_and_forget(_save_blueprint_with_retry())
 
         return solution_text
-
-    async def _async_tool_synthesis(
-        self,
-        user_id: str,
-        result: RouterResult,
-        state: Dict[str, Any],
-    ) -> None:
-        """Background task: run tool synthesis and send the HITL prompt to admin."""
-        try:
-            async def _run_synthesis() -> None:
-                hitl_prompt = await self.tool_synthesis_node(state, result)
-                await self._notify_admin(hitl_prompt)
-
-            await asyncio.wait_for(
-                _run_synthesis(),
-                timeout=float(_SYNTHESIS_LOCKOUT_TTL_SECONDS),
-            )
-        except asyncio.TimeoutError:
-            logger.critical(
-                "Background tool synthesis timed out for user %s after %ss.",
-                user_id,
-                _SYNTHESIS_LOCKOUT_TTL_SECONDS,
-            )
-            try:
-                await self._notify_admin(
-                    "CRITICAL: Tool synthesis timed out and was aborted. "
-                    f"User: {user_id}. Timeout: {_SYNTHESIS_LOCKOUT_TTL_SECONDS}s."
-                )
-            except Exception as notify_error:
-                logger.error("Failed to notify admin about synthesis timeout: %s", notify_error)
-        except Exception as e:
-            logger.error(f"Background tool synthesis failed: {e}", exc_info=True)
-        finally:
-            in_progress = getattr(self, "_synthesis_in_progress", None)
-            if isinstance(in_progress, dict):
-                in_progress.pop(user_id, None)
 
     def close(self) -> None:
         try:

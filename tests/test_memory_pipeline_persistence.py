@@ -1,4 +1,5 @@
 import asyncio
+import types
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -24,6 +25,8 @@ def _build_explicit_memory_orchestrator(*, profile_updated: bool = False) -> Orc
     orchestrator.pending_mfa = {}
     orchestrator.pending_hitl_state = {}
     orchestrator.pending_tool_approval = {}
+    orchestrator._energy_budget = 100
+    orchestrator._energy_budget_lock = asyncio.Lock()
     orchestrator._ready = asyncio.Event()
     orchestrator._ready.set()
     orchestrator._user_locks = {}
@@ -36,7 +39,9 @@ def _build_explicit_memory_orchestrator(*, profile_updated: bool = False) -> Orc
     orchestrator._save_memory_async = AsyncMock()
     orchestrator._fire_and_forget = _close_fire_and_forget
     orchestrator._try_resume_mfa = AsyncMock(return_value=None)
-    orchestrator._try_resume_tool_approval = AsyncMock(return_value=None)
+    orchestrator.synthesis_pipeline = types.SimpleNamespace(
+        try_resume_tool_approval=AsyncMock(return_value=None)
+    )
     orchestrator._remember_user_profile = AsyncMock(return_value=profile_updated)
     orchestrator._remember_assistant_identity = AsyncMock()
     orchestrator._try_goal_planning_response = AsyncMock(return_value="Memory noted.")

@@ -242,6 +242,28 @@ class LedgerMemory:
                 )
             """)
             await self._db.execute("""
+                CREATE TABLE IF NOT EXISTS conversation_sessions (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    name TEXT NOT NULL,
+                    description TEXT NOT NULL DEFAULT '',
+                    epic_id INTEGER,
+                    is_active INTEGER NOT NULL DEFAULT 0,
+                    turn_count INTEGER NOT NULL DEFAULT 0,
+                    memory_count INTEGER NOT NULL DEFAULT 0,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    FOREIGN KEY (epic_id) REFERENCES objective_backlog(id)
+                )
+            """)
+            await self._db.execute("""
+                CREATE INDEX IF NOT EXISTS idx_sessions_is_active
+                ON conversation_sessions(is_active)
+            """)
+            await self._db.execute("""
+                CREATE INDEX IF NOT EXISTS idx_sessions_epic_id
+                ON conversation_sessions(epic_id)
+            """)
+            await self._db.execute("""
                 CREATE TABLE IF NOT EXISTS moral_audit_log (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     user_id TEXT NOT NULL,
@@ -458,6 +480,15 @@ class LedgerMemory:
                 "synthesis_json",
                 _SQL_TEXT_DEFAULT_EMPTY,
             )
+            await self._ensure_table_column(
+                "chat_history",
+                "session_id",
+                "INTEGER",
+            )
+            await self._db.execute("""
+                CREATE INDEX IF NOT EXISTS idx_chat_user_session
+                ON chat_history(user_id, session_id, id DESC)
+            """)
             await self._db.execute("""
                 CREATE INDEX IF NOT EXISTS idx_synthesis_attempts_run_attempt
                 ON synthesis_attempts(run_id, attempt_number ASC)
@@ -2323,5 +2354,172 @@ class LedgerMemory:
         async with self._lock:
             await self._db.execute(
                 "DELETE FROM pending_mfa_states WHERE user_id=?", (user_id,)
+            )
+            await self._db.commit()
+
+    # -----------------------------------------------------------------
+    # Conversation Sessions
+    # -----------------------------------------------------------------
+
+    async def create_session(
+        self,
+        name: str,
+        description: str = "",
+        epic_id: Optional[int] = None,
+    ) -> int:
+        """Create a new session without activating it. Returns session id."""
+        clean_name = str(name or "").strip()
+        if not clean_name:
+            raise ValueError("Session name must be non-empty")
+        async with self._lock:
+            cursor = await self._db.execute(
+                "INSERT INTO conversation_sessions "
+                "(name, description, epic_id, is_active) VALUES (?, ?, ?, 0)",
+                (clean_name, str(description or "").strip(), epic_id),
+            )
+            await self._db.commit()
+            return int(cursor.lastrowid)
+
+    async def activate_session(self, session_id: int) -> Optional[Dict[str, Any]]:
+        """Set one session as active, deactivating all others.
+        Returns the activated session row or None if not found."""
+        async with self._lock:
+            cursor = await self._db.execute(
+                "SELECT id, name, description, epic_id, turn_count, memory_count, "
+                "created_at FROM conversation_sessions WHERE id = ?",
+                (session_id,),
+            )
+            row = await cursor.fetchone()
+            if row is None:
+                return None
+
+            await self._db.execute(
+                "UPDATE conversation_sessions SET is_active = 0, "
+                "updated_at = CURRENT_TIMESTAMP"
+            )
+            await self._db.execute(
+                "UPDATE conversation_sessions SET is_active = 1, "
+                "updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+                (session_id,),
+            )
+            await self._db.commit()
+        return dict(row)
+
+    async def deactivate_all_sessions(self) -> None:
+        """Clear the active session (no session mode)."""
+        async with self._lock:
+            await self._db.execute(
+                "UPDATE conversation_sessions SET is_active = 0, "
+                "updated_at = CURRENT_TIMESTAMP"
+            )
+            await self._db.commit()
+
+    async def get_active_session(self) -> Optional[Dict[str, Any]]:
+        """Return the currently active session row, or None."""
+        async with self._lock:
+            cursor = await self._db.execute(
+                "SELECT id, name, description, epic_id, turn_count, memory_count, "
+                "created_at, updated_at FROM conversation_sessions "
+                "WHERE is_active = 1 LIMIT 1"
+            )
+            row = await cursor.fetchone()
+        return dict(row) if row else None
+
+    async def get_session(self, session_id: int) -> Optional[Dict[str, Any]]:
+        """Return one session by id."""
+        async with self._lock:
+            cursor = await self._db.execute(
+                "SELECT id, name, description, epic_id, is_active, turn_count, "
+                "memory_count, created_at, updated_at "
+                "FROM conversation_sessions WHERE id = ?",
+                (session_id,),
+            )
+            row = await cursor.fetchone()
+        return dict(row) if row else None
+
+    async def list_sessions(self, limit: int = 20) -> List[Dict[str, Any]]:
+        """Return all sessions ordered by most recent activity."""
+        async with self._lock:
+            cursor = await self._db.execute(
+                "SELECT id, name, description, epic_id, is_active, turn_count, "
+                "memory_count, created_at, updated_at "
+                "FROM conversation_sessions "
+                "ORDER BY is_active DESC, updated_at DESC LIMIT ?",
+                (max(1, int(limit)),),
+            )
+            rows = await cursor.fetchall()
+        return [dict(r) for r in rows]
+
+    async def link_session_to_epic(
+        self,
+        session_id: int,
+        epic_id: Optional[int],
+    ) -> bool:
+        """Link or unlink a session to/from an Epic. Returns True if found."""
+        async with self._lock:
+            cursor = await self._db.execute(
+                "UPDATE conversation_sessions SET epic_id = ?, "
+                "updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+                (epic_id, session_id),
+            )
+            await self._db.commit()
+        return cursor.rowcount > 0
+
+    async def increment_session_turn_count(self, session_id: int) -> None:
+        """Increment turn_count for a session (called on each persisted turn)."""
+        async with self._lock:
+            await self._db.execute(
+                "UPDATE conversation_sessions "
+                "SET turn_count = turn_count + 1, updated_at = CURRENT_TIMESTAMP "
+                "WHERE id = ?",
+                (session_id,),
+            )
+            await self._db.commit()
+
+    async def increment_session_memory_count(self, session_id: int) -> None:
+        """Increment memory_count when a memory is tagged with this session."""
+        async with self._lock:
+            await self._db.execute(
+                "UPDATE conversation_sessions "
+                "SET memory_count = memory_count + 1, "
+                "updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+                (session_id,),
+            )
+            await self._db.commit()
+
+    async def get_session_chat_history(
+        self,
+        user_id: str,
+        session_id: int,
+        limit: int = 20,
+    ) -> List[Dict[str, str]]:
+        """Return chat history scoped to a session, in chronological order."""
+        async with self._lock:
+            cursor = await self._db.execute(
+                "SELECT role, content FROM ("
+                "  SELECT id, role, content FROM chat_history "
+                "  WHERE user_id = ? AND session_id = ? "
+                "  ORDER BY id DESC LIMIT ?"
+                ") ORDER BY id ASC",
+                (user_id, session_id, max(1, int(limit))),
+            )
+            rows = await cursor.fetchall()
+        return [{"role": r["role"], "content": r["content"]} for r in rows]
+
+    async def save_chat_turn_with_session(
+        self,
+        user_id: str,
+        role: str,
+        content: str,
+        session_id: Optional[int] = None,
+    ) -> None:
+        """Persist one turn, optionally tagged with a session_id."""
+        if role not in ("user", "assistant"):
+            raise ValueError("role must be 'user' or 'assistant'")
+        async with self._lock:
+            await self._db.execute(
+                "INSERT INTO chat_history (user_id, role, content, session_id) "
+                "VALUES (?, ?, ?, ?)",
+                (user_id, role, content, session_id),
             )
             await self._db.commit()

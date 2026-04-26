@@ -7,3 +7,11 @@ __pycache__/
 # Downloads folder — ignore dropped files, keep the folder itself
 /downloads/*
 !/downloads/.gitkeep
+
+# Eval artifacts (keep placeholder only)
+/tests/evals/results/*
+!/tests/evals/results/.gitkeep
+tests/evals/results/*.json
+!tests/evals/results/.gitkeep
+tests/evals/results/snapshots/*.json
+!tests/evals/results/snapshots/.gitkeep

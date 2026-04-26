@@ -148,3 +148,95 @@ def test_age_extraction_requires_first_person_subject():
     assert Orchestrator._extract_user_profile_updates("I am 37 years old") == {"age": 37}
     assert Orchestrator._extract_user_profile_updates("I'm 38 years old") == {"age": 38}
     assert "age" not in Orchestrator._extract_user_profile_updates("I ran a 5 years old marathon.")
+
+
+# ---------------------------------------------------------------------------
+# Issue 8 — compact skill-list fast path
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("msg", [
+    "Can you tell me the list of skills you have?",
+    "list your skills",
+    "list your tools",
+    "show me your tools",
+    "what tools do you have?",
+    "what skills do you have available?",
+    "what are your capabilities?",
+    "all your tools",
+    "display your capabilities",
+    "enumerate your skills",
+    "give me a list of your tools",
+])
+def test_is_skill_list_request_detects_inventory_queries(msg):
+    assert Orchestrator._is_skill_list_request(msg) is True, f"Expected True for: {msg!r}"
+
+
+@pytest.mark.parametrize("msg", [
+    "can you search the web for me?",
+    "search for a list of tools for woodworking",
+    "find me a list of Python tools for data science",
+    "What is the weather like today?",
+    "do you have access to the internet?",
+    "hello, how are you?",
+    "list the files in my downloads folder",
+])
+def test_is_skill_list_request_rejects_non_inventory_queries(msg):
+    assert Orchestrator._is_skill_list_request(msg) is False, f"Expected False for: {msg!r}"
+
+
+def _build_skill_list_orchestrator(skill_names_and_descs):
+    orchestrator = Orchestrator.__new__(Orchestrator)
+    orchestrator.cognitive_router = MagicMock()
+    catalog = [{"name": n, "description": d} for n, d in skill_names_and_descs]
+    orchestrator.cognitive_router.registry.get_skill_catalog.return_value = catalog
+    return orchestrator
+
+
+def test_build_compact_skill_list_response_format():
+    orch = _build_skill_list_orchestrator([
+        ("web_search", "Performs an internet search to retrieve the most up-to-date information including news and data."),
+        ("get_stock_price", "Fetches current stock price and quote data for a given ticker."),
+        ("extract_pdf_text", "Reads and extracts plain text content from a PDF file."),
+    ])
+    response = orch._build_compact_skill_list_response()
+
+    assert "3 registered skills" in response
+    assert "• web_search" in response
+    assert "• get_stock_price" in response
+    assert "• extract_pdf_text" in response
+    # Each description is truncated to ≤ 73 chars (70 + "…")
+    for line in response.splitlines():
+        if line.startswith("•"):
+            parts = line.split(" — ", 1)
+            if len(parts) == 2:
+                assert len(parts[1]) <= 73, f"Description too long: {parts[1]!r}"
+
+
+def test_build_compact_skill_list_response_empty_registry():
+    orchestrator = Orchestrator.__new__(Orchestrator)
+    orchestrator.cognitive_router = MagicMock()
+    orchestrator.cognitive_router.registry.get_skill_catalog.return_value = []
+    orchestrator.cognitive_router.registry.get_schemas.return_value = []
+    assert "don't have any registered skills" in orchestrator._build_compact_skill_list_response()
+
+
+@pytest.mark.asyncio
+async def test_skill_list_fast_path_returns_without_llm():
+    orch = _build_skill_list_orchestrator([
+        ("web_search", "Searches the internet for current information."),
+        ("consolidate_memory", "Consolidates recent interactions into long-term memory."),
+    ])
+    orch._route_to_system_1 = AsyncMock()
+    orch.core_memory = MagicMock()
+    orch.core_memory.get_context_string = AsyncMock(return_value="")
+
+    result = await Orchestrator._try_meta_fast_path_response(
+        orch,
+        {"user_input": "Can you tell me the list of skills you have?", "chat_history": []},
+    )
+
+    assert result is not None
+    assert "• web_search" in result
+    assert "• consolidate_memory" in result
+    # Must not have called the LLM
+    orch._route_to_system_1.assert_not_awaited()

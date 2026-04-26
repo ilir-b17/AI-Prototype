@@ -27,6 +27,8 @@ from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 from telegram.error import Conflict, RetryAfter
 from src.core.orchestrator import Orchestrator
+from src.interfaces.streaming import DeferredStatusMessage, StatusFormatter
+from src.core.progress import ProgressEvent
 
 # Ensure stdout/stderr use UTF-8 on Windows so Unicode log characters don't crash
 if hasattr(sys.stdout, "reconfigure"):
@@ -85,6 +87,15 @@ _RETIRE_CONFIRM_ALIASES = {"confirm", "yes", "y"}
 TELEGRAM_BOT_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN')
 ADMIN_USER_ID = int(os.getenv('ADMIN_USER_ID', 0))
 AGENT_TIMEOUT_SECONDS = float(os.getenv('AGENT_TIMEOUT_SECONDS', 300.0))
+
+# Minimum delay before showing status message (seconds).
+# Responses arriving before this delay show no status message at all.
+# This prevents fast-path responses from flashing a status UI.
+_STREAMING_DELAY_SECONDS = float(os.getenv("STREAMING_DELAY_SECONDS", "2.5"))
+
+# Minimum token count before streaming is enabled.
+# Very short messages get fast-path routing so streaming is never needed.
+_STREAMING_MIN_TOKENS = int(os.getenv("STREAMING_MIN_TOKENS", "4"))
 
 
 def _env_bool(name: str, default: bool = False) -> bool:
@@ -471,32 +482,118 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             await update.message.reply_text(_SERVICE_UNAVAILABLE_MSG)
             return
 
-        # Keep sending 'typing' every 4 s so the indicator stays visible throughout
+        # Short messages that will be handled by fast-path routing
+        # do not need streaming — skip the DeferredStatusMessage overhead.
+        token_count = len(user_message.split())
+        use_streaming = token_count >= _STREAMING_MIN_TOKENS
+
+        if not use_streaming:
+            # Original non-streaming path for very short messages
+            stop_typing = asyncio.Event()
+            typing_task = asyncio.create_task(
+                _keep_typing_alive(context.bot, update.effective_chat.id, stop_typing)
+            )
+            try:
+                ai_response = await asyncio.wait_for(
+                    orchestrator.process_message(user_message, str(user_id)),
+                    timeout=AGENT_TIMEOUT_SECONDS,
+                )
+            except (TimeoutError, asyncio.TimeoutError):
+                logger.warning(
+                    "Timeout after %.0fs for user %s", AGENT_TIMEOUT_SECONDS, user_id
+                )
+                await update.message.reply_text(_TIMEOUT_MSG)
+                return
+            except Exception as e:
+                logger.error("Error processing message: %s", e, exc_info=True)
+                await update.message.reply_text(
+                    "An error occurred while processing your message. Please try again."
+                )
+                return
+            finally:
+                stop_typing.set()
+                await typing_task
+            await update.message.reply_text(ai_response)
+            logger.info(f"Response sent to user {user_id}")
+            return
+
+        # Streaming path — DeferredStatusMessage sends status only if slow
+        formatter = StatusFormatter()
+        dsm = DeferredStatusMessage(
+            update.message,
+            delay_seconds=_STREAMING_DELAY_SECONDS,
+        )
+        await dsm.start()
+
+        # Keep typing indicator running until status message appears.
+        # The DeferredStatusMessage replaces the typing indicator once sent.
         stop_typing = asyncio.Event()
         typing_task = asyncio.create_task(
             _keep_typing_alive(context.bot, update.effective_chat.id, stop_typing)
         )
 
+        async def on_progress(event: ProgressEvent) -> None:
+            # Stop typing indicator on first progress event — the status
+            # message is about to appear (or has already appeared).
+            if not stop_typing.is_set():
+                stop_typing.set()
+            formatter.apply(event)
+            await dsm.update(formatter.render())
+
         try:
-            # Process message (may call external APIs - handle timeouts)
             ai_response = await asyncio.wait_for(
-                orchestrator.process_message(user_message, str(user_id)),
-                timeout=AGENT_TIMEOUT_SECONDS
+                orchestrator.process_message(
+                    user_message,
+                    str(user_id),
+                    progress_callback=on_progress,
+                ),
+                timeout=AGENT_TIMEOUT_SECONDS,
             )
-        finally:
+        except (TimeoutError, asyncio.TimeoutError):
             stop_typing.set()
             await typing_task
+            logger.warning(
+                "Timeout after %.0fs for user %s", AGENT_TIMEOUT_SECONDS, user_id
+            )
+            delivered = await dsm.finalize(_TIMEOUT_MSG)
+            if not delivered:
+                await update.message.reply_text(_TIMEOUT_MSG)
+            return
+        except Exception as e:
+            stop_typing.set()
+            await typing_task
+            logger.error("Error processing message: %s", e, exc_info=True)
+            error_msg = (
+                "An error occurred while processing your message. Please try again."
+            )
+            delivered = await dsm.finalize(error_msg)
+            if not delivered:
+                await update.message.reply_text(error_msg)
+            return
+        finally:
+            # Ensure typing indicator is stopped in all paths
+            if not stop_typing.is_set():
+                stop_typing.set()
+            # Await typing task to prevent ResourceWarning
+            try:
+                await asyncio.wait_for(typing_task, timeout=1.0)
+            except (asyncio.TimeoutError, asyncio.CancelledError):
+                pass
 
-        await update.message.reply_text(ai_response)
-        logger.info(f"Response sent to user {user_id}")
-
-    except (TimeoutError, asyncio.TimeoutError) as e:
-        logger.warning(f"Timeout error after {AGENT_TIMEOUT_SECONDS}s: {e}")
-        await update.message.reply_text(_TIMEOUT_MSG)
+        # Deliver the final response
+        delivered = await dsm.finalize(ai_response)
+        if not delivered:
+            await update.message.reply_text(ai_response[:4096])
+        logger.info("Response delivered to user %s", user_id)
 
     except Exception as e:
-        logger.error(f"Error processing message: {e}", exc_info=True)
-        await update.message.reply_text("An error occurred while processing your message. Please try again.")
+        logger.error("Unhandled error in handle_message: %s", e, exc_info=True)
+        try:
+            await update.message.reply_text(
+                "An error occurred while processing your message. Please try again."
+            )
+        except Exception:
+            pass
 
 
 async def handle_voice_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -535,42 +632,81 @@ async def handle_voice_message(update: Update, context: ContextTypes.DEFAULT_TYP
             await update.message.reply_text(_SERVICE_UNAVAILABLE_MSG)
             return
 
+        telegram_file = await context.bot.get_file(voice.file_id)
+        buffer = BytesIO()
+        await telegram_file.download_to_memory(out=buffer)
+        audio_bytes = buffer.getvalue()
+        if not audio_bytes:
+            await update.message.reply_text("I could not read that voice note. Please try again.")
+            return
+
+        prompt_payload = {
+            "text": str(update.message.caption or "").strip(),
+            "audio_bytes": audio_bytes,
+            "audio_mime_type": "audio/ogg",
+            "audio_source": "telegram_voice",
+            "audio_file_id": voice.file_id,
+        }
+
+        formatter = StatusFormatter()
+        dsm = DeferredStatusMessage(
+            update.message,
+            delay_seconds=_STREAMING_DELAY_SECONDS,
+            initial_text="⏳ AIDEN — Processing voice note...",
+        )
+        await dsm.start()
+
         stop_typing = asyncio.Event()
         typing_task = asyncio.create_task(
             _keep_typing_alive(context.bot, update.effective_chat.id, stop_typing)
         )
 
+        async def on_voice_progress(event: ProgressEvent) -> None:
+            if not stop_typing.is_set():
+                stop_typing.set()
+            formatter.apply(event)
+            await dsm.update(formatter.render())
+
         try:
-            telegram_file = await context.bot.get_file(voice.file_id)
-            buffer = BytesIO()
-            await telegram_file.download_to_memory(out=buffer)
-            audio_bytes = buffer.getvalue()
-            if not audio_bytes:
-                await update.message.reply_text("I could not read that voice note. Please try again.")
-                return
-
-            prompt_payload = {
-                "text": str(update.message.caption or "").strip(),
-                "audio_bytes": audio_bytes,
-                "audio_mime_type": "audio/ogg",
-                "audio_source": "telegram_voice",
-                "audio_file_id": voice.file_id,
-            }
-
             ai_response = await asyncio.wait_for(
-                orchestrator.process_message(prompt_payload, str(user_id)),
+                orchestrator.process_message(
+                    prompt_payload,
+                    str(user_id),
+                    progress_callback=on_voice_progress,
+                ),
                 timeout=AGENT_TIMEOUT_SECONDS,
             )
-        finally:
+        except (TimeoutError, asyncio.TimeoutError) as e:
             stop_typing.set()
             await typing_task
+            logger.warning("Voice timeout after %.0fs: %s", AGENT_TIMEOUT_SECONDS, e)
+            delivered = await dsm.finalize(_TIMEOUT_MSG)
+            if not delivered:
+                await update.message.reply_text(_TIMEOUT_MSG)
+            return
+        except Exception as e:
+            stop_typing.set()
+            await typing_task
+            logger.error("Error processing voice message: %s", e, exc_info=True)
+            error_msg = (
+                "An error occurred while processing your voice note. Please try again."
+            )
+            delivered = await dsm.finalize(error_msg)
+            if not delivered:
+                await update.message.reply_text(error_msg)
+            return
+        finally:
+            if not stop_typing.is_set():
+                stop_typing.set()
+            try:
+                await asyncio.wait_for(typing_task, timeout=1.0)
+            except (asyncio.TimeoutError, asyncio.CancelledError):
+                pass
 
-        await update.message.reply_text(ai_response)
-        logger.info("Voice response sent to user %s", user_id)
-
-    except (TimeoutError, asyncio.TimeoutError) as e:
-        logger.warning(f"Voice timeout error after {AGENT_TIMEOUT_SECONDS}s: {e}")
-        await update.message.reply_text(_TIMEOUT_MSG)
+        delivered = await dsm.finalize(ai_response)
+        if not delivered:
+            await update.message.reply_text(ai_response[:4096])
+        logger.info("Voice response delivered to user %s", user_id)
 
     except Exception as e:
         logger.error(f"Error processing voice message: {e}", exc_info=True)
@@ -735,6 +871,311 @@ async def addgoal(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     except Exception as e:
         logger.error(f"/addgoal error: {e}", exc_info=True)
         await update.message.reply_text(f"Error adding goal: {e}")
+
+
+async def session_command(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    """/session [new|list|switch|link|end|status] — manage conversation sessions."""
+    if not is_authorized(update.effective_user.id):
+        await update.message.reply_text(_UNAUTHORIZED_MSG)
+        return
+
+    orchestrator_inst = context.bot_data.get("orchestrator") or orchestrator
+    ledger = context.bot_data.get("ledger")
+
+    if orchestrator_inst is None:
+        await update.message.reply_text(_ORCHESTRATOR_NOT_AVAILABLE_MSG)
+        return
+    if ledger is None:
+        await update.message.reply_text(_LEDGER_NOT_AVAILABLE_MSG)
+        return
+
+    args = getattr(context, "args", []) or []
+    subcommand = args[0].lower() if args else "status"
+
+    try:
+        if subcommand == "status":
+            await _session_status(update, orchestrator_inst)
+
+        elif subcommand == "new":
+            name_parts = args[1:]
+            if not name_parts:
+                await update.message.reply_text(
+                    "Usage: /session new <name> [| description]\n"
+                    "Example: /session new AIDEN Refactor | Architectural work"
+                )
+                return
+            raw = " ".join(name_parts)
+            parts = raw.split("|", 1)
+            name = parts[0].strip()
+            description = parts[1].strip() if len(parts) > 1 else ""
+            await _session_new(update, ledger, orchestrator_inst, name, description)
+
+        elif subcommand == "list":
+            await _session_list(update, ledger)
+
+        elif subcommand == "switch":
+            if len(args) < 2:
+                await update.message.reply_text("Usage: /session switch <id>")
+                return
+            try:
+                session_id = int(args[1])
+            except ValueError:
+                await update.message.reply_text("Session id must be an integer.")
+                return
+            await _session_switch(update, ledger, orchestrator_inst, session_id)
+
+        elif subcommand == "link":
+            if len(args) < 2:
+                await update.message.reply_text(
+                    "Usage: /session link <epic_id>\n"
+                    "Links the active session to an Epic in the backlog."
+                )
+                return
+            try:
+                epic_id = int(args[1])
+            except ValueError:
+                await update.message.reply_text("Epic id must be an integer.")
+                return
+            await _session_link(update, ledger, orchestrator_inst, epic_id)
+
+        elif subcommand == "end":
+            await _session_end(update, orchestrator_inst)
+
+        elif subcommand == "summary":
+            await _session_summary(update, ledger, orchestrator_inst)
+
+        else:
+            await update.message.reply_text(
+                "Unknown subcommand. Available: status, new, list, switch, link, end, summary"
+            )
+
+    except Exception as e:
+        logger.error("/session error: %s", e, exc_info=True)
+        await update.message.reply_text(f"Session command error: {e}")
+
+
+# --- Session subcommand implementations ---
+
+async def _session_status(
+    update: Update, orchestrator_inst
+) -> None:
+    active = await orchestrator_inst._get_active_session()
+    if not active:
+        await update.message.reply_text(
+            "No active session.\n"
+            "Use /session new <name> to create one, or "
+            "/session list to see existing sessions."
+        )
+        return
+    epic_id = active.get("epic_id")
+    epic_line = f"\nLinked Epic: #{epic_id}" if epic_id else "\nNo linked Epic"
+    await update.message.reply_text(
+        f"Active session\n"
+        f"  id: {active['id']}\n"
+        f"  name: {active['name']}\n"
+        f"  description: {active.get('description') or '—'}\n"
+        f"  turns: {active.get('turn_count', 0)}\n"
+        f"  memories: {active.get('memory_count', 0)}\n"
+        f"  started: {active.get('started_at') or active.get('created_at', '?')}"
+        f"{epic_line}"
+    )
+
+
+async def _session_new(
+    update: Update, ledger, orchestrator_inst, name: str, description: str
+) -> None:
+    session_id = await ledger.create_session(name, description)
+    row = await orchestrator_inst._activate_session(session_id)
+    if row is None:
+        await update.message.reply_text(f"Created session #{session_id} but could not activate it.")
+        return
+    await update.message.reply_text(
+        f"Session created and activated.\n"
+        f"  id: {session_id}\n"
+        f"  name: {name}\n"
+        f"  description: {description or '—'}\n\n"
+        f"Future messages will be scoped to this session.\n"
+        f"Use /session link <epic_id> to connect to a project Epic."
+    )
+    logger.info(
+        "Admin created and activated session #%s: %r",
+        session_id, name,
+    )
+
+
+async def _session_list(update: Update, ledger) -> None:
+    sessions = await ledger.list_sessions(limit=15)
+    if not sessions:
+        await update.message.reply_text("No sessions found. Use /session new <name> to create one.")
+        return
+    lines = ["Sessions:"]
+    for s in sessions:
+        active_marker = " [ACTIVE]" if s.get("is_active") else ""
+        epic_tag = f" Epic#{s['epic_id']}" if s.get("epic_id") else ""
+        lines.append(
+            f"  #{s['id']}{active_marker} {s['name']}{epic_tag} "
+            f"— {s.get('turn_count', 0)} turns"
+        )
+    await update.message.reply_text("\n".join(lines))
+
+
+async def _session_switch(
+    update: Update, ledger, orchestrator_inst, session_id: int
+) -> None:
+    _ = ledger
+    row = await orchestrator_inst._activate_session(session_id)
+    if row is None:
+        await update.message.reply_text(
+            f"Session #{session_id} not found. Use /session list to see available sessions."
+        )
+        return
+    epic_line = f"\nLinked Epic: #{row['epic_id']}" if row.get("epic_id") else ""
+    await update.message.reply_text(
+        f"Switched to session #{session_id}: {row['name']}"
+        f"{epic_line}\n\n"
+        f"Chat history and memories are now scoped to this session."
+    )
+
+
+async def _session_link(
+    update: Update, ledger, orchestrator_inst, epic_id: int
+) -> None:
+    active = await orchestrator_inst._get_active_session()
+    if not active:
+        await update.message.reply_text(
+            "No active session. Use /session switch <id> first."
+        )
+        return
+    session_id = int(active["id"])
+    # Verify the Epic exists in the backlog
+    tree = await ledger.get_active_objective_tree(epic_id)
+    epic_node = next(
+        (n for n in tree if n.get("tier") == "Epic" and int(n.get("id") or 0) == epic_id),
+        None,
+    )
+    if epic_node is None:
+        await update.message.reply_text(
+            f"Epic #{epic_id} not found in active backlog. "
+            f"Use /goals to see available Epics."
+        )
+        return
+    success = await ledger.link_session_to_epic(session_id, epic_id)
+    if not success:
+        await update.message.reply_text("Failed to link session.")
+        return
+    # Refresh core memory cache with the new epic_id
+    updated_row = await ledger.get_session(session_id)
+    if updated_row:
+        await orchestrator_inst._sync_active_session_to_core(updated_row)
+    await update.message.reply_text(
+        f"Session #{session_id} linked to Epic #{epic_id}: "
+        f"{epic_node.get('title', '')}\n\n"
+        f"Archival memory searches will now prioritise memories "
+        f"from this project."
+    )
+
+
+async def _session_end(update: Update, orchestrator_inst) -> None:
+    active = await orchestrator_inst._get_active_session()
+    if not active:
+        await update.message.reply_text("No active session to end.")
+        return
+    name = active.get("name", "Unknown")
+    await orchestrator_inst._deactivate_session()
+    await update.message.reply_text(
+        f"Session '{name}' deactivated.\n"
+        f"AIDEN is now in global context mode — "
+        f"all chat history is loaded chronologically."
+    )
+
+
+async def _session_summary(
+    update: Update, ledger, orchestrator_inst
+) -> None:
+    _ = ledger
+    active = await orchestrator_inst._get_active_session()
+    if not active:
+        await update.message.reply_text(
+            "No active session. Use /session switch <id> first."
+        )
+        return
+    session_id = int(active["id"])
+    # Build a summary by calling process_message with a meta-prompt
+    prompt = (
+        f"[SESSION SUMMARY REQUEST] "
+        f"Summarise the key decisions, findings, and open questions from "
+        f"this session so far. Session: {active['name']} (id={session_id}). "
+        f"Keep the summary under 400 words. Structure: "
+        f"1) What was accomplished 2) Key decisions made 3) Open items."
+    )
+    await update.message.reply_text("Generating session summary...")
+    try:
+        summary = await asyncio.wait_for(
+            orchestrator_inst.process_message(prompt, str(update.effective_user.id)),
+            timeout=float(os.getenv("AGENT_TIMEOUT_SECONDS", "300")),
+        )
+        await update.message.reply_text(summary[:4096])
+    except Exception as e:
+        await update.message.reply_text(f"Summary failed: {e}")
+
+
+async def eval_command(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> None:
+    """/eval [suite] - run eval suites and report results to admin."""
+    if not is_authorized(update.effective_user.id):
+        await update.message.reply_text(_UNAUTHORIZED_MSG)
+        return
+
+    args = getattr(context, "args", []) or []
+    suite_filter = args[0].lower() if args else None
+
+    await update.message.reply_text(
+        f"Running eval suites{' (' + suite_filter + ')' if suite_filter else ''}... "
+        f"This takes about 10 seconds."
+    )
+
+    try:
+        cmd = [sys.executable, "scripts/run_evals.py"]
+        if suite_filter:
+            cmd += ["--suite", suite_filter]
+
+        proc = await asyncio.wait_for(
+            asyncio.create_subprocess_exec(
+                *cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            ),
+            timeout=5.0,
+        )
+
+        stdout, stderr = await asyncio.wait_for(
+            proc.communicate(),
+            timeout=120.0,
+        )
+
+        output = stdout.decode(errors="replace").strip()
+        err_output = stderr.decode(errors="replace").strip()
+        if err_output:
+            if output:
+                output = f"{output}\n\n[stderr]\n{err_output}"
+            else:
+                output = err_output
+
+        if not output:
+            output = "(no output)"
+
+        status = "PASS" if proc.returncode == 0 else "FAIL"
+        message = f"{status}\n\n```\n{output[-3000:]}\n```"
+        await update.message.reply_text(message[:4096])
+
+    except asyncio.TimeoutError:
+        await update.message.reply_text("Eval runner timed out after 120s.")
+    except Exception as exc:
+        await update.message.reply_text(f"Eval failed: {exc}")
 
 
 async def shutdown(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -988,6 +1429,8 @@ def main() -> None:
         application.add_handler(CommandHandler("retire_unused_tools", retire_unused_tools))
         application.add_handler(CommandHandler("goals", goals))
         application.add_handler(CommandHandler("addgoal", addgoal))
+        application.add_handler(CommandHandler("session", session_command))
+        application.add_handler(CommandHandler("eval", eval_command))
         application.add_handler(CommandHandler("shutdown", shutdown))
         application.add_handler(CommandHandler("restart", restart))
         application.add_handler(MessageHandler(filters.VOICE, handle_voice_message))

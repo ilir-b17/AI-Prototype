@@ -266,7 +266,8 @@ class VectorMemory:
     def query_memory(
         self,
         query_text: str,
-        n_results: int = 3
+        n_results: int = 3,
+        where: Optional[Dict[str, Any]] = None,
     ) -> List[Dict[str, Any]]:
         """
         Query the vector database for semantically similar memories.
@@ -297,10 +298,14 @@ class VectorMemory:
             with self._collection_lock:
                 if self.collection is None:
                     raise RuntimeError(_CLOSED_COLLECTION_ERROR)
-                results = self.collection.query(
-                    query_texts=[query_text],
-                    n_results=n_results
-                )
+                query_kwargs: Dict[str, Any] = {
+                    "query_texts": [query_text],
+                    "n_results": n_results,
+                }
+                if where is not None:
+                    query_kwargs["where"] = where
+
+                results = self.collection.query(**query_kwargs)
 
             # Format results into a more readable structure
             formatted_results = []
@@ -452,8 +457,11 @@ class VectorMemory:
         self,
         query_text: str,
         n_results: int = 3,
+        where: Optional[Dict[str, Any]] = None,
     ) -> List[Dict[str, Any]]:
-        """Non-blocking wrapper for :meth:`query_memory`."""
+        """Non-blocking wrapper for query_memory."""
         import asyncio
-        return await asyncio.to_thread(self.query_memory, query_text, n_results)
+        return await asyncio.to_thread(
+            self.query_memory, query_text, n_results, where
+        )
 

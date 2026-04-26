@@ -1,14 +1,12 @@
 import asyncio
+import types
 
 import pytest
 from unittest.mock import AsyncMock, MagicMock
 
 from src.core.llm_router import CognitiveRouter, RouterResult
-from src.core.orchestrator import (
-    Orchestrator,
-    _BLOCKED_ENV_PREFIXES,
-    _build_safe_subprocess_env,
-)
+from src.core.orchestrator import Orchestrator
+from src.core.synthesis_pipeline import _BLOCKED_ENV_PREFIXES, _build_safe_subprocess_env
 from src.core.runtime_context import get_vector_memory, set_runtime_context
 
 
@@ -77,9 +75,7 @@ def test_fix3_safe_subprocess_env_excludes_blocked_prefixes(monkeypatch):
 @pytest.mark.asyncio
 async def test_fix5_replenish_requires_elapsed_wall_clock_time(monkeypatch):
     monkeypatch.setenv("INITIAL_ENERGY_BUDGET", "200")
-    monkeypatch.setenv("ENERGY_REPLENISH_PER_HOUR", "60")
-    monkeypatch.setenv("ENERGY_REPLENISH_PER_TURN", "999")  # deprecated no-op
-    monkeypatch.setattr("src.core.orchestrator.time.time", lambda: 1_000.0)
+    monkeypatch.setenv("ENERGY_REPLENISH_PER_TURN", "5")
 
     orchestrator = Orchestrator.__new__(Orchestrator)
     orchestrator._ready = asyncio.Event()
@@ -87,36 +83,24 @@ async def test_fix5_replenish_requires_elapsed_wall_clock_time(monkeypatch):
     orchestrator.pending_mfa = {}
     orchestrator.pending_hitl_state = {}
     orchestrator.pending_tool_approval = {}
-    orchestrator._user_locks = {}
-    orchestrator._user_locks_lock = asyncio.Lock()
-    orchestrator._predictive_energy_budget_lock = asyncio.Lock()
-    orchestrator._predictive_energy_budget_remaining = 40
-    orchestrator._predictive_energy_budget_last_replenished_at = 1_000.0
+    orchestrator._energy_budget_lock = asyncio.Lock()
+    orchestrator._energy_budget = 40
 
-    orchestrator._get_user_lock = AsyncMock(return_value=asyncio.Lock())
+    _user_lock = asyncio.Lock()
+    orchestrator._get_user_lock = AsyncMock(return_value=_user_lock)
     orchestrator._try_resume_mfa = AsyncMock(return_value=None)
-    orchestrator._try_resume_tool_approval = AsyncMock(return_value=None)
-    orchestrator._remember_user_profile = AsyncMock(return_value=False)
-    orchestrator._remember_assistant_identity = AsyncMock(return_value=False)
-    orchestrator._try_goal_planning_response = AsyncMock(return_value=None)
-    orchestrator._run_graph_loop = AsyncMock(return_value="graph")
-    orchestrator._finalize_user_response = AsyncMock(side_effect=lambda _uid, _msg, response: response)
+    orchestrator.synthesis_pipeline = types.SimpleNamespace(
+        try_resume_tool_approval=AsyncMock(return_value=None)
+    )
 
-    def fake_load_state(user_id: str, user_message: str, *, user_prompt=None):
-        return _minimal_state(user_id, user_message, user_prompt or {})
-
-    async def fake_fast_path(state):
-        async with orchestrator._predictive_energy_budget_lock:
-            orchestrator._predictive_energy_budget_remaining -= 3
-        state["_energy_gate_cleared"] = True
+    async def fake_run_user_turn_locked(*, user_id: str, user_message: str, user_prompt: dict):
+        async with orchestrator._energy_budget_lock:
+            orchestrator._energy_budget -= 3
         return "ok"
 
-    orchestrator._load_state = AsyncMock(side_effect=fake_load_state)
-    orchestrator._try_fast_path_response = AsyncMock(side_effect=fake_fast_path)
-    orchestrator.cognitive_router = MagicMock()
-    orchestrator.cognitive_router.sanitize_response = MagicMock(side_effect=lambda text: text)
+    orchestrator._run_user_turn_locked = AsyncMock(side_effect=fake_run_user_turn_locked)
 
-    initial_budget = orchestrator._predictive_energy_budget_remaining
+    initial_budget = orchestrator._energy_budget
 
     resp1 = await Orchestrator.process_message(orchestrator, "first turn", "user-1")
     resp2 = await Orchestrator.process_message(orchestrator, "second turn", "user-1")
@@ -124,14 +108,15 @@ async def test_fix5_replenish_requires_elapsed_wall_clock_time(monkeypatch):
     assert resp1 == "ok"
     assert resp2 == "ok"
 
-    projected_without_replenish = initial_budget - 6
-    assert orchestrator._predictive_energy_budget_remaining == projected_without_replenish
+    projected_with_turn_replenish = initial_budget + 2 * 5 - 2 * 3
+    assert orchestrator._energy_budget == projected_with_turn_replenish
 
 
 @pytest.mark.asyncio
 async def test_fix6_energy_gate_flag_set_after_fast_path_single_tool():
     orchestrator = Orchestrator.__new__(Orchestrator)
-    orchestrator._assess_request_route = MagicMock(
+    orchestrator.routing_assessor = MagicMock()
+    orchestrator.routing_assessor.assess_request_route = MagicMock(
         return_value={
             "mode": "single_tool",
             "tool_name": "web_search",
