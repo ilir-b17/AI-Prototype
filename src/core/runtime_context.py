@@ -15,6 +15,7 @@ from src.memory.ledger_db import LedgerMemory
 if TYPE_CHECKING:
     from src.memory.vector_db import VectorMemory
     from src.core.orchestrator import Orchestrator
+    from src.core.prompt_config import PromptConfig
     from src.core.memory_reranker import MemoryReranker
 
 
@@ -58,6 +59,13 @@ def get_vector_memory() -> Optional["VectorMemory"]:
 
 def get_orchestrator() -> Optional["Orchestrator"]:
     return _orchestrator
+
+
+def get_prompt_config() -> Optional["PromptConfig"]:
+    orchestrator = get_orchestrator()
+    if orchestrator is None:
+        return None
+    return getattr(orchestrator, "prompt_config", None)
 
 
 def get_reranker_fn() -> Optional[Callable[..., Awaitable[List[Any]]]]:

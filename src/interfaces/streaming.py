@@ -249,6 +249,27 @@ class DeferredStatusMessage:
             )
             return False
 
+    async def cancel(self) -> None:
+        """Cancel the deferred timer and delete the status bubble if shown.
+
+        After calling cancel(), the caller is responsible for sending the
+        final response via reply_text() so it appears as a proper new message.
+        """
+        self._cancelled = True
+        if self._send_task is not None and not self._send_task.done():
+            self._send_task.cancel()
+            try:
+                await self._send_task
+            except asyncio.CancelledError:
+                pass
+        if self._status_msg is not None:
+            try:
+                await self._status_msg.delete()
+            except Exception as exc:
+                logger.debug("Status message delete failed (non-fatal): %s", exc)
+            finally:
+                self._status_msg = None
+
     async def _deferred_send(self) -> None:
         """Wait delay_seconds then send the initial status message."""
         await asyncio.sleep(self._delay)

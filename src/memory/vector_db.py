@@ -8,8 +8,6 @@ contextual awareness in agent decision-making.
 
 import os
 import logging
-import re
-import threading
 import uuid
 from datetime import datetime, timedelta
 from datetime import timezone
@@ -21,11 +19,6 @@ logger = logging.getLogger(__name__)
 
 _HNSW_SPACE = "cosine"
 _COLLECTION_METADATA = {"hnsw:space": _HNSW_SPACE}
-_CLOSED_COLLECTION_ERROR = "VectorMemory has been closed"
-_CANONICAL_TIMESTAMP_FORMAT = "%Y-%m-%dT%H:%M:%S"
-_CANONICAL_TIMESTAMP_RE = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}$")
-_LEGACY_TIMESTAMP_FORMATS = ("%Y-%m-%d %H:%M:%S", "%Y/%m/%d %H:%M:%S", "%Y-%m-%d")
-_TIMESTAMP_MIGRATION_BATCH_SIZE = 500
 
 
 class VectorMemory:
@@ -49,7 +42,6 @@ class VectorMemory:
         """
         self.persist_dir = persist_dir
         self.collection = None
-        self._collection_lock = threading.Lock()
 
         # Ensure the persistence directory exists
         os.makedirs(self.persist_dir, exist_ok=True)
@@ -87,96 +79,10 @@ class VectorMemory:
                 )
                 logger.info("Created fresh collection after recovery")
 
-            self._normalize_legacy_timestamps()
             logger.info(f"VectorMemory initialized with persistence at {self.persist_dir}")
         except Exception as e:
             logger.error(f"Failed to initialize VectorMemory: {e}")
             raise
-
-    @staticmethod
-    def _format_canonical_timestamp(parsed: datetime) -> str:
-        if parsed.tzinfo is not None:
-            parsed = parsed.astimezone(timezone.utc).replace(tzinfo=None)
-        else:
-            parsed = parsed.replace(tzinfo=None)
-        return parsed.strftime(_CANONICAL_TIMESTAMP_FORMAT)
-
-    @staticmethod
-    def _parse_timestamp_text(raw: str) -> Optional[datetime]:
-        candidate = raw[:-1] + "+00:00" if raw.endswith("Z") else raw
-        try:
-            return datetime.fromisoformat(candidate)
-        except ValueError:
-            pass
-
-        for fmt in _LEGACY_TIMESTAMP_FORMATS:
-            try:
-                return datetime.strptime(raw, fmt)
-            except ValueError:
-                continue
-        return None
-
-    @classmethod
-    def _canonicalize_timestamp(cls, value: Any) -> Optional[str]:
-        if value is None:
-            return None
-        if isinstance(value, (int, float)):
-            try:
-                return cls._format_canonical_timestamp(datetime.fromtimestamp(float(value), tz=timezone.utc))
-            except (OSError, OverflowError, ValueError):
-                return None
-
-        raw = str(value).strip()
-        if _CANONICAL_TIMESTAMP_RE.fullmatch(raw):
-            return raw
-        if not raw:
-            return None
-
-        parsed = cls._parse_timestamp_text(raw)
-        return cls._format_canonical_timestamp(parsed) if parsed is not None else None
-
-    def _update_timestamp_batch(self, ids: List[str], metadatas: List[Dict[str, Any]]) -> None:
-        if ids:
-            self.collection.update(ids=ids, metadatas=metadatas)
-
-    def _normalize_legacy_timestamps(self) -> int:
-        migrated = 0
-        try:
-            with self._collection_lock:
-                if self.collection is None:
-                    raise RuntimeError(_CLOSED_COLLECTION_ERROR)
-                results = self.collection.get(include=["metadatas"])
-                ids = results.get("ids", []) or []
-                metadatas = results.get("metadatas", []) or []
-                pending_ids: List[str] = []
-                pending_metadatas: List[Dict[str, Any]] = []
-
-                for memory_id, metadata in zip(ids, metadatas):
-                    if not isinstance(metadata, dict) or "timestamp" not in metadata:
-                        continue
-                    normalized = self._canonicalize_timestamp(metadata.get("timestamp"))
-                    if not normalized or normalized == metadata.get("timestamp"):
-                        continue
-
-                    updated_metadata = dict(metadata)
-                    updated_metadata["timestamp"] = normalized
-                    pending_ids.append(memory_id)
-                    pending_metadatas.append(updated_metadata)
-                    migrated += 1
-
-                    if len(pending_ids) >= _TIMESTAMP_MIGRATION_BATCH_SIZE:
-                        self._update_timestamp_batch(pending_ids, pending_metadatas)
-                        pending_ids = []
-                        pending_metadatas = []
-
-                self._update_timestamp_batch(pending_ids, pending_metadatas)
-
-            if migrated:
-                logger.info("Normalized %d vector memory timestamps to canonical UTC format.", migrated)
-            return migrated
-        except Exception as e:
-            logger.warning("Vector timestamp normalization failed: %s", e)
-            return 0
 
     def add_memory(
         self,
@@ -210,10 +116,7 @@ class VectorMemory:
 
         # Near-duplicate guard: skip insert if a very similar entry already exists
         try:
-            with self._collection_lock:
-                if self.collection is None:
-                    raise RuntimeError(_CLOSED_COLLECTION_ERROR)
-                existing = self.collection.query(query_texts=[text], n_results=1)
+            existing = self.collection.query(query_texts=[text], n_results=1)
             if existing.get("distances") and existing["distances"][0]:
                 similarity = 1.0 - existing["distances"][0][0]  # cosine: distance = 1 − sim
                 if similarity >= dedup_threshold:
@@ -231,7 +134,7 @@ class VectorMemory:
             metadata = dict(metadata)
             # Use a consistent UTC-naive format so lexical comparison remains stable.
             # Existing records with legacy timestamp formats are not rewritten here.
-            metadata["timestamp"] = datetime.now(timezone.utc).strftime(_CANONICAL_TIMESTAMP_FORMAT)
+            metadata["timestamp"] = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S")
 
         # Generate ID if not provided
         if not memory_id:
@@ -242,14 +145,11 @@ class VectorMemory:
         for attempt in range(max_retries):
             try:
                 # Add memory to the collection with explicit ID
-                with self._collection_lock:
-                    if self.collection is None:
-                        raise RuntimeError(_CLOSED_COLLECTION_ERROR)
-                    self.collection.add(
-                        ids=[memory_id],
-                        documents=[text],
-                        metadatas=[metadata]
-                    )
+                self.collection.add(
+                    ids=[memory_id],
+                    documents=[text],
+                    metadatas=[metadata]
+                )
 
                 logger.info(f"Memory added with ID: {memory_id}")
                 return memory_id
@@ -266,8 +166,7 @@ class VectorMemory:
     def query_memory(
         self,
         query_text: str,
-        n_results: int = 3,
-        where: Optional[Dict[str, Any]] = None,
+        n_results: int = 3
     ) -> List[Dict[str, Any]]:
         """
         Query the vector database for semantically similar memories.
@@ -295,17 +194,10 @@ class VectorMemory:
 
         try:
             # Query the collection
-            with self._collection_lock:
-                if self.collection is None:
-                    raise RuntimeError(_CLOSED_COLLECTION_ERROR)
-                query_kwargs: Dict[str, Any] = {
-                    "query_texts": [query_text],
-                    "n_results": n_results,
-                }
-                if where is not None:
-                    query_kwargs["where"] = where
-
-                results = self.collection.query(**query_kwargs)
+            results = self.collection.query(
+                query_texts=[query_text],
+                n_results=n_results
+            )
 
             # Format results into a more readable structure
             formatted_results = []
@@ -335,10 +227,7 @@ class VectorMemory:
             Exception: If deletion fails.
         """
         try:
-            with self._collection_lock:
-                if self.collection is None:
-                    raise RuntimeError(_CLOSED_COLLECTION_ERROR)
-                self.collection.delete(ids=[memory_id])
+            self.collection.delete(ids=[memory_id])
             logger.info(f"Memory {memory_id} deleted")
         except Exception as e:
             logger.error(f"Failed to delete memory {memory_id}: {e}")
@@ -352,14 +241,9 @@ class VectorMemory:
             int: The total count of memories.
         """
         try:
-            with self._collection_lock:
-                if self.collection is None:
-                    raise RuntimeError(_CLOSED_COLLECTION_ERROR)
-                count = self.collection.count()
+            count = self.collection.count()
             logger.info(f"Total memories in database: {count}")
             return count
-        except RuntimeError:
-            raise
         except Exception as e:
             logger.error(f"Failed to retrieve memory count: {e}")
             return 0
@@ -374,15 +258,12 @@ class VectorMemory:
             Exception: If clearing fails.
         """
         try:
-            with self._collection_lock:
-                if self.collection is None:
-                    raise RuntimeError(_CLOSED_COLLECTION_ERROR)
-                # Delete the collection and recreate it
-                self.client.delete_collection(name="agent_memory")
-                self.collection = self.client.get_or_create_collection(
-                    name="agent_memory",
-                    metadata=_COLLECTION_METADATA
-                )
+            # Delete the collection and recreate it
+            self.client.delete_collection(name="agent_memory")
+            self.collection = self.client.get_or_create_collection(
+                name="agent_memory",
+                metadata=_COLLECTION_METADATA
+            )
             logger.warning("All memories cleared from the database")
         except Exception as e:
             logger.error(f"Failed to clear all memories: {e}")
@@ -398,11 +279,11 @@ class VectorMemory:
         nulling the client reference.
         """
         try:
-            # Drop the collection reference under a thread lock so any in-flight
-            # worker call completes before teardown begins.
-            with self._collection_lock:
-                if hasattr(self, 'collection') and self.collection is not None:
-                    self.collection = None
+            # Drop the collection reference before touching the client so that
+            # any concurrent asyncio.to_thread() calls see None and raise an
+            # AttributeError rather than accessing a half-torn-down client.
+            if hasattr(self, 'collection') and self.collection is not None:
+                self.collection = None
 
             if hasattr(self, 'client') and self.client is not None:
                 # Attempt to stop ChromaDB's internal background system
@@ -421,19 +302,16 @@ class VectorMemory:
         """Delete memories whose metadata timestamp is older than *days* days."""
         # Keep cutoff format aligned with newly-stamped UTC timestamps.
         # Existing DB rows with legacy/mixed timestamp formats are not retroactively fixed.
-        cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).strftime(_CANONICAL_TIMESTAMP_FORMAT)
+        cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).strftime("%Y-%m-%dT%H:%M:%S")
         try:
-            with self._collection_lock:
-                if self.collection is None:
-                    raise RuntimeError(_CLOSED_COLLECTION_ERROR)
-                results = self.collection.get(
-                    where={"timestamp": {"$lt": cutoff}},
-                    include=["metadatas"],
-                )
-                ids = results.get("ids", [])
-                if ids:
-                    self.collection.delete(ids=ids)
-                    logger.info("Pruned %d old vector memories (older than %d days).", len(ids), days)
+            results = self.collection.get(
+                where={"timestamp": {"$lt": cutoff}},
+                include=["metadatas"],
+            )
+            ids = results.get("ids", [])
+            if ids:
+                self.collection.delete(ids=ids)
+                logger.info("Pruned %d old vector memories (older than %d days).", len(ids), days)
             return len(ids)
         except Exception as e:
             logger.warning("Vector memory pruning failed: %s", e)
@@ -457,11 +335,8 @@ class VectorMemory:
         self,
         query_text: str,
         n_results: int = 3,
-        where: Optional[Dict[str, Any]] = None,
     ) -> List[Dict[str, Any]]:
-        """Non-blocking wrapper for query_memory."""
+        """Non-blocking wrapper for :meth:`query_memory`."""
         import asyncio
-        return await asyncio.to_thread(
-            self.query_memory, query_text, n_results, where
-        )
+        return await asyncio.to_thread(self.query_memory, query_text, n_results)
 

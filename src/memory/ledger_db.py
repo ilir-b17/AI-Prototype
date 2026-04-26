@@ -10,10 +10,8 @@ import os
 import asyncio
 import logging
 import json
-import re
 from datetime import datetime
-from difflib import SequenceMatcher
-from typing import List, Dict, Any, Optional, Tuple
+from typing import List, Dict, Any, Optional
 from enum import Enum
 
 import aiosqlite
@@ -98,17 +96,6 @@ class LedgerMemory:
                 )
             """)
             await self._db.execute("""
-                CREATE TABLE IF NOT EXISTS cloud_payload_audit (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    purpose TEXT NOT NULL,
-                    message_count_before INTEGER NOT NULL,
-                    message_count_after INTEGER NOT NULL,
-                    allow_sensitive_context INTEGER NOT NULL DEFAULT 0,
-                    payload_sha256 TEXT NOT NULL,
-                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-                )
-            """)
-            await self._db.execute("""
                 CREATE INDEX IF NOT EXISTS idx_task_status ON task_queue(status)
             """)
             await self._db.execute("""
@@ -116,10 +103,6 @@ class LedgerMemory:
             """)
             await self._db.execute("""
                 CREATE INDEX IF NOT EXISTS idx_log_timestamp ON system_logs(timestamp)
-            """)
-            await self._db.execute("""
-                CREATE INDEX IF NOT EXISTS idx_cloud_payload_audit_created_at
-                ON cloud_payload_audit(created_at DESC, id DESC)
             """)
             await self._db.execute("""
                 CREATE TABLE IF NOT EXISTS objective_backlog (
@@ -202,15 +185,6 @@ class LedgerMemory:
                     approved_at TIMESTAMP
                 )
             """)
-            await self._ensure_table_column(
-                "tool_registry",
-                "last_used_at",
-                "TIMESTAMP",
-            )
-            await self._db.execute("""
-                CREATE INDEX IF NOT EXISTS idx_tool_registry_status_last_used_approved
-                ON tool_registry(status, last_used_at, approved_at)
-            """)
             await self._db.execute("""
                 CREATE TABLE IF NOT EXISTS pending_tool_approvals (
                     user_id TEXT NOT NULL PRIMARY KEY,
@@ -242,50 +216,6 @@ class LedgerMemory:
                 )
             """)
             await self._db.execute("""
-                CREATE TABLE IF NOT EXISTS supervisor_decisions (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    user_id TEXT NOT NULL DEFAULT '',
-                    user_input TEXT NOT NULL DEFAULT '',
-                    plan_json TEXT NOT NULL DEFAULT '[]',
-                    is_direct INTEGER NOT NULL DEFAULT 0,
-                    reasoning TEXT NOT NULL DEFAULT '',
-                    energy_before INTEGER NOT NULL DEFAULT 0,
-                    worker_count INTEGER NOT NULL DEFAULT 0,
-                    session_id INTEGER,
-                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-                )
-            """)
-            await self._db.execute("""
-                CREATE INDEX IF NOT EXISTS idx_supervisor_decisions_user_created
-                ON supervisor_decisions(user_id, created_at DESC)
-            """)
-            await self._db.execute("""
-                CREATE INDEX IF NOT EXISTS idx_supervisor_decisions_created
-                ON supervisor_decisions(created_at DESC)
-            """)
-            await self._db.execute("""
-                CREATE TABLE IF NOT EXISTS conversation_sessions (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    name TEXT NOT NULL,
-                    description TEXT NOT NULL DEFAULT '',
-                    epic_id INTEGER,
-                    is_active INTEGER NOT NULL DEFAULT 0,
-                    turn_count INTEGER NOT NULL DEFAULT 0,
-                    memory_count INTEGER NOT NULL DEFAULT 0,
-                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    FOREIGN KEY (epic_id) REFERENCES objective_backlog(id)
-                )
-            """)
-            await self._db.execute("""
-                CREATE INDEX IF NOT EXISTS idx_sessions_is_active
-                ON conversation_sessions(is_active)
-            """)
-            await self._db.execute("""
-                CREATE INDEX IF NOT EXISTS idx_sessions_epic_id
-                ON conversation_sessions(epic_id)
-            """)
-            await self._db.execute("""
                 CREATE TABLE IF NOT EXISTS moral_audit_log (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     user_id TEXT NOT NULL,
@@ -305,11 +235,6 @@ class LedgerMemory:
             await self._db.execute("""
                 CREATE INDEX IF NOT EXISTS idx_moral_audit_created_at
                 ON moral_audit_log(created_at DESC)
-            """)
-            await self._db.execute("""
-                CREATE INDEX IF NOT EXISTS idx_moral_audit_user_rejections_created
-                ON moral_audit_log(user_id, created_at DESC)
-                WHERE json_extract(moral_decision_json, '$.is_approved') = 0
             """)
             await self._db.execute("""
                 CREATE TRIGGER IF NOT EXISTS trg_moral_audit_log_no_update
@@ -397,10 +322,6 @@ class LedgerMemory:
             await self._db.execute("""
                 CREATE INDEX IF NOT EXISTS idx_synthesis_runs_status_created
                 ON synthesis_runs(status, created_at DESC)
-            """)
-            await self._db.execute("""
-                CREATE INDEX IF NOT EXISTS idx_synthesis_runs_tool_status_created
-                ON synthesis_runs(suggested_tool_name, status, created_at DESC)
             """)
             await self._db.execute("""
                 CREATE TABLE IF NOT EXISTS synthesis_attempts (
@@ -502,15 +423,6 @@ class LedgerMemory:
                 "synthesis_json",
                 _SQL_TEXT_DEFAULT_EMPTY,
             )
-            await self._ensure_table_column(
-                "chat_history",
-                "session_id",
-                "INTEGER",
-            )
-            await self._db.execute("""
-                CREATE INDEX IF NOT EXISTS idx_chat_user_session
-                ON chat_history(user_id, session_id, id DESC)
-            """)
             await self._db.execute("""
                 CREATE INDEX IF NOT EXISTS idx_synthesis_attempts_run_attempt
                 ON synthesis_attempts(run_id, attempt_number ASC)
@@ -583,40 +495,6 @@ class LedgerMemory:
         # Fallback for legacy comma-separated values.
         parts = [part.strip() for part in raw_text.split(",") if part.strip()]
         return LedgerMemory._deserialize_depends_on_ids(parts)
-
-    @staticmethod
-    def _parse_json_dict(raw_value: Any) -> Dict[str, Any]:
-        if isinstance(raw_value, dict):
-            return raw_value
-        try:
-            decoded = json.loads(str(raw_value or "{}"))
-        except Exception:
-            return {}
-        if isinstance(decoded, dict):
-            return decoded
-        return {}
-
-    @staticmethod
-    def _normalize_string_list(raw_value: Any) -> List[str]:
-        if isinstance(raw_value, list):
-            values = raw_value
-        elif raw_value is None:
-            values = []
-        else:
-            values = [raw_value]
-        return [str(item).strip() for item in values if str(item).strip()]
-
-    @classmethod
-    def _normalize_moral_rejection_row(cls, row: aiosqlite.Row) -> Dict[str, Any]:
-        decision = cls._parse_json_dict(row["moral_decision_json"])
-        return {
-            "created_at": row["created_at"],
-            "reasoning": str(decision.get("reasoning") or ""),
-            "remediation_constraints": cls._normalize_string_list(
-                decision.get("remediation_constraints")
-            ),
-            "violated_tiers": cls._normalize_string_list(decision.get("violated_tiers")),
-        }
 
     @classmethod
     def _normalize_objective_row(cls, row: aiosqlite.Row) -> Dict[str, Any]:
@@ -929,50 +807,6 @@ class LedgerMemory:
         logger.info(f"Retrieved {len(logs)} log entries")
         return logs
 
-    async def append_cloud_payload_audit(
-        self,
-        *,
-        purpose: str,
-        message_count_before: int,
-        message_count_after: int,
-        allow_sensitive_context: bool,
-        payload_sha256: str,
-    ) -> int:
-        """Append one cloud payload audit row without storing payload contents."""
-        async with self._lock:
-            cursor = await self._db.execute(
-                "INSERT INTO cloud_payload_audit "
-                "(purpose, message_count_before, message_count_after, allow_sensitive_context, payload_sha256) "
-                "VALUES (?, ?, ?, ?, ?)",
-                (
-                    str(purpose or ""),
-                    int(message_count_before),
-                    int(message_count_after),
-                    1 if allow_sensitive_context else 0,
-                    str(payload_sha256 or ""),
-                ),
-            )
-            await self._db.commit()
-            return int(cursor.lastrowid)
-
-    async def get_cloud_payload_audit_entries(self, limit: int = 100) -> List[Dict[str, Any]]:
-        """Read cloud payload audit rows, most recent first."""
-        async with self._lock:
-            cursor = await self._db.execute(
-                "SELECT id, purpose, message_count_before, message_count_after, "
-                "allow_sensitive_context, payload_sha256, created_at "
-                "FROM cloud_payload_audit ORDER BY created_at DESC, id DESC LIMIT ?",
-                (int(limit),),
-            )
-            rows = await cursor.fetchall()
-
-        entries: List[Dict[str, Any]] = []
-        for row in rows:
-            item = dict(row)
-            item["allow_sensitive_context"] = bool(item.get("allow_sensitive_context"))
-            entries.append(item)
-        return entries
-
     async def append_moral_audit_log(
         self,
         *,
@@ -1039,28 +873,6 @@ class LedgerMemory:
                 item["moral_decision"] = {}
             logs.append(item)
         return logs
-
-    async def get_recent_moral_rejections(
-        self,
-        user_id: str,
-        limit: int = 3,
-    ) -> List[Dict[str, Any]]:
-        """Return recent non-approved moral decisions with remediation metadata."""
-        normalized_user_id = str(user_id or "").strip()
-        if not normalized_user_id:
-            return []
-
-        async with self._lock:
-            cursor = await self._db.execute(
-                "SELECT id, moral_decision_json, created_at "
-                "FROM moral_audit_log "
-                "WHERE user_id = ? "
-                "AND json_extract(moral_decision_json, '$.is_approved') = 0 "
-                "ORDER BY created_at DESC, id DESC LIMIT ?",
-                (normalized_user_id, max(1, int(limit))),
-            )
-            rows = await cursor.fetchall()
-        return [self._normalize_moral_rejection_row(row) for row in rows]
 
     # ─────────────────────────────────────────────────────────────
     # Objective Backlog  (3-tier: Epic > Story > Task)
@@ -1399,7 +1211,7 @@ class LedgerMemory:
         statuses: Optional[List[str]] = None,
     ) -> List[dict]:
         """Return Task rows that still have unresolved depends_on_ids."""
-        statuses = statuses or ["pending", "active", "deferred_due_to_energy"]
+        statuses = statuses or ["pending", "active"]
         if not statuses:
             return []
 
@@ -1667,23 +1479,11 @@ class LedgerMemory:
                 "VALUES (?, ?, ?, ?, 'pending_approval') "
                 "ON CONFLICT(name) DO UPDATE SET "
                 "description=excluded.description, code=excluded.code, "
-                "schema_json=excluded.schema_json, status='pending_approval', approved_at=NULL, last_used_at=NULL",
+                "schema_json=excluded.schema_json, status='pending_approval', approved_at=NULL",
                 (name, description, code, schema_json),
             )
             await self._db.commit()
             return cursor.lastrowid
-
-    async def touch_tool_last_used(self, name: str) -> None:
-        """Record tool usage by updating last_used_at."""
-        normalized_name = str(name or "").strip()
-        if not normalized_name:
-            return
-        async with self._lock:
-            await self._db.execute(
-                "UPDATE tool_registry SET last_used_at=CURRENT_TIMESTAMP WHERE name=?",
-                (normalized_name,),
-            )
-            await self._db.commit()
 
     async def approve_tool(self, name: str) -> None:
         """Mark a tool as approved and record the approval timestamp."""
@@ -1705,71 +1505,6 @@ class LedgerMemory:
             rows = await cursor.fetchall()
         return [dict(r) for r in rows]
 
-    async def get_unused_approved_tools(self, days: int = 30) -> List[Dict[str, Any]]:
-        """Return approved tools that have not been used within the day window."""
-        cutoff_days = max(0, int(days))
-        cutoff_sql = f"-{cutoff_days} days"
-        async with self._lock:
-            cursor = await self._db.execute(
-                "SELECT name, description, approved_at, last_used_at "
-                "FROM tool_registry "
-                "WHERE status='approved' AND ("
-                "(last_used_at IS NOT NULL AND datetime(last_used_at) <= datetime('now', ?)) OR "
-                "(last_used_at IS NULL AND approved_at IS NOT NULL AND datetime(approved_at) <= datetime('now', ?))"
-                ") "
-                "ORDER BY COALESCE(last_used_at, approved_at, created_at) ASC, name ASC",
-                (cutoff_sql, cutoff_sql),
-            )
-            rows = await cursor.fetchall()
-        return [dict(row) for row in rows]
-
-    async def retire_tools(self, tool_names: List[str]) -> int:
-        """Mark approved tools as retired and return number of tools retired."""
-        normalized = [str(name).strip() for name in (tool_names or []) if str(name).strip()]
-        if not normalized:
-            return 0
-        placeholders = ",".join("?" for _ in normalized)
-        async with self._lock:
-            cursor = await self._db.execute(
-                "UPDATE tool_registry SET status='retired' "
-                "WHERE status='approved' AND name IN (" + placeholders + ")",
-                tuple(normalized),
-            )
-            await self._db.commit()
-            return int(cursor.rowcount or 0)
-
-    async def purge_expired_pending(self, ttl_seconds: int) -> Dict[str, int]:
-        """Delete stale pending-state rows from all pending tables and return per-table counts."""
-        ttl = max(1, int(ttl_seconds))
-        table_names = [
-            "pending_tool_approvals",
-            "pending_hitl_states",
-            "pending_mfa_states",
-        ]
-        deleted_by_table: Dict[str, int] = {table_name: 0 for table_name in table_names}
-
-        async with self._lock:
-            for table_name in table_names:
-                cursor = await self._db.execute(
-                    f"DELETE FROM {table_name} "
-                    "WHERE created_at <= datetime('now', '-' || ? || ' seconds')",
-                    (ttl,),
-                )
-                deleted_by_table[table_name] = int(cursor.rowcount or 0)
-
-            if any(count > 0 for count in deleted_by_table.values()):
-                await self._db.commit()
-
-        for table_name, deleted_count in deleted_by_table.items():
-            if deleted_count > 0:
-                logger.warning(
-                    "Purged %d stale row(s) from %s.",
-                    deleted_count,
-                    table_name,
-                )
-
-        return deleted_by_table
-
     # ─────────────────────────────────────────────────────────────
     # Pending Tool Approvals  (survive bot restarts)
     # ─────────────────────────────────────────────────────────────
@@ -1790,44 +1525,17 @@ class LedgerMemory:
     async def load_pending_approvals(self) -> dict:
         """Return {user_id: {synthesis, original_input}} for all pending approvals."""
         import json
-        ttl_seconds = int(os.getenv("PENDING_STATE_TTL_SECONDS", "86400"))
         async with self._lock:
             cursor = await self._db.execute(
-                "SELECT user_id, synthesis_json, original_input, created_at "
-                "FROM pending_tool_approvals "
-                "WHERE created_at > datetime('now', '-' || ? || ' seconds')",
-                (ttl_seconds,),
+                "SELECT user_id, synthesis_json, original_input FROM pending_tool_approvals"
             )
             rows = await cursor.fetchall()
-            stale_cursor = await self._db.execute(
-                "DELETE FROM pending_tool_approvals "
-                "WHERE created_at <= datetime('now', '-' || ? || ' seconds')",
-                (ttl_seconds,),
-            )
-            stale_count = int(stale_cursor.rowcount or 0)
-            if stale_count > 0:
-                await self._db.commit()
-                logger.warning(
-                    "Pruned %d stale row(s) from pending_tool_approvals during load_pending_approvals.",
-                    stale_count,
-                )
-
-        def _to_epoch(value) -> float:
-            if isinstance(value, (int, float)):
-                return float(value)
-            try:
-                from datetime import datetime
-                return datetime.fromisoformat(str(value)).timestamp()
-            except Exception:
-                return 0.0
-
         result = {}
         for row in rows:
             try:
                 result[row["user_id"]] = {
                     "synthesis": json.loads(row["synthesis_json"]),
                     "original_input": row["original_input"],
-                    "_created_at": _to_epoch(row["created_at"]),
                 }
             except Exception:
                 pass
@@ -2086,115 +1794,6 @@ class LedgerMemory:
             return None
         return await self.get_synthesis_run(int(row["id"]))
 
-    async def count_synthesis_runs_by_tool_status(
-        self,
-        *,
-        suggested_tool_name: str,
-        statuses: Optional[List[str]] = None,
-    ) -> int:
-        """Count synthesis runs for a tool filtered by status values."""
-        tool_name = str(suggested_tool_name or "").strip()
-        normalized_statuses = [str(item).strip() for item in (statuses or []) if str(item).strip()]
-        if not tool_name or not normalized_statuses:
-            return 0
-
-        placeholders = ",".join("?" for _ in normalized_statuses)
-        params: List[Any] = [tool_name, *normalized_statuses]
-        async with self._lock:
-            cursor = await self._db.execute(
-                "SELECT COUNT(*) AS run_count FROM synthesis_runs "
-                "WHERE suggested_tool_name = ? AND status IN (" + placeholders + ")",
-                tuple(params),
-            )
-            row = await cursor.fetchone()
-        return int((row["run_count"] if row is not None else 0) or 0)
-
-    @staticmethod
-    def _normalize_synthesis_tool_name(name: str, *, sort_tokens: bool = False) -> str:
-        lowered = re.sub(r"[^a-z0-9]+", " ", str(name or "").lower()).strip()
-        if not lowered:
-            return ""
-        tokens = [token for token in lowered.split() if token]
-        if sort_tokens:
-            tokens = sorted(tokens)
-        return "_".join(tokens)
-
-    async def count_synthesis_failures_fuzzy(
-        self,
-        name: str,
-        threshold: float = 0.75,
-        window_hours: int = 24,
-    ) -> int:
-        target_name = str(name or "").strip()
-        if not target_name:
-            return 0
-
-        try:
-            ratio_threshold = float(threshold)
-        except (TypeError, ValueError):
-            ratio_threshold = 0.75
-        ratio_threshold = max(0.0, min(1.0, ratio_threshold))
-
-        try:
-            hours = int(window_hours)
-        except (TypeError, ValueError):
-            hours = 24
-        hours = max(1, hours)
-
-        async with self._lock:
-            cursor = await self._db.execute(
-                "SELECT suggested_tool_name FROM synthesis_runs "
-                "WHERE status IN ('blocked', 'rejected') "
-                "AND created_at >= datetime('now', '-' || ? || ' hours')",
-                (hours,),
-            )
-            rows = await cursor.fetchall()
-
-        target_normalized = self._normalize_synthesis_tool_name(target_name, sort_tokens=False)
-        target_token_sorted = self._normalize_synthesis_tool_name(target_name, sort_tokens=True)
-
-        if not target_normalized:
-            return 0
-
-        matches = 0
-        for row in rows:
-            candidate_raw = str(row["suggested_tool_name"] or "").strip()
-            candidate_normalized = self._normalize_synthesis_tool_name(candidate_raw, sort_tokens=False)
-            if not candidate_normalized:
-                continue
-            candidate_token_sorted = self._normalize_synthesis_tool_name(candidate_raw, sort_tokens=True)
-            direct_ratio = SequenceMatcher(None, target_normalized, candidate_normalized).ratio()
-            token_ratio = SequenceMatcher(None, target_token_sorted, candidate_token_sorted).ratio()
-            if max(direct_ratio, token_ratio) >= ratio_threshold:
-                matches += 1
-        return matches
-
-    async def count_synthesis_runs_for_user_window(
-        self,
-        *,
-        user_id: str,
-        window_hours: int = 1,
-    ) -> int:
-        normalized_user_id = str(user_id or "").strip()
-        if not normalized_user_id:
-            return 0
-
-        try:
-            hours = int(window_hours)
-        except (TypeError, ValueError):
-            hours = 1
-        hours = max(1, hours)
-
-        async with self._lock:
-            cursor = await self._db.execute(
-                "SELECT COUNT(*) AS run_count FROM synthesis_runs "
-                "WHERE user_id = ? "
-                "AND created_at >= datetime('now', '-' || ? || ' hours')",
-                (normalized_user_id, hours),
-            )
-            row = await cursor.fetchone()
-        return int((row["run_count"] if row is not None else 0) or 0)
-
     # ─────────────────────────────────────────────────────────────
     # HITL State Persistence  (survive bot restarts)
     # ─────────────────────────────────────────────────────────────
@@ -2219,46 +1818,15 @@ class LedgerMemory:
     async def load_hitl_states(self) -> dict:
         """Return {user_id: state_dict} for all persisted HITL states."""
         import json as _json
-        ttl_seconds = int(os.getenv("PENDING_STATE_TTL_SECONDS", "86400"))
         async with self._lock:
             cursor = await self._db.execute(
-                "SELECT user_id, state_json, created_at "
-                "FROM pending_hitl_states "
-                "WHERE created_at > datetime('now', '-' || ? || ' seconds')",
-                (ttl_seconds,),
+                "SELECT user_id, state_json FROM pending_hitl_states"
             )
             rows = await cursor.fetchall()
-            stale_cursor = await self._db.execute(
-                "DELETE FROM pending_hitl_states "
-                "WHERE created_at <= datetime('now', '-' || ? || ' seconds')",
-                (ttl_seconds,),
-            )
-            stale_count = int(stale_cursor.rowcount or 0)
-            if stale_count > 0:
-                await self._db.commit()
-                logger.warning(
-                    "Pruned %d stale row(s) from pending_hitl_states during load_hitl_states.",
-                    stale_count,
-                )
-
-        def _to_epoch(value) -> float:
-            if isinstance(value, (int, float)):
-                return float(value)
-            try:
-                from datetime import datetime
-                return datetime.fromisoformat(str(value)).timestamp()
-            except Exception:
-                return 0.0
-
         result = {}
         for row in rows:
             try:
-                state_payload = _json.loads(row["state_json"])
-                if isinstance(state_payload, dict):
-                    state_payload["_hitl_created_at"] = _to_epoch(row["created_at"])
-                    result[row["user_id"]] = state_payload
-                else:
-                    logger.warning("Could not deserialize HITL state for user '%s': payload is not a dict", row["user_id"])
+                result[row["user_id"]] = _json.loads(row["state_json"])
             except Exception as e:
                 logger.warning(f"Could not deserialize HITL state for user '{row['user_id']}': {e}")
         return result
@@ -2294,20 +1862,6 @@ class LedgerMemory:
             row = await cursor.fetchone()
         return row["value"] if row else None
 
-    async def get_system_state_keys_by_prefix(self, prefix: str) -> List[Tuple[str, str]]:
-        """Return all (key, value) pairs in system_state whose key starts with prefix."""
-        key_prefix = str(prefix or "")
-        async with self._lock:
-            cursor = await self._db.execute(
-                "SELECT key, value FROM system_state WHERE key LIKE ? ORDER BY key ASC",
-                (f"{key_prefix}%",),
-            )
-            rows = await cursor.fetchall()
-        return [
-            (str(row["key"]), str(row["value"]))
-            for row in rows
-        ]
-
     # ─────────────────────────────────────────────────────────────
     # MFA State  (persisted so bot restarts don't lose pending MFA)
     # ─────────────────────────────────────────────────────────────
@@ -2328,44 +1882,18 @@ class LedgerMemory:
     async def load_mfa_states(self) -> dict:
         """Return {user_id: {name, arguments, _created_at}} for all persisted MFA states."""
         import json as _json
-        ttl_seconds = int(os.getenv("PENDING_STATE_TTL_SECONDS", "86400"))
         async with self._lock:
             cursor = await self._db.execute(
-                "SELECT user_id, tool_name, arguments_json, created_at "
-                "FROM pending_mfa_states "
-                "WHERE created_at > datetime('now', '-' || ? || ' seconds')",
-                (ttl_seconds,),
+                "SELECT user_id, tool_name, arguments_json, created_at FROM pending_mfa_states"
             )
             rows = await cursor.fetchall()
-            stale_cursor = await self._db.execute(
-                "DELETE FROM pending_mfa_states "
-                "WHERE created_at <= datetime('now', '-' || ? || ' seconds')",
-                (ttl_seconds,),
-            )
-            stale_count = int(stale_cursor.rowcount or 0)
-            if stale_count > 0:
-                await self._db.commit()
-                logger.warning(
-                    "Pruned %d stale row(s) from pending_mfa_states during load_mfa_states.",
-                    stale_count,
-                )
-
-        def _to_epoch(value) -> float:
-            if isinstance(value, (int, float)):
-                return float(value)
-            try:
-                from datetime import datetime
-                return datetime.fromisoformat(str(value)).timestamp()
-            except Exception:
-                return 0.0
-
         result = {}
         for row in rows:
             try:
                 result[row["user_id"]] = {
                     "name": row["tool_name"],
                     "arguments": _json.loads(row["arguments_json"]),
-                    "_created_at": _to_epoch(row["created_at"]),
+                    "_created_at": row["created_at"],
                 }
             except Exception as e:
                 logger.warning("Could not deserialize MFA state for '%s': %s", row["user_id"], e)
@@ -2376,431 +1904,5 @@ class LedgerMemory:
         async with self._lock:
             await self._db.execute(
                 "DELETE FROM pending_mfa_states WHERE user_id=?", (user_id,)
-            )
-            await self._db.commit()
-
-    # -----------------------------------------------------------------
-    # Supervisor Decisions  (introspection log)
-    # -----------------------------------------------------------------
-
-    async def log_supervisor_decision(
-        self,
-        *,
-        user_id: str,
-        user_input: str,
-        plan_json: str,
-        is_direct: bool,
-        reasoning: str,
-        energy_before: int,
-        worker_count: int = 0,
-        session_id: Optional[int] = None,
-    ) -> int:
-        """Log one supervisor plan decision. Returns row id.
-
-        Called fire-and-forget from supervisor_node — must never raise.
-        """
-        try:
-            async with self._lock:
-                cursor = await self._db.execute(
-                    "INSERT INTO supervisor_decisions "
-                    "(user_id, user_input, plan_json, is_direct, reasoning, "
-                    "energy_before, worker_count, session_id) "
-                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-                    (
-                        str(user_id or "")[:64],
-                        str(user_input or "")[:500],
-                        str(plan_json or "[]"),
-                        1 if is_direct else 0,
-                        str(reasoning or "")[:1000],
-                        max(0, int(energy_before)),
-                        max(0, int(worker_count)),
-                        session_id,
-                    ),
-                )
-                await self._db.commit()
-                return int(cursor.lastrowid)
-        except Exception as exc:
-            logger.warning("log_supervisor_decision failed: %s", exc)
-            return 0
-
-    async def get_recent_supervisor_decisions(
-        self,
-        user_id: Optional[str] = None,
-        limit: int = 10,
-    ) -> List[Dict[str, Any]]:
-        """Return recent supervisor decisions, most recent first."""
-        capped_limit = max(1, min(int(limit), 50))
-        async with self._lock:
-            if user_id is not None:
-                cursor = await self._db.execute(
-                    "SELECT id, user_id, user_input, plan_json, is_direct, "
-                    "reasoning, energy_before, worker_count, session_id, "
-                    "created_at FROM supervisor_decisions "
-                    "WHERE user_id = ? "
-                    "ORDER BY created_at DESC, id DESC LIMIT ?",
-                    (str(user_id), capped_limit),
-                )
-            else:
-                cursor = await self._db.execute(
-                    "SELECT id, user_id, user_input, plan_json, is_direct, "
-                    "reasoning, energy_before, worker_count, session_id, "
-                    "created_at FROM supervisor_decisions "
-                    "ORDER BY created_at DESC, id DESC LIMIT ?",
-                    (capped_limit,),
-                )
-            rows = await cursor.fetchall()
-
-        results = []
-        for row in rows:
-            item = dict(row)
-            item["is_direct"] = bool(item.get("is_direct"))
-            try:
-                item["plan"] = json.loads(str(item.get("plan_json") or "[]"))
-            except Exception:
-                item["plan"] = []
-            results.append(item)
-        return results
-
-    async def get_last_supervisor_decision(
-        self,
-        user_id: Optional[str] = None,
-    ) -> Optional[Dict[str, Any]]:
-        """Return the single most recent supervisor decision."""
-        results = await self.get_recent_supervisor_decisions(
-            user_id=user_id, limit=1
-        )
-        return results[0] if results else None
-
-    # -----------------------------------------------------------------
-    # Introspection Queries  (cross-table reads for skill layer)
-    # -----------------------------------------------------------------
-
-    async def get_deferred_tasks_with_energy_context(
-        self,
-        limit: int = 20,
-    ) -> List[Dict[str, Any]]:
-        """Return deferred tasks with their energy deferral details."""
-        capped = max(1, min(int(limit), 50))
-        async with self._lock:
-            cursor = await self._db.execute(
-                "SELECT id, tier, title, priority, estimated_energy, "
-                "defer_count, last_energy_eval_json, next_eligible_at, "
-                "acceptance_criteria, updated_at "
-                "FROM objective_backlog "
-                "WHERE status = 'deferred_due_to_energy' "
-                "ORDER BY priority ASC, defer_count DESC LIMIT ?",
-                (capped,),
-            )
-            rows = await cursor.fetchall()
-
-        result = []
-        for row in rows:
-            item = dict(row)
-            try:
-                eval_json = str(item.get("last_energy_eval_json") or "{}")
-                item["energy_eval"] = json.loads(eval_json) if eval_json else {}
-            except Exception:
-                item["energy_eval"] = {}
-            result.append(item)
-        return result
-
-    async def get_blocked_tasks(self, limit: int = 20) -> List[Dict[str, Any]]:
-        """Return blocked tasks with parent context."""
-        capped = max(1, min(int(limit), 50))
-        async with self._lock:
-            cursor = await self._db.execute(
-                "SELECT t.id, t.tier, t.title, t.priority, t.estimated_energy, "
-                "t.acceptance_criteria, t.updated_at, "
-                "p.title AS parent_title, p.tier AS parent_tier "
-                "FROM objective_backlog t "
-                "LEFT JOIN objective_backlog p ON t.parent_id = p.id "
-                "WHERE t.status = 'blocked' "
-                "ORDER BY t.priority ASC LIMIT ?",
-                (capped,),
-            )
-            rows = await cursor.fetchall()
-        return [dict(r) for r in rows]
-
-    async def get_recent_synthesis_runs(
-        self,
-        limit: int = 10,
-    ) -> List[Dict[str, Any]]:
-        """Return recent synthesis runs with status and outcome."""
-        capped = max(1, min(int(limit), 30))
-        async with self._lock:
-            cursor = await self._db.execute(
-                "SELECT id, user_id, suggested_tool_name, status, "
-                "total_attempts, max_retries, final_tool_name, "
-                "test_summary, blocked_reason, created_at, updated_at "
-                "FROM synthesis_runs "
-                "ORDER BY created_at DESC, id DESC LIMIT ?",
-                (capped,),
-            )
-            rows = await cursor.fetchall()
-        return [dict(r) for r in rows]
-
-    async def get_system_error_log(
-        self,
-        hours: int = 24,
-        limit: int = 30,
-    ) -> List[Dict[str, Any]]:
-        """Return WARNING/ERROR/CRITICAL log entries from the past N hours."""
-        capped_hours = max(1, min(int(hours), 168))
-        capped_limit = max(1, min(int(limit), 100))
-        cutoff_sql = f"-{capped_hours} hours"
-        async with self._lock:
-            cursor = await self._db.execute(
-                "SELECT id, log_level, message, timestamp, context "
-                "FROM system_logs "
-                "WHERE log_level IN ('WARNING', 'ERROR', 'CRITICAL') "
-                "AND datetime(timestamp) >= datetime('now', ?) "
-                "ORDER BY timestamp DESC, id DESC LIMIT ?",
-                (cutoff_sql, capped_limit),
-            )
-            rows = await cursor.fetchall()
-        return [dict(r) for r in rows]
-
-    async def get_moral_audit_summary(
-        self,
-        user_id: Optional[str] = None,
-        limit: int = 10,
-    ) -> List[Dict[str, Any]]:
-        """Return recent moral audit records with parsed decision data."""
-        capped = max(1, min(int(limit), 30))
-        async with self._lock:
-            if user_id is not None:
-                cursor = await self._db.execute(
-                    "SELECT id, user_id, audit_mode, audit_trace, "
-                    "critic_feedback, moral_decision_json, "
-                    "request_redacted, created_at "
-                    "FROM moral_audit_log "
-                    "WHERE user_id = ? "
-                    "ORDER BY created_at DESC, id DESC LIMIT ?",
-                    (str(user_id), capped),
-                )
-            else:
-                cursor = await self._db.execute(
-                    "SELECT id, user_id, audit_mode, audit_trace, "
-                    "critic_feedback, moral_decision_json, "
-                    "request_redacted, created_at "
-                    "FROM moral_audit_log "
-                    "ORDER BY created_at DESC, id DESC LIMIT ?",
-                    (capped,),
-                )
-            rows = await cursor.fetchall()
-
-        results = []
-        for row in rows:
-            item = dict(row)
-            try:
-                decision = json.loads(str(item.get("moral_decision_json") or "{}"))
-                item["is_approved"] = bool(decision.get("is_approved", True))
-                item["scores"] = dict(decision.get("scores", {}))
-                item["violated_tiers"] = list(decision.get("violated_tiers", []))
-                item["remediation_constraints"] = list(
-                    decision.get("remediation_constraints", [])
-                )
-            except Exception:
-                item["is_approved"] = True
-                item["scores"] = {}
-                item["violated_tiers"] = []
-                item["remediation_constraints"] = []
-            results.append(item)
-        return results
-
-    async def get_objective_counts_by_status(self) -> Dict[str, int]:
-        """Return count of objectives grouped by status."""
-        async with self._lock:
-            cursor = await self._db.execute(
-                "SELECT status, COUNT(*) AS cnt "
-                "FROM objective_backlog "
-                "GROUP BY status"
-            )
-            rows = await cursor.fetchall()
-        return {row["status"]: int(row["cnt"]) for row in rows}
-
-    async def count_supervisor_decisions(
-        self,
-        user_id: Optional[str] = None,
-    ) -> int:
-        """Return total supervisor decision count."""
-        async with self._lock:
-            if user_id:
-                cursor = await self._db.execute(
-                    "SELECT COUNT(*) AS cnt FROM supervisor_decisions "
-                    "WHERE user_id = ?",
-                    (str(user_id),),
-                )
-            else:
-                cursor = await self._db.execute(
-                    "SELECT COUNT(*) AS cnt FROM supervisor_decisions"
-                )
-            row = await cursor.fetchone()
-        return int(row["cnt"]) if row else 0
-
-    # -----------------------------------------------------------------
-    # Conversation Sessions
-    # -----------------------------------------------------------------
-
-    async def create_session(
-        self,
-        name: str,
-        description: str = "",
-        epic_id: Optional[int] = None,
-    ) -> int:
-        """Create a new session without activating it. Returns session id."""
-        clean_name = str(name or "").strip()
-        if not clean_name:
-            raise ValueError("Session name must be non-empty")
-        async with self._lock:
-            cursor = await self._db.execute(
-                "INSERT INTO conversation_sessions "
-                "(name, description, epic_id, is_active) VALUES (?, ?, ?, 0)",
-                (clean_name, str(description or "").strip(), epic_id),
-            )
-            await self._db.commit()
-            return int(cursor.lastrowid)
-
-    async def activate_session(self, session_id: int) -> Optional[Dict[str, Any]]:
-        """Set one session as active, deactivating all others.
-        Returns the activated session row or None if not found."""
-        async with self._lock:
-            cursor = await self._db.execute(
-                "SELECT id, name, description, epic_id, turn_count, memory_count, "
-                "created_at FROM conversation_sessions WHERE id = ?",
-                (session_id,),
-            )
-            row = await cursor.fetchone()
-            if row is None:
-                return None
-
-            await self._db.execute(
-                "UPDATE conversation_sessions SET is_active = 0, "
-                "updated_at = CURRENT_TIMESTAMP"
-            )
-            await self._db.execute(
-                "UPDATE conversation_sessions SET is_active = 1, "
-                "updated_at = CURRENT_TIMESTAMP WHERE id = ?",
-                (session_id,),
-            )
-            await self._db.commit()
-        return dict(row)
-
-    async def deactivate_all_sessions(self) -> None:
-        """Clear the active session (no session mode)."""
-        async with self._lock:
-            await self._db.execute(
-                "UPDATE conversation_sessions SET is_active = 0, "
-                "updated_at = CURRENT_TIMESTAMP"
-            )
-            await self._db.commit()
-
-    async def get_active_session(self) -> Optional[Dict[str, Any]]:
-        """Return the currently active session row, or None."""
-        async with self._lock:
-            cursor = await self._db.execute(
-                "SELECT id, name, description, epic_id, turn_count, memory_count, "
-                "created_at, updated_at FROM conversation_sessions "
-                "WHERE is_active = 1 LIMIT 1"
-            )
-            row = await cursor.fetchone()
-        return dict(row) if row else None
-
-    async def get_session(self, session_id: int) -> Optional[Dict[str, Any]]:
-        """Return one session by id."""
-        async with self._lock:
-            cursor = await self._db.execute(
-                "SELECT id, name, description, epic_id, is_active, turn_count, "
-                "memory_count, created_at, updated_at "
-                "FROM conversation_sessions WHERE id = ?",
-                (session_id,),
-            )
-            row = await cursor.fetchone()
-        return dict(row) if row else None
-
-    async def list_sessions(self, limit: int = 20) -> List[Dict[str, Any]]:
-        """Return all sessions ordered by most recent activity."""
-        async with self._lock:
-            cursor = await self._db.execute(
-                "SELECT id, name, description, epic_id, is_active, turn_count, "
-                "memory_count, created_at, updated_at "
-                "FROM conversation_sessions "
-                "ORDER BY is_active DESC, updated_at DESC LIMIT ?",
-                (max(1, int(limit)),),
-            )
-            rows = await cursor.fetchall()
-        return [dict(r) for r in rows]
-
-    async def link_session_to_epic(
-        self,
-        session_id: int,
-        epic_id: Optional[int],
-    ) -> bool:
-        """Link or unlink a session to/from an Epic. Returns True if found."""
-        async with self._lock:
-            cursor = await self._db.execute(
-                "UPDATE conversation_sessions SET epic_id = ?, "
-                "updated_at = CURRENT_TIMESTAMP WHERE id = ?",
-                (epic_id, session_id),
-            )
-            await self._db.commit()
-        return cursor.rowcount > 0
-
-    async def increment_session_turn_count(self, session_id: int) -> None:
-        """Increment turn_count for a session (called on each persisted turn)."""
-        async with self._lock:
-            await self._db.execute(
-                "UPDATE conversation_sessions "
-                "SET turn_count = turn_count + 1, updated_at = CURRENT_TIMESTAMP "
-                "WHERE id = ?",
-                (session_id,),
-            )
-            await self._db.commit()
-
-    async def increment_session_memory_count(self, session_id: int) -> None:
-        """Increment memory_count when a memory is tagged with this session."""
-        async with self._lock:
-            await self._db.execute(
-                "UPDATE conversation_sessions "
-                "SET memory_count = memory_count + 1, "
-                "updated_at = CURRENT_TIMESTAMP WHERE id = ?",
-                (session_id,),
-            )
-            await self._db.commit()
-
-    async def get_session_chat_history(
-        self,
-        user_id: str,
-        session_id: int,
-        limit: int = 20,
-    ) -> List[Dict[str, str]]:
-        """Return chat history scoped to a session, in chronological order."""
-        async with self._lock:
-            cursor = await self._db.execute(
-                "SELECT role, content FROM ("
-                "  SELECT id, role, content FROM chat_history "
-                "  WHERE user_id = ? AND session_id = ? "
-                "  ORDER BY id DESC LIMIT ?"
-                ") ORDER BY id ASC",
-                (user_id, session_id, max(1, int(limit))),
-            )
-            rows = await cursor.fetchall()
-        return [{"role": r["role"], "content": r["content"]} for r in rows]
-
-    async def save_chat_turn_with_session(
-        self,
-        user_id: str,
-        role: str,
-        content: str,
-        session_id: Optional[int] = None,
-    ) -> None:
-        """Persist one turn, optionally tagged with a session_id."""
-        if role not in ("user", "assistant"):
-            raise ValueError("role must be 'user' or 'assistant'")
-        async with self._lock:
-            await self._db.execute(
-                "INSERT INTO chat_history (user_id, role, content, session_id) "
-                "VALUES (?, ?, ?, ?)",
-                (user_id, role, content, session_id),
             )
             await self._db.commit()

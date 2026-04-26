@@ -225,7 +225,15 @@ escalation_problem / escalation_context  # for System 2 escalations
 
 **Location:** `src/core/orchestrator.py`
 
-The `Orchestrator` is the central processing hub. It initialises all memory systems, the router, agent registry, skill registry, synthesis pipeline, consolidation engine, and starts the heartbeat loop.
+`Orchestrator` is now intentionally thin: it owns bootstrap/lifecycle flow, while domain logic is split into dedicated mixins and constants modules:
+
+- `src/core/orchestrator_llm.py` (`_LLMGatewayMixin`) — System 1/System 2 routing and escalation handling
+- `src/core/orchestrator_memory.py` (`_MemoryOpsMixin`) — archival/core memory retrieval, persistence, consolidation helpers
+- `src/core/orchestrator_energy.py` (`_EnergyManagerMixin`) — predictive budget, ROI gating, reservation/refund logic
+- `src/core/orchestrator_heartbeat.py` (`_HeartbeatManagerMixin`) — autonomous backlog execution and pending-state sweeps
+- `src/core/orchestrator_fast_path.py` (`_FastPathMixin`) — direct/meta fast paths, capability responses, charter parsing helpers
+- `src/core/orchestrator_graph.py` (`_GraphNodesMixin`) — supervisor/worker/critic graph nodes and turn loop
+- `src/core/orchestrator_constants.py` — shared constants extracted to avoid circular imports
 
 ### 6.1 AgentState Model
 
@@ -248,7 +256,7 @@ The `Orchestrator` is the central processing hub. It initialises all memory syst
 
 ### 6.2 Supervisor → Workers → Critic Pipeline
 
-The orchestrator builds a LangGraph `StateGraph` with three nodes:
+The orchestrator builds a LangGraph `StateGraph` with three nodes. Node implementations and turn-loop helpers are owned by `_GraphNodesMixin`.
 
 **`supervisor_node`**
 - Constructs the full supervisor prompt: charter, sensory context (OS, CPU, CWD), core memory, recent archival memories, chat history, available tools, and current energy budget.
@@ -304,9 +312,11 @@ Each `process_message` turn starts with `INITIAL_ENERGY_BUDGET` points (default 
 - Each tool execution within a worker
 - Critic call
 
-If `energy_remaining` drops too low mid-turn, further work is deferred. A `ENERGY_REPLENISH_PER_TURN` amount is credited at the start of each user turn to prevent permanent exhaustion.
+If `energy_remaining` drops too low mid-turn, further work is deferred.
 
 A separate **predictive energy account** (`_energy_budget`) is used for heartbeat and ad-hoc background tasks, replenished by wall-clock time (`ENERGY_REPLENISH_PER_HOUR`) and per-heartbeat credits (`ENERGY_REPLENISH_PER_HEARTBEAT`).
+
+`ENERGY_REPLENISH_PER_TURN` is retained only as a legacy compatibility knob and is deprecated for predictive-budget policy; prefer `ENERGY_REPLENISH_PER_HOUR` and `ENERGY_REPLENISH_PER_HEARTBEAT`.
 
 ---
 
@@ -577,6 +587,8 @@ Before any payload is sent to System 2, `cloud_redaction` applies layered scrubb
 - **Block-level redaction:** `<Core_Working_Memory>`, `<Archival_Memory>`, and `<chat_history>` XML blocks are replaced with `[REDACTED_CONTEXT_BLOCK]`.
 - **Sensory context redaction:** Machine-specific data (OS, CPU usage, CWD, platform) is replaced with `[REDACTED_SENSORY_STATE]`.
 - **PII patterns:** Email addresses, phone numbers, physical addresses, names, locations, SSNs, and local filesystem paths are replaced with typed sentinels.
+- **Message minimization (`redact_messages_for_cloud`):** when sensitive context is not allowed, only a reduced subset is forwarded (first+last system message and the latest user message), deduplicated after redaction, with a safe empty sentinel fallback.
+- **Sensitive-context override:** with `allow_sensitive_context=true`, message pruning/redaction is bypassed but payloads are still bounded by max-character truncation safeguards.
 
 All redaction functions are pure (no side effects) and are compiled as module-level regex patterns for performance.
 
@@ -675,7 +687,9 @@ All configuration is via environment variables loaded from `.env` (copy from `.e
 |---|---|---|
 | `HEARTBEAT_INTERVAL_SECONDS` | `1800` | Background objective execution interval |
 | `INITIAL_ENERGY_BUDGET` | `100` | Per-turn energy budget |
-| `ENERGY_REPLENISH_PER_TURN` | `5` | Budget restored each user turn |
+| `ENERGY_REPLENISH_PER_HOUR` | `30` | Wall-clock predictive energy replenishment rate |
+| `ENERGY_REPLENISH_PER_HEARTBEAT` | `2` | Predictive energy refund applied at heartbeat cycle start |
+| `ENERGY_REPLENISH_PER_TURN` | `5` | Legacy compatibility setting (deprecated) |
 | `ENERGY_ROI_THRESHOLD` | `1.25` | Minimum ROI to execute a task |
 | `ENERGY_MIN_RESERVE` | `10` | Minimum energy reserve after execution |
 | `FAIRNESS_BOOST_MULTIPLIER` | `0.15` | ROI boost per defer count |
@@ -776,7 +790,14 @@ AI_Prototype/
 │   │   └── streaming.py            # Deferred status message + progress formatter
 │   │
 │   ├── core/
-│   │   ├── orchestrator.py         # Central orchestration engine (largest module)
+│   │   ├── orchestrator.py         # Thin orchestrator shell (bootstrap + lifecycle wrappers)
+│   │   ├── orchestrator_constants.py # Shared orchestrator constants
+│   │   ├── orchestrator_llm.py     # LLM routing mixin
+│   │   ├── orchestrator_memory.py  # Memory operations mixin
+│   │   ├── orchestrator_energy.py  # Predictive energy/ROI mixin
+│   │   ├── orchestrator_heartbeat.py # Heartbeat + pending-state mixin
+│   │   ├── orchestrator_fast_path.py # Fast-path and charter helpers mixin
+│   │   ├── orchestrator_graph.py   # Graph nodes + execution loop mixin
 │   │   ├── progress.py             # ProgressEvent + ProgressEmitter ContextVar infra
 │   │   ├── state_model.py          # AgentState dataclass
 │   │   ├── workflow_graph.py       # LangGraph supervisor→workers→critic graph

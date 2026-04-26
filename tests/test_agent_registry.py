@@ -250,6 +250,48 @@ def test_parse_supervisor_response_invalid_workers_payload_keeps_long_answer_pre
     assert result["final_response"] == long_answer
 
 
+def test_decode_workers_payload_accepts_json_with_trailing_prose():
+    """Regression: gemma4:e4b appends an explanation sentence after the JSON array.
+    The payload must be accepted (not silently discarded) so the agent plan is executed."""
+    payload = (
+        '[{"agent": "research_agent", "task": "Search GitHub for Google AI tools", '
+        '"reason": "Need current data", "depends_on": []}]\n'
+        "I will now search GitHub for you."
+    )
+    result = Orchestrator._decode_workers_payload(payload)
+    assert result is not None
+    assert isinstance(result, list)
+    assert result[0]["agent"] == "research_agent"
+
+
+def test_decode_workers_payload_still_rejects_malformed_json():
+    """Malformed JSON must still return None."""
+    payload = '[{"agent": "research_agent", "task": "x", not valid json'
+    result = Orchestrator._decode_workers_payload(payload)
+    assert result is None
+
+
+def test_parse_supervisor_response_dispatches_agents_when_json_has_trailing_prose():
+    """End-to-end regression: supervisor response with trailing prose after WORKERS: JSON
+    must result in a populated current_plan (i.e. agents are dispatched), not a fallback."""
+    orchestrator = Orchestrator.__new__(Orchestrator)
+    state = AgentState.new("user-1", "check google AI tools on github").to_dict()
+
+    preamble = "I'll search GitHub for the latest Google AI agent tools."
+    json_plan = '[{"agent": "research_agent", "task": "Find Google AI tools on GitHub", "reason": "External data needed", "depends_on": []}]'
+    trailing = "\nI will now search GitHub for you and report back."
+    response = f"{preamble}\nWORKERS: {json_plan}{trailing}"
+
+    result = Orchestrator._parse_supervisor_response(orchestrator, response, state)
+
+    assert result["current_plan"] != [], (
+        "Agent plan must not be empty — trailing prose should not kill the dispatch"
+    )
+    assert result.get("final_response") is None or result.get("final_response") == "", (
+        "final_response must not be set when agents are dispatched"
+    )
+
+
 def test_build_execution_plan_respects_task_packet_dependencies():
     orchestrator = Orchestrator.__new__(Orchestrator)
     orchestrator.agent_registry = AgentRegistry(agents_dir=Path("does-not-matter"))

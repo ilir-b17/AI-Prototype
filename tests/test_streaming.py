@@ -203,3 +203,72 @@ async def test_streaming_end_to_end_simulation():
     # Final edit should contain the answer
     last_call_args = sent_msg.edit_text.call_args_list[-1]
     assert "42" in str(last_call_args)
+
+
+# -- cancel() tests ---------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_cancel_before_status_sent_is_noop():
+    """cancel() before the delay fires does nothing and does not raise."""
+    mock_msg, sent_msg = _make_mock_message()
+    dsm = DeferredStatusMessage(mock_msg, delay_seconds=10.0)
+    await dsm.start()
+    # Cancel before delay fires — status msg never sent
+    await dsm.cancel()
+    assert dsm._status_msg is None
+    sent_msg.edit_text.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_cancel_deletes_status_bubble():
+    """cancel() after the status bubble is sent deletes the message."""
+    mock_msg, sent_msg = _make_mock_message()
+    sent_msg.delete = AsyncMock()
+
+    dsm = DeferredStatusMessage(mock_msg, delay_seconds=0.05)
+    await dsm.start()
+    await asyncio.sleep(0.15)  # let the status bubble appear
+
+    assert dsm._status_msg is not None
+    await dsm.cancel()
+
+    sent_msg.delete.assert_called_once()
+    assert dsm._status_msg is None
+
+
+@pytest.mark.asyncio
+async def test_cancel_delete_failure_is_non_fatal():
+    """If delete() raises, cancel() swallows the error and clears _status_msg."""
+    mock_msg, sent_msg = _make_mock_message()
+    sent_msg.delete = AsyncMock(side_effect=Exception("Message not found"))
+
+    dsm = DeferredStatusMessage(mock_msg, delay_seconds=0.05)
+    await dsm.start()
+    await asyncio.sleep(0.15)
+
+    # Should not raise even if delete fails
+    await dsm.cancel()
+    assert dsm._status_msg is None
+
+
+@pytest.mark.asyncio
+async def test_cancel_then_reply_text_is_visible_new_message():
+    """Simulates the new delivery pattern: cancel status, then reply_text."""
+    mock_msg, sent_msg = _make_mock_message()
+    sent_msg.delete = AsyncMock()
+
+    dsm = DeferredStatusMessage(mock_msg, delay_seconds=0.05)
+    await dsm.start()
+    await asyncio.sleep(0.15)  # status bubble appears
+
+    await dsm.cancel()
+
+    # Caller sends final response as a fresh reply_text
+    await mock_msg.reply_text("Here is the answer!")
+
+    sent_msg.delete.assert_called_once()
+    # reply_text called twice: once for status bubble, once for final answer
+    assert mock_msg.reply_text.call_count == 2
+    last_reply = mock_msg.reply_text.call_args_list[-1]
+    assert "Here is the answer!" in str(last_reply)

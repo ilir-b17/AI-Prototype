@@ -72,6 +72,9 @@ async def test_supervisor_fallback_receives_tool_catalog_and_writes_audit(tmp_pa
         assert result is not None
         assert result.status == "ok"
 
+        _, s1_kwargs = orchestrator._route_to_system_1.await_args
+        assert s1_kwargs["allowed_tools"] == []
+
         args, kwargs = orchestrator.cognitive_router.route_to_system_2.await_args
         forwarded_messages = args[0]
         forwarded_text = "\n".join(message["content"] for message in forwarded_messages)
@@ -82,7 +85,7 @@ async def test_supervisor_fallback_receives_tool_catalog_and_writes_audit(tmp_pa
         assert "coder_agent" in forwarded_text
         assert "core secret user preference" not in forwarded_text
         assert "archival secret memory" not in forwarded_text
-        assert kwargs["allowed_tools"] is None
+        assert kwargs["allowed_tools"] == []
 
         entries = await ledger.get_cloud_payload_audit_entries(limit=5)
         assert len(entries) == 1
@@ -92,7 +95,7 @@ async def test_supervisor_fallback_receives_tool_catalog_and_writes_audit(tmp_pa
         assert entries[0]["allow_sensitive_context"] is False
         assert entries[0]["payload_sha256"] == Orchestrator._cloud_payload_audit_sha256(
             forwarded_messages,
-            None,
+            [],
         )
     finally:
         await ledger.close()

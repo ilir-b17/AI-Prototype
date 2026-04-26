@@ -11,16 +11,13 @@ System 2: Cloud LLM for complex reasoning. Provider priority:
 import ast
 import base64
 import difflib
-import io
 import os
-import sys
 import logging
 import json
 import asyncio
 import math
 import re
 import time
-import tokenize
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from typing import Optional, Dict, Any, List, AsyncIterator
@@ -42,7 +39,6 @@ try:
 except ImportError:
     GROQ_AVAILABLE = False
 
-from src.core.dynamic_tool_worker import DynamicToolWorkerClient
 from src.core.skill_manager import SkillRegistry
 
 # ── Structured result returned by all router methods ─────────────────────────
@@ -114,12 +110,6 @@ _BLOCKED_TOP_LEVEL_MODULES = {
     "marshal",      # low-level serialization; can reconstruct code objects
     "shelve",       # uses pickle internally
     "ast",          # can parse/compile/reconstruct blocked expressions at runtime
-    "sqlite3",      # direct access to AIDEN's ledger DB must not be available
-    "dbm",
-    "fileinput",
-    "linecache",
-    "io",           # io.open would bypass the worker-local safe open wrapper
-    "src",          # dynamic tools must never import AIDEN modules
 }
 
 # Generated pytest scripts are intentionally constrained to a tight import
@@ -141,25 +131,8 @@ _BLOCKED_DUNDER_ATTRIBUTES = {
 }
 
 _BLOCKED_TOOL_BUILTINS = {
-    "eval", "exec", "compile", "__import__", "globals", "locals",
-    "getattr", "setattr", "delattr", "vars",
+    "eval", "exec", "compile", "open", "__import__", "globals", "locals",
 }
-
-_BLOCKED_DYNAMIC_TOOL_TOKENS = {
-    "__subclasses__", "__mro__", "__globals__", "__builtins__", "__import__",
-}
-
-_BLOCKED_DYNAMIC_TOOL_DOTTED_TOKENS = {"sys.modules"}
-
-_DYNAMIC_TOOL_IGNORED_TOKEN_TYPES = frozenset({
-    tokenize.COMMENT,
-    tokenize.ENCODING,
-    tokenize.ENDMARKER,
-    tokenize.INDENT,
-    tokenize.DEDENT,
-    tokenize.NL,
-    tokenize.NEWLINE,
-})
 
 _BLOCKED_ASYNCIO_CALLS = {
     "create_subprocess_exec",
@@ -204,22 +177,6 @@ _CAPABILITY_META_TOOL_NAMES = {
     "ask_admin_for_guidance",
     "escalate_to_system_2",
 }
-_SANITIZE_THINK_BLOCK_RE = re.compile(r"<think>.*?</think>", flags=re.DOTALL | re.IGNORECASE)
-_SANITIZE_REASONING_BLOCK_RE = re.compile(r"<reasoning>.*?</reasoning>", flags=re.DOTALL | re.IGNORECASE)
-_SANITIZE_CRITIC_FEEDBACK_RE = re.compile(r"\[CRITIC FEEDBACK[^\n]*\n?", flags=re.IGNORECASE)
-_SANITIZE_ADMIN_GUIDANCE_RE = re.compile(r"\[ADMIN GUIDANCE[^\n]*\n?", flags=re.IGNORECASE)
-_SANITIZE_HEARTBEAT_TAG_RE = re.compile(r"\[HEARTBEAT TASK[^\n]*\n?", flags=re.IGNORECASE)
-_SANITIZE_WORKERS_TAG_RE = re.compile(r"WORKERS:\s*\[.*?\]\s*\n?", flags=re.IGNORECASE)
-_SANITIZE_STANDALONE_TOOL_JSON_RE = re.compile(
-    r'(?m)^\s*\{[^{}]*"(?:tool_call|tool_name|function_call|function|name)"[^{}]*\}\s*$',
-    flags=re.IGNORECASE,
-)
-_SANITIZE_MARKDOWN_HEADER_RE = re.compile(r"^#{1,3}\s.*$", flags=re.MULTILINE)
-_SANITIZE_OUTPUT_DRAFT_RE = re.compile(r"\[Output Draft\][^\[]*", flags=re.DOTALL | re.IGNORECASE)
-_SANITIZE_INTERNAL_CRITIQUE_RE = re.compile(r"\[Internal Critique\][^\[]*", flags=re.DOTALL | re.IGNORECASE)
-_SANITIZE_FINALIZED_DELIVERABLE_RE = re.compile(r"\[Finalized Deliverable\]\s*", flags=re.IGNORECASE)
-_SANITIZE_HORIZONTAL_RULE_RE = re.compile(r"---+\s*\n")
-_SANITIZE_MULTI_BLANK_LINES_RE = re.compile(r"\n{3,}")
 
 
 class CognitiveRouter:
@@ -373,31 +330,36 @@ class CognitiveRouter:
             return text
 
         # Chain-of-thought blocks produced by some local models
-        text = _SANITIZE_THINK_BLOCK_RE.sub('', text)
-        text = _SANITIZE_REASONING_BLOCK_RE.sub('', text)
+        text = re.sub(r'<think>.*?</think>', '', text, flags=re.DOTALL | re.IGNORECASE)
+        text = re.sub(r'<reasoning>.*?</reasoning>', '', text, flags=re.DOTALL | re.IGNORECASE)
 
         # Internal annotation tags injected by the orchestrator loop
-        text = _SANITIZE_CRITIC_FEEDBACK_RE.sub('', text)
-        text = _SANITIZE_ADMIN_GUIDANCE_RE.sub('', text)
-        text = _SANITIZE_HEARTBEAT_TAG_RE.sub('', text)
+        text = re.sub(r'\[CRITIC FEEDBACK[^\n]*\n?', '', text, flags=re.IGNORECASE)
+        text = re.sub(r'\[ADMIN GUIDANCE[^\n]*\n?', '', text, flags=re.IGNORECASE)
+        text = re.sub(r'\[HEARTBEAT TASK[^\n]*\n?', '', text, flags=re.IGNORECASE)
 
         # Supervisor planning tag
-        text = _SANITIZE_WORKERS_TAG_RE.sub('', text)
+        text = re.sub(r'WORKERS:\s*\[.*?\]\s*\n?', '', text, flags=re.IGNORECASE)
 
         # Standalone JSON blobs that look like tool-call payloads
         # Matches a top-level {...} block containing known internal keys
-        text = _SANITIZE_STANDALONE_TOOL_JSON_RE.sub('', text)
+        text = re.sub(
+            r'(?m)^\s*\{[^{}]*"(?:tool_call|tool_name|function_call|function|name)"[^{}]*\}\s*$',
+            '',
+            text,
+            flags=re.IGNORECASE,
+        )
 
         # Internal planning/scratchpad sections the model sometimes generates
         # Strips: ## ⚙️ Section Title, [Output Draft], [Internal Critique], [Finalized Deliverable]
-        text = _SANITIZE_MARKDOWN_HEADER_RE.sub('', text)
-        text = _SANITIZE_OUTPUT_DRAFT_RE.sub('', text)
-        text = _SANITIZE_INTERNAL_CRITIQUE_RE.sub('', text)
-        text = _SANITIZE_FINALIZED_DELIVERABLE_RE.sub('', text)
-        text = _SANITIZE_HORIZONTAL_RULE_RE.sub('', text)
+        text = re.sub(r'^#{1,3}\s.*$', '', text, flags=re.MULTILINE)
+        text = re.sub(r'\[Output Draft\][^\[]*', '', text, flags=re.DOTALL | re.IGNORECASE)
+        text = re.sub(r'\[Internal Critique\][^\[]*', '', text, flags=re.DOTALL | re.IGNORECASE)
+        text = re.sub(r'\[Finalized Deliverable\]\s*', '', text, flags=re.IGNORECASE)
+        text = re.sub(r'---+\s*\n', '', text)  # horizontal rule separators
 
         # Collapse leftover blank lines
-        text = _SANITIZE_MULTI_BLANK_LINES_RE.sub('\n\n', text)
+        text = re.sub(r'\n{3,}', '\n\n', text)
 
         logged = text[:120].replace('\n', ' ')
         logger.debug(f"sanitize_response output preview: {logged!r}")
@@ -569,11 +531,8 @@ class CognitiveRouter:
         messages: List[Dict[str, Any]],
         *,
         tools=None,
-        max_output_tokens: Optional[int] = None,
     ) -> Dict[str, Any]:
-        ollama_options = dict(getattr(self, "_ollama_options", {}) or {})
-        if max_output_tokens is not None:
-            ollama_options["num_predict"] = max(1, int(max_output_tokens))
+        ollama_options = getattr(self, "_ollama_options", {}) or {}
         ollama_keep_alive = getattr(self, "_ollama_keep_alive", None)
         ollama_think = getattr(self, "_ollama_think", None)
         system_1_capabilities = getattr(self, "_system_1_capabilities", set()) or set()
@@ -667,20 +626,14 @@ class CognitiveRouter:
         self._system_1_wait_events = 0
         self._system_1_total_wait_seconds = 0.0
         self._system_1_peak_waiting_requests = 0
-        self._inline_tool_call_streak = 0
         self._system2_cooldown_until = 0.0
-        # Optional callback to persist cooldown expiry to DB; set by Orchestrator.async_init.
-        # The orchestrator callback schedules persistence through Orchestrator._fire_and_forget.
-        self._persist_cooldown_cb = None
+        # Optional callback to persist cooldown expiry to DB; set by Orchestrator.async_init
+        self._persist_cooldown_cb = None  # Optional[Callable[[float], Awaitable[None]]]
         # Optional callback to lazily resolve scoped SKILL.md context per tool call.
         self._skill_context_resolver = None
 
         # SkillRegistry — single source of truth for all tool schemas and callables
         self.registry = SkillRegistry()
-        self._dynamic_tool_worker = DynamicToolWorkerClient(
-            call_timeout_seconds=TOOL_EXEC_TIMEOUT_SECONDS,
-        )
-        self.registry.set_dynamic_tool_worker(self._dynamic_tool_worker)
 
         # System 1: cached Ollama client — created once, reused across all calls
         self._ollama_client: Optional[ollama.AsyncClient] = None
@@ -862,25 +815,9 @@ class CognitiveRouter:
             "peak_waiting_requests": self._system_1_peak_waiting_requests,
         }
 
-    def set_dynamic_tool_restart_callback(self, callback) -> None:
-        worker = getattr(self, "_dynamic_tool_worker", None)
-        if worker is not None:
-            worker.set_restart_callback(callback)
-
-    async def start_dynamic_tool_worker(self) -> None:
-        worker = getattr(self, "_dynamic_tool_worker", None)
-        if worker is None:
-            worker = DynamicToolWorkerClient(call_timeout_seconds=TOOL_EXEC_TIMEOUT_SECONDS)
-            self._dynamic_tool_worker = worker
-            self.registry.set_dynamic_tool_worker(worker)
-        await worker.start()
-
     async def close(self) -> None:
-        """Release cached runtime resources."""
-        worker = getattr(self, "_dynamic_tool_worker", None)
-        if worker is not None:
-            await worker.shutdown()
-        if getattr(self, "_ollama_client", None) is not None:
+        """Release the cached Ollama client connection."""
+        if self._ollama_client is not None:
             try:
                 await self._ollama_client.close()
             except Exception as e:
@@ -1183,60 +1120,40 @@ class CognitiveRouter:
         return {k: v for k, v in obj.items() if k not in known_meta}
 
     @staticmethod
-    def _extract_inline_tool_call(
-        text: str,
-        *,
-        call_context: Optional[Dict[str, Any]] = None,
-    ) -> Optional[tuple]:
+    def _extract_inline_tool_call(text: str) -> Optional[tuple]:
         """
         Fallback parser for models that embed tool call JSON inside the text
         ``content`` field instead of using the native ``tool_calls`` array.
 
-        Requires the JSON payload to be the dominant content of the message
-        (raw JSON or ```json fenced JSON) so prose examples are not executed.
+        Looks for a top-level JSON object containing a ``tool_name`` (or
+        ``name``) key whose value matches a known meta-tool pattern, plus an
+        optional ``arguments`` / ``parameters`` block.
 
         Returns ``(tool_name, arguments_dict)`` on success, or ``None`` if no
         recognisable inline tool call is found.
         """
-        if call_context and bool(call_context.get("inline_tool_call_blocked")):
-            return None
-
         if not text:
             return None
 
-        candidate = str(text).strip()
-        if not candidate:
-            return None
+        for raw in CognitiveRouter._find_json_blobs(text):
+            try:
+                obj = json.loads(raw)
+            except ValueError:
+                continue
 
-        if candidate.startswith("```"):
-            fence_match = re.fullmatch(r"```(?:json)?\s*(.*?)\s*```", candidate, flags=re.IGNORECASE | re.DOTALL)
-            if fence_match is None:
-                return None
-            candidate = str(fence_match.group(1) or "").strip()
+            if not isinstance(obj, dict):
+                continue
 
-        if not candidate.startswith("{"):
-            return None
+            name_val = (
+                obj.get("tool_name") or obj.get("name")
+                or obj.get("function_call") or obj.get("tool_call")
+            )
+            if not isinstance(name_val, str) or not name_val.strip():
+                continue
 
-        try:
-            obj, end_index = json.JSONDecoder().raw_decode(candidate)
-        except ValueError:
-            return None
-
-        if candidate[end_index:].strip():
-            return None
-        if not isinstance(obj, dict):
-            return None
-
-        name_val = (
-            obj.get("tool_name") or obj.get("name")
-            or obj.get("function_call") or obj.get("tool_call")
-        )
-        if not isinstance(name_val, str) or not name_val.strip():
-            return None
-
-        raw_args = CognitiveRouter._extract_args_from_blob(obj)
-        logger.debug(f"_extract_inline_tool_call: found '{name_val}' in content text")
-        return (name_val.strip(), raw_args)
+            raw_args = CognitiveRouter._extract_args_from_blob(obj)
+            logger.debug(f"_extract_inline_tool_call: found '{name_val}' in content text")
+            return (name_val.strip(), raw_args)
 
         return None
 
@@ -1269,21 +1186,7 @@ class CognitiveRouter:
         minutes, seconds = divmod(remaining, 60)
         return f"Rate limited. Retry in {minutes}m{seconds}s."
 
-    def _groq_cooldown_active(self) -> tuple[bool, str]:
-        cooldown_until = float(getattr(self, "_system2_cooldown_until", 0.0) or 0.0)
-        if cooldown_until and time.time() < cooldown_until:
-            msg = self._format_cooldown_message() or "Rate limited. Please try again later."
-            return True, msg
-        return False, ""
-
-    async def _call_ollama_with_model_fallback(
-        self,
-        client,
-        messages,
-        tools,
-        *,
-        max_output_tokens: Optional[int] = None,
-    ):
+    async def _call_ollama_with_model_fallback(self, client, messages, tools):
         """Call Ollama chat with the configured local model.
 
         Raises on failure so the orchestrator's S1→S2 escalation logic takes over.
@@ -1291,14 +1194,7 @@ class CognitiveRouter:
         """
         model = self.local_model
         response = await asyncio.wait_for(
-            client.chat(
-                **self._build_system_1_chat_kwargs(
-                    model,
-                    messages,
-                    tools=tools,
-                    max_output_tokens=max_output_tokens,
-                )
-            ),
+            client.chat(**self._build_system_1_chat_kwargs(model, messages, tools=tools)),
             timeout=self._ollama_timeout,
         )
         return response, model
@@ -1858,16 +1754,7 @@ class CognitiveRouter:
             return RouterResult(status="ok", content=content)
         return RouterResult(status="ok", content="Tool(s) executed but model produced no response.")
 
-    async def _handle_text_response(
-        self,
-        message: dict,
-        *,
-        client=None,
-        model: str = "",
-        current_messages: Optional[List[Dict[str, Any]]] = None,
-        active_tools=None,
-        inline_call_context: Optional[Dict[str, Any]] = None,
-    ) -> RouterResult:
+    async def _handle_text_response(self, message: dict) -> RouterResult:
         """Handle a plain-text (no tool_calls) response message from Ollama."""
         if "content" not in message:
             return RouterResult(status="ok", content="[System 1 - Error]: Unexpected response format")
@@ -1877,49 +1764,22 @@ class CognitiveRouter:
             logger.warning("System 1 returned empty response")
             return RouterResult(status="ok", content="[System 1 - Error]: Empty response from model")
 
-        call_context = inline_call_context if inline_call_context is not None else {}
-        calls_executed = int(call_context.get("inline_calls_executed", 0) or 0)
-        call_limit = int(call_context.get("inline_call_limit", 1) or 1)
-        inline_blocked = bool(self._inline_tool_call_streak > 0 or calls_executed >= call_limit)
-
-        inline_tc = self._extract_inline_tool_call(
-            result,
-            call_context={"inline_tool_call_blocked": inline_blocked},
-        )
+        inline_tc = self._extract_inline_tool_call(result)
         if inline_tc:
             inline_name, inline_args = inline_tc
-            self._inline_tool_call_streak += 1
-            call_context["inline_calls_executed"] = calls_executed + 1
             logger.info(f"System 1 in-text tool call detected: {inline_name}")
-
-            if client is not None and model and current_messages is not None:
-                synthetic_message = {
-                    "content": "",
-                    "tool_calls": [{"function": {"name": inline_name, "arguments": inline_args}}],
-                }
-                return await self._run_tool_loop(
-                    client,
-                    model,
-                    synthetic_message,
-                    list(current_messages),
-                    active_tools,
-                )
-
             exec_result = await self._execute_tool(inline_name, inline_args)
             if exec_result.status != "ok":
                 return exec_result
             return RouterResult(status="ok", content=exec_result.content)
 
-        self._inline_tool_call_streak = 0
         logger.info(f"System 1 response received ({len(result)} chars)")
         return RouterResult(status="ok", content=result)
 
     async def route_to_system_1(
         self,
         messages: List[Dict[str, Any]],
-        allowed_tools: Optional[List[str]] = None,
-        *,
-        max_output_tokens: Optional[int] = None,
+        allowed_tools: Optional[List[str]] = None
     ) -> RouterResult:
         """
         Route to System 1 (Local Model) - Fast, pattern-based responses.
@@ -1933,16 +1793,8 @@ class CognitiveRouter:
                 client = self._get_or_create_ollama_client()
                 active_tools = self._format_ollama_tools(allowed_tools) or None
                 prepared_messages = self._prepare_system_1_messages(messages)
-                self._inline_tool_call_streak = 0
-                inline_call_context = {
-                    "inline_calls_executed": 0,
-                    "inline_call_limit": 1,
-                }
                 response, available_model = await self._call_ollama_with_model_fallback(
-                    client,
-                    prepared_messages,
-                    active_tools,
-                    max_output_tokens=max_output_tokens,
+                    client, prepared_messages, active_tools
                 )
 
                 if not (response and "message" in response):
@@ -1958,14 +1810,7 @@ class CognitiveRouter:
                         active_tools,
                     )
 
-                return await self._handle_text_response(
-                    message,
-                    client=client,
-                    model=available_model,
-                    current_messages=list(prepared_messages),
-                    active_tools=active_tools,
-                    inline_call_context=inline_call_context,
-                )
+                return await self._handle_text_response(message)
 
         except asyncio.TimeoutError:
             error_msg = (
@@ -2345,12 +2190,6 @@ Rules:
                 f"Synthesised tool '{tool_name}' imports blocked module '{module_name}'. "
                 f"Blocked modules: {sorted(_BLOCKED_TOP_LEVEL_MODULES)}"
             )
-        stdlib_names = getattr(sys, "stdlib_module_names", set())
-        if stdlib_names and base not in stdlib_names:
-            raise ValueError(
-                f"Synthesised tool '{tool_name}' imports non-stdlib module '{module_name}'. "
-                "Dynamic tools may only import Python standard library modules."
-            )
 
     @staticmethod
     def _validate_ast_import_node(node: ast.AST, tool_name: str) -> bool:
@@ -2443,16 +2282,6 @@ Rules:
         return True
 
     @staticmethod
-    def _validate_ast_string_constant_node(node: ast.AST, tool_name: str) -> bool:
-        if not isinstance(node, ast.Constant) or not isinstance(node.value, str):
-            return False
-        if node.value in _BLOCKED_TOP_LEVEL_MODULES:
-            raise ValueError(
-                f"Synthesised tool '{tool_name}' references blocked module string literal '{node.value}'."
-            )
-        return True
-
-    @staticmethod
     def _validate_tool_code_ast(code: str, tool_name: str) -> None:
         """
         Parse the synthesised code as an AST and reject any import that
@@ -2472,8 +2301,6 @@ Rules:
             CognitiveRouter._validate_ast_asyncio_call(node, tool_name)
             if CognitiveRouter._validate_ast_attribute_node(node, tool_name):
                 continue
-            if CognitiveRouter._validate_ast_string_constant_node(node, tool_name):
-                continue
             CognitiveRouter._validate_ast_call_node(node, tool_name)
 
     @staticmethod
@@ -2490,98 +2317,54 @@ Rules:
             CognitiveRouter._validate_ast_asyncio_call(node, tool_name)
             if CognitiveRouter._validate_ast_attribute_node(node, tool_name):
                 continue
-            if CognitiveRouter._validate_ast_string_constant_node(node, tool_name):
-                continue
             CognitiveRouter._validate_ast_call_node(node, tool_name)
 
-    @staticmethod
-    def _dynamic_tool_significant_tokens(code: str, tool_name: str) -> List[tokenize.TokenInfo]:
-        try:
-            tokens = list(tokenize.tokenize(io.BytesIO(code.encode("utf-8")).readline))
-        except tokenize.TokenError as exc:
-            raise ValueError(f"Synthesised code for '{tool_name}' could not be tokenized: {exc}") from exc
-        return [token for token in tokens if token.type not in _DYNAMIC_TOOL_IGNORED_TOKEN_TYPES]
+    def register_dynamic_tool(self, tool_name: str, code: str, schema_json: str) -> None:
+        """Load synthesised Python code into the runtime via the SkillRegistry.
 
-    @staticmethod
-    def _string_token_literal_value(token: tokenize.TokenInfo) -> Optional[str]:
-        if token.type != tokenize.STRING:
-            return None
-        try:
-            literal_value = ast.literal_eval(token.string)
-        except (SyntaxError, ValueError):
-            return None
-        return literal_value if isinstance(literal_value, str) else None
-
-    @staticmethod
-    def _validate_dynamic_tool_bare_token(token: tokenize.TokenInfo, tool_name: str) -> None:
-        token_value = token.string
-        literal_value = CognitiveRouter._string_token_literal_value(token)
-        blocked_value = token_value if token_value in _BLOCKED_DYNAMIC_TOOL_TOKENS else literal_value
-        if blocked_value in _BLOCKED_DYNAMIC_TOOL_TOKENS:
-            raise ValueError(
-                f"Synthesised tool '{tool_name}' contains blocked runtime token '{blocked_value}'."
-            )
-
-    @staticmethod
-    def _validate_dynamic_tool_dotted_token(
-        tokens: List[tokenize.TokenInfo],
-        index: int,
-        tool_name: str,
-    ) -> None:
-        if tokens[index].string != "sys" or index + 2 >= len(tokens):
-            return
-        dotted = "".join(next_token.string for next_token in tokens[index:index + 3])
-        if dotted in _BLOCKED_DYNAMIC_TOOL_DOTTED_TOKENS:
-            raise ValueError(
-                f"Synthesised tool '{tool_name}' contains blocked runtime token '{dotted}'."
-            )
-
-    @staticmethod
-    def _validate_dynamic_tool_token_scan(code: str, tool_name: str) -> None:
-        """Reject known escape tokens immediately before dynamic exec."""
-        significant_tokens = CognitiveRouter._dynamic_tool_significant_tokens(code, tool_name)
-        # This token gate intentionally catches direct and literal spellings of
-        # dangerous runtime names. Constructed dunder names are still not a viable
-        # escape path because AST call validation already blocks getattr/eval/exec/
-        # __import__/vars/globals/locals before dynamic registration is allowed.
-        for index, token in enumerate(significant_tokens):
-            CognitiveRouter._validate_dynamic_tool_bare_token(token, tool_name)
-            CognitiveRouter._validate_dynamic_tool_dotted_token(significant_tokens, index, tool_name)
-
-    @staticmethod
-    def _coerce_dynamic_schema(tool_name: str, schema_json: Any) -> Dict[str, Any]:
-        if isinstance(schema_json, dict):
-            schema = dict(schema_json)
-        else:
-            try:
-                schema = json.loads(str(schema_json or ""))
-            except Exception as exc:
-                raise RuntimeError(f"Invalid schema JSON for '{tool_name}': {exc}") from exc
-        if not isinstance(schema, dict):
-            raise RuntimeError(f"Invalid schema JSON for '{tool_name}': schema must be an object")
-        schema.setdefault("name", tool_name)
-        return schema
-
-    async def register_dynamic_tool(self, tool_name: str, code: str, schema_json: Any) -> None:
-        """Register synthesised code in the isolated dynamic-tool worker.
-
-        The orchestrator process validates the payload, sends the source to the
-        worker for a second validation + exec pass, then stores only the schema
-        in the local SkillRegistry.
+        The code is first validated through an AST sandbox that blocks imports
+        of dangerous modules (os, sys, subprocess, etc.) before execution.
         """
+        import types
+        import json as _json
+
+        # ── AST sandbox check ──────────────────────────────────────────────
         self._validate_tool_code_ast(code, tool_name)
-        self._validate_dynamic_tool_token_scan(code, tool_name)
-        schema = self._coerce_dynamic_schema(tool_name, schema_json)
 
-        worker = getattr(self, "_dynamic_tool_worker", None)
-        if worker is None:
-            raise RuntimeError("Dynamic tool worker is not configured.")
-        response = await worker.register_tool(tool_name, code, schema)
-        if not response.get("ok"):
-            raise RuntimeError(str(response.get("error") or "Dynamic tool worker registration failed."))
+        module = types.ModuleType(f"dynamic_tool_{tool_name}")
+        # Restrict built-ins to a safe subset so that exec() cannot reach
+        # open(), eval(), __import__(), exec(), compile(), etc. even if the
+        # AST check is somehow bypassed.
+        _safe_builtins = {
+            "None": None, "True": True, "False": False,
+            "abs": abs, "all": all, "any": any, "bool": bool,
+            "bytes": bytes, "chr": chr, "dict": dict, "dir": dir,
+            "divmod": divmod, "enumerate": enumerate, "filter": filter,
+            "float": float, "format": format, "frozenset": frozenset,
+            "getattr": getattr, "hasattr": hasattr, "hash": hash,
+            "int": int, "isinstance": isinstance, "issubclass": issubclass,
+            "iter": iter, "len": len, "list": list, "map": map,
+            "max": max, "min": min, "next": next, "object": object,
+            "ord": ord, "pow": pow, "print": print, "range": range,
+            "repr": repr, "reversed": reversed, "round": round,
+            "set": set, "slice": slice, "sorted": sorted, "str": str,
+            "sum": sum, "tuple": tuple, "type": type, "vars": vars,
+            "zip": zip,
+        }
+        module.__dict__["__builtins__"] = _safe_builtins
+        exec(compile(code, f"<dynamic:{tool_name}>", "exec"), module.__dict__)
 
-        self.registry.register_dynamic(tool_name, schema)
-        logger.info("Dynamic tool '%s' registered in isolated worker", tool_name)
+        fn = getattr(module, tool_name, None)
+        if fn is None:
+            raise RuntimeError(f"Synthesised code does not define function '{tool_name}'")
+
+        try:
+            schema = _json.loads(schema_json)
+        except Exception as exc:
+            raise RuntimeError(f"Invalid schema JSON for '{tool_name}': {exc}")
+
+        self.registry.register_dynamic(tool_name, fn, schema)
+        logger.info(f"Dynamic tool '{tool_name}' registered via SkillRegistry")
 
     def get_system_1_available(self) -> bool:
         """System 1 (local Ollama) is always considered available."""
@@ -2606,8 +2389,8 @@ Rules:
         Route to System 2. Priority: Ollama Cloud > Groq > Gemini.
         Returns a :class:`RouterResult` — never raises for security intercepts.
         """
-        cooldown_active, msg = self._groq_cooldown_active()
-        if cooldown_active:
+        if self._system2_cooldown_until and time.time() < self._system2_cooldown_until:
+            msg = self._format_cooldown_message() or "Rate limited. Please try again later."
             return RouterResult(status="ok", content=f"[System 2 - Error]: {msg}")
 
         sanitized_messages = self._prepare_system_2_messages(messages)
@@ -2819,15 +2602,15 @@ Rules:
         match = re.search(r"try again in (\d+)m(\d+(?:\.\d+)?)s", err_text)
         if match:
             cooldown_seconds = int(match.group(1)) * 60 + int(float(match.group(2)))
-        current_cooldown_until = float(getattr(self, "_system2_cooldown_until", 0.0) or 0.0)
-        parsed_cooldown_until = time.time() + cooldown_seconds
-        self._system2_cooldown_until = max(current_cooldown_until, parsed_cooldown_until)
+        self._system2_cooldown_until = time.time() + cooldown_seconds
         # Persist cooldown so it survives a bot restart
         if self._persist_cooldown_cb is not None:
+            import asyncio as _asyncio
             try:
-                self._persist_cooldown_cb(self._system2_cooldown_until)
-            except Exception as persist_error:
-                logger.warning("Failed to schedule Groq cooldown persistence: %s", persist_error)
+                task = _asyncio.create_task(self._persist_cooldown_cb(self._system2_cooldown_until))
+                self._cooldown_persist_task = task
+            except RuntimeError:
+                pass  # No running event loop (e.g., during tests)
         msg = self._format_cooldown_message() or "Rate limited. Please try again later."
         logger.warning(f"Groq rate limit hit: {msg}")
         return RouterResult(status="ok", content=f"[System 2 - Error]: {msg}")
@@ -3061,10 +2844,6 @@ Rules:
         allowed_tools: Optional[List[str]] = None
     ) -> RouterResult:
         """Route to Groq API (llama-3.3-70b or configured model) with full tool calling."""
-        cooldown_active, msg = self._groq_cooldown_active()
-        if cooldown_active:
-            return RouterResult(status="ok", content=f"[System 2 - Error]: {msg}")
-
         logger.info(f"Routing to System 2 (Groq/{self.groq_model})")
         try:
             response = await self._create_groq_completion(messages, allowed_tools=allowed_tools)
