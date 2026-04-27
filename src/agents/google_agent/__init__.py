@@ -29,6 +29,8 @@ class GoogleAgentTaskError(RuntimeError):
 
 
 class GoogleAgent(BaseAgent):
+    MIN_CHILD_POLL_INTERVAL_SECONDS = 0.05
+
     allowed_tool_names = [
         "read_inbox",
         "send_email",
@@ -47,7 +49,10 @@ class GoogleAgent(BaseAgent):
         **kwargs: Any,
     ) -> None:
         super().__init__(**kwargs)
-        self.child_poll_interval_seconds = max(0.05, float(child_poll_interval_seconds))
+        self.child_poll_interval_seconds = max(
+            self.MIN_CHILD_POLL_INTERVAL_SECONDS,
+            float(child_poll_interval_seconds),
+        )
         self.child_timeout_seconds = max(self.child_poll_interval_seconds, float(child_timeout_seconds))
 
     async def execute_task(self, task: Dict[str, Any]) -> Dict[str, Any]:

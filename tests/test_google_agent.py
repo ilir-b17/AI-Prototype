@@ -140,7 +140,7 @@ async def test_google_agent_email_request_spawns_aiden_child_and_sends_reply(tmp
         agent.execute_tool = _fake_execute  # type: ignore[assignment]
 
         async def _complete_child_task() -> None:
-            deadline = asyncio.get_running_loop().time() + 2.0
+            deadline = asyncio.get_running_loop().time() + agent.child_timeout_seconds
             while asyncio.get_running_loop().time() <= deadline:
                 cursor = await ledger._db.execute(
                     "SELECT id FROM objective_backlog WHERE tier = 'Task' AND agent_domain = 'aiden' AND parent_id = ? "
