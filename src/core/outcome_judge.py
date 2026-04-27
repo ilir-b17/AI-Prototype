@@ -12,7 +12,7 @@ from __future__ import annotations
 import json
 import logging
 import re
-from typing import Any, Dict, Optional, TYPE_CHECKING
+from typing import Any, Dict, Optional, Set, TYPE_CHECKING
 
 if TYPE_CHECKING:
     from src.memory.ledger_db import LedgerMemory
@@ -82,7 +82,7 @@ class OutcomeJudge:
         return False
 
     @staticmethod
-    def _tokenize(text: str) -> set[str]:
+    def _tokenize(text: str) -> Set[str]:
         """Return a set of lower-case tokens (length ≥ _MIN_TOKEN_LEN)."""
         return {
             w.lower()

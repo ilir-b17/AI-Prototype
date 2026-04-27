@@ -43,6 +43,9 @@ VALID_TASK_STATUSES_LIST = [s.value for s in TaskStatus]
 _SQL_TEXT_DEFAULT_EMPTY = "TEXT NOT NULL DEFAULT ''"
 _SQL_INT_DEFAULT_ZERO = "INTEGER NOT NULL DEFAULT 0"
 _MAX_PENDING_TTL_SECONDS = 31_536_000
+# Energy estimation accuracy threshold: tasks estimated within this fraction
+# of actual energy are counted as "accurate" in /learnings output.
+_ENERGY_ACCURACY_THRESHOLD = 0.5
 
 
 class LedgerMemory:
@@ -1580,7 +1583,7 @@ class LedgerMemory:
         for row in energy_rows:
             estimated = float(row["estimated_energy"])
             actual = float(row["actual_energy_used"])
-            if actual > 0 and abs(estimated - actual) / actual <= 0.5:
+            if actual > 0 and abs(estimated - actual) / actual <= _ENERGY_ACCURACY_THRESHOLD:
                 accurate += 1
 
         energy_accuracy_pct = (

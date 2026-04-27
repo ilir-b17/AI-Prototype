@@ -764,7 +764,7 @@ async def learnings(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                 f"avg={item['avg_score']:.1f}/5 (n={item['count']})"
             )
 
-    lines.append("\n\u26a1 Energy estimation accuracy (last 30 days):")
+    lines.append(f"\n\u26a1 Energy estimation accuracy (last {days} days):")
     if accuracy is not None:
         lines.append(
             f"  {accuracy}% of tasks estimated within ±50% of actual "

@@ -240,7 +240,8 @@ async def test_get_outcome_learnings_energy_accuracy(tmp_path: Path):
 
         result = await ledger.get_outcome_learnings(days=30)
         assert result["energy_accuracy_sample"] == 2
-        # 1 out of 2 tasks is accurate → 50%
+        # 1 out of 2 tasks is accurate (within the _ENERGY_ACCURACY_THRESHOLD=50%)
+        # → 50.0%; this assertion depends on the threshold constant
         assert result["energy_accuracy_pct"] == 50.0
     finally:
         await ledger.close()
