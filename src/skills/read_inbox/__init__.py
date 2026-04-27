@@ -14,6 +14,8 @@ import imaplib
 
 from src.skills._common.path_guard import get_default_allowed_roots, resolve_confined_path
 
+MAX_PATH_SEGMENT_LENGTH = 120
+
 
 def _downloads_dir() -> str:
     return os.path.abspath(
@@ -65,7 +67,7 @@ def _sanitize_segment(value: str, fallback: str) -> str:
         return fallback
     raw = raw.strip("<>")
     sanitized = re.sub(r"[^A-Za-z0-9._-]", "_", raw)
-    return sanitized[:120] or fallback
+    return sanitized[:MAX_PATH_SEGMENT_LENGTH] or fallback
 
 
 def _extract_body(message: Message) -> str:
@@ -212,6 +214,9 @@ def _read_inbox_sync(max_emails: int, folder: str, mark_as_read: bool) -> str:
 
             raw_message = None
             for item in payload:
+                # IMAP fetch response is typically a tuple like:
+                # (b'<sequence-id> (RFC822 {bytes})', raw_rfc822_bytes)
+                # where index 1 contains the RFC822 body bytes.
                 if isinstance(item, tuple) and len(item) >= 2 and isinstance(item[1], (bytes, bytearray)):
                     raw_message = bytes(item[1])
                     break
