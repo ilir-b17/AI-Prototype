@@ -1360,7 +1360,10 @@ class LedgerMemory:
         return [self._normalize_objective_row(row) for row in rows]
 
     async def get_completed_tasks_pending_notification(self, limit: int = 50) -> List[Dict[str, Any]]:
-        """Return terminal non-AIDEN domain tasks not yet reported to admin."""
+        """Return terminal non-AIDEN domain tasks not yet reported to admin.
+
+        Terminal statuses currently include: completed, failed, and blocked.
+        """
         async with self._lock:
             cursor = await self._db.execute(
                 "SELECT id, tier, title, status, priority, estimated_energy, "
@@ -1384,13 +1387,15 @@ class LedgerMemory:
     async def mark_tasks_admin_notified(self, task_ids: List[int]) -> None:
         """Mark a set of Task rows as already notified to admin."""
         normalized_ids: List[int] = []
+        seen_ids = set()
         for task_id in task_ids or []:
             try:
                 normalized = int(task_id)
             except (TypeError, ValueError):
                 continue
-            if normalized > 0 and normalized not in normalized_ids:
+            if normalized > 0 and normalized not in seen_ids:
                 normalized_ids.append(normalized)
+                seen_ids.add(normalized)
         if not normalized_ids:
             return
 

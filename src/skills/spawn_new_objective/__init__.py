@@ -53,7 +53,7 @@ async def spawn_new_objective(
                 "id": obj_id,
                 "tier": tier,
                 "title": title,
-                "agent_domain": (str(agent_domain).strip() if agent_domain is not None else None),
+                "agent_domain": (agent_domain.strip() if isinstance(agent_domain, str) else None),
             }
         }, indent=2)
     except Exception as exc:

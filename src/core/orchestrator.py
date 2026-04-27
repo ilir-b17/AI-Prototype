@@ -160,6 +160,8 @@ _GOAL_PLANNER_COMPLEXITY_THRESHOLD = int(os.getenv("GOAL_PLANNER_COMPLEXITY_THRE
 _HEARTBEAT_FAILURE_STRIKES = int(os.getenv("HEARTBEAT_FAILURE_STRIKES", "3"))
 _HEARTBEAT_FAILURE_STATE_KEY = "heartbeat_task_failure_counts"
 HEARTBEAT_TASK_PREFIX_FMT = "[HEARTBEAT TASK #{task_id}]"
+_NOTIFIABLE_DOMAIN_RESULTS = {"google"}
+_DOMAIN_RESULT_SUMMARY_MAX_LENGTH = 220
 _ERROR_RESPONSE_PREFIXES = (
     "Supervisor encountered an error",
     "Both local and cloud reasoning failed",
@@ -3263,18 +3265,18 @@ class Orchestrator:
         for key in ("summary", "result_summary", "final_answer", "message", "result", "content"):
             value = result_payload.get(key)
             if isinstance(value, str) and value.strip():
-                return value.strip()[:220]
+                return value.strip()[:_DOMAIN_RESULT_SUMMARY_MAX_LENGTH]
         compact = json.dumps(result_payload, ensure_ascii=False)
-        return compact[:220] if compact else "No summary provided"
+        return compact[:_DOMAIN_RESULT_SUMMARY_MAX_LENGTH] if compact else "No summary provided"
 
     @staticmethod
     def _extract_domain_task_error(result_payload: Dict[str, Any]) -> str:
         for key in ("error", "message", "details", "reason"):
             value = result_payload.get(key)
             if isinstance(value, str) and value.strip():
-                return value.strip()[:220]
+                return value.strip()[:_DOMAIN_RESULT_SUMMARY_MAX_LENGTH]
         compact = json.dumps(result_payload, ensure_ascii=False)
-        return compact[:220] if compact else "Unknown error"
+        return compact[:_DOMAIN_RESULT_SUMMARY_MAX_LENGTH] if compact else "Unknown error"
 
     async def _notify_completed_domain_tasks(self) -> None:
         query_pending = getattr(self.ledger_memory, "get_completed_tasks_pending_notification", None)
@@ -3295,7 +3297,12 @@ class Orchestrator:
             if task_id <= 0:
                 continue
             domain = str(task.get("agent_domain") or "").strip().lower()
-            if domain != "google":
+            if domain not in _NOTIFIABLE_DOMAIN_RESULTS:
+                logger.debug(
+                    "Domain result monitor: skipping task #%s for non-notifiable domain '%s'.",
+                    task_id,
+                    domain,
+                )
                 continue
 
             title = str(task.get("title") or "").strip() or f"Task #{task_id}"
