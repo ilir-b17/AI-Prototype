@@ -5302,6 +5302,8 @@ class Orchestrator:
 
         max_size = max(1, int(os.getenv("CONSOLIDATION_TURN_COUNTS_MAX_SIZE", "100")))
         counts = self._consolidation_turn_counts
+        # Tests and compatibility paths may construct Orchestrator via __new__()
+        # or restore this attribute from persisted plain-dict JSON.
         if not isinstance(counts, OrderedDict):
             counts = OrderedDict(counts)
             self._consolidation_turn_counts = counts
@@ -5534,7 +5536,7 @@ class Orchestrator:
                 )
                 return f"{deferred_follow_up['reply_text']}\n\n{follow_up_response}".strip()
 
-            raise RuntimeError("process_message exited without producing a response")
+            raise RuntimeError("Unreachable: process_message must produce a response or raise an exception")
         finally:
             if emitter is not None:
                 await emitter.flush_pending()
