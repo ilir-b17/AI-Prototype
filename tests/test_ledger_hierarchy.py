@@ -145,6 +145,20 @@ async def test_claim_task_same_agent_is_idempotent(tmp_path: Path):
 
 
 @pytest.mark.asyncio
+async def test_write_task_result_rejects_non_dict_payload(tmp_path: Path):
+    ledger = LedgerMemory(db_path=str(tmp_path / "blackboard_invalid_result_ledger.db"))
+    await ledger.initialize()
+    try:
+        epic_id = await ledger.add_objective(tier="Epic", title="Blackboard Epic")
+        story_id = await ledger.add_objective(tier="Story", title="Blackboard Story", parent_id=epic_id)
+        task_id = await ledger.add_objective(tier="Task", title="Domain task", parent_id=story_id)
+        with pytest.raises(ValueError):
+            await ledger.write_task_result(task_id, None)  # type: ignore[arg-type]
+    finally:
+        await ledger.close()
+
+
+@pytest.mark.asyncio
 async def test_active_tree_returns_only_active_nodes_and_preserves_hierarchy_fields(tmp_path: Path):
     ledger = LedgerMemory(db_path=str(tmp_path / "tree_ledger.db"))
     await ledger.initialize()

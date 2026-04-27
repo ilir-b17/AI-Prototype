@@ -199,6 +199,10 @@ class LedgerMemory:
                 CREATE INDEX IF NOT EXISTS idx_objective_next_eligible ON objective_backlog(next_eligible_at)
             """)
             await self._db.execute("""
+                CREATE INDEX IF NOT EXISTS idx_objective_blackboard_pending
+                ON objective_backlog(agent_domain, status, claimed_by, next_eligible_at)
+            """)
+            await self._db.execute("""
                 CREATE TABLE IF NOT EXISTS chat_history (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     user_id TEXT NOT NULL,
@@ -1199,14 +1203,16 @@ class LedgerMemory:
 
     async def claim_task(self, task_id: int, agent_name: str) -> bool:
         """Atomically claim a pending Task; returns False if already claimed by another agent."""
-        claimed = False
         owner = str(agent_name or "").strip()
         if not owner:
             raise ValueError("agent_name must be a non-empty string")
+        row = None
 
         async with self._lock:
-            await self._db.execute("BEGIN IMMEDIATE")
+            tx_started = False
             try:
+                await self._db.execute("BEGIN IMMEDIATE")
+                tx_started = True
                 cursor = await self._db.execute(
                     "UPDATE objective_backlog "
                     "SET claimed_by = ?, claimed_at = CURRENT_TIMESTAMP, status = 'active', "
@@ -1215,8 +1221,7 @@ class LedgerMemory:
                     "AND (next_eligible_at IS NULL OR datetime(next_eligible_at) <= CURRENT_TIMESTAMP)",
                     (owner, task_id),
                 )
-                claimed = bool(cursor.rowcount and cursor.rowcount > 0)
-                if claimed:
+                if bool(cursor.rowcount and cursor.rowcount > 0):
                     await self._db.commit()
                     return True
 
@@ -1227,7 +1232,8 @@ class LedgerMemory:
                 row = await row_cursor.fetchone()
                 await self._db.commit()
             except Exception:
-                await self._db.rollback()
+                if tx_started:
+                    await self._db.rollback()
                 raise
 
         if row is None:
@@ -1239,7 +1245,9 @@ class LedgerMemory:
 
     async def write_task_result(self, task_id: int, result: dict) -> None:
         """Persist task result payload and mark the Task as completed."""
-        result_payload = dict(result or {})
+        if not isinstance(result, dict):
+            raise ValueError("result must be a dict")
+        result_payload = dict(result)
         result_json = json.dumps(result_payload, sort_keys=True)
         updated = False
         async with self._lock:
