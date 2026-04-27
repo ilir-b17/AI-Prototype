@@ -256,7 +256,7 @@ class GoogleAgent(BaseAgent):
             "send_email",
             {
                 "recipient": sender,
-                "subject": f"Re: {subject}" if subject else "Re: your request",
+                "subject": f"Re: {subject}" if subject else "Re: (no subject)",
                 "body": body,
             },
         )
@@ -292,9 +292,6 @@ class GoogleAgent(BaseAgent):
             sender_ok = not wanted_sender or wanted_sender in sender
             subject_ok = not wanted_subject or wanted_subject in subject
             if sender_ok and subject_ok:
-                return item
-        for item in emails:
-            if isinstance(item, dict):
                 return item
         return None
 

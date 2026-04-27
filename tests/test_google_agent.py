@@ -142,14 +142,11 @@ async def test_google_agent_email_request_spawns_aiden_child_and_sends_reply(tmp
         async def _complete_child_task() -> None:
             deadline = asyncio.get_running_loop().time() + agent.child_timeout_seconds
             while asyncio.get_running_loop().time() <= deadline:
-                cursor = await ledger._db.execute(
-                    "SELECT id FROM objective_backlog WHERE tier = 'Task' AND agent_domain = 'aiden' AND parent_id = ? "
-                    "ORDER BY id DESC LIMIT 1",
-                    (story_id,),
-                )
-                row = await cursor.fetchone()
-                if row:
-                    await ledger.write_task_result(int(row["id"]), {"final_answer": "Here is the completed response."})
+                pending_aiden = await ledger.get_pending_tasks_for_domain("aiden", limit=10)
+                child_tasks = [row for row in pending_aiden if int(row.get("parent_id") or 0) == story_id]
+                if child_tasks:
+                    child_id = int(child_tasks[0]["id"])
+                    await ledger.write_task_result(child_id, {"final_answer": "Here is the completed response."})
                     return
                 await asyncio.sleep(0.05)
             raise AssertionError("Child task was not created")
