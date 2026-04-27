@@ -216,7 +216,7 @@ class GoogleAgent(BaseAgent):
             "recipient": "",
             "subject": "",
             "attachment_paths": [],
-            "error": "" if created > 0 else "no_qualifying_emails_found",
+            "error": "",
             "objectives_created": created,
         }
 
