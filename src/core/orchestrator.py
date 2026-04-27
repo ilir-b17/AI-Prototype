@@ -76,6 +76,7 @@ _PENDING_STATE_TTL_SECONDS = int(os.getenv("PENDING_STATE_TTL_SECONDS", "86400")
 _SYNTHESIS_SELF_TEST_TIMEOUT_DEFAULT_SECONDS = 12.0
 _MAX_SYNTHESIS_RETRIES = int(os.getenv("MAX_SYNTHESIS_RETRIES", "3"))
 _CONSOLIDATION_TRIGGER_TURNS = int(os.getenv("CONSOLIDATION_TRIGGER_TURNS", "10"))
+_CONSOLIDATION_TURN_COUNTS_MAX_SIZE_DEFAULT = 100
 _SAFE_SUBPROCESS_ENV_KEYS = {
     "PATH",
     "SYSTEMROOT",
@@ -5300,7 +5301,13 @@ class Orchestrator:
         if not hasattr(self, "_consolidation_turn_counts"):
             self._consolidation_turn_counts = OrderedDict()
 
-        max_size = max(1, int(os.getenv("CONSOLIDATION_TURN_COUNTS_MAX_SIZE", "100")))
+        max_size = max(
+            1,
+            int(os.getenv(
+                "CONSOLIDATION_TURN_COUNTS_MAX_SIZE",
+                str(_CONSOLIDATION_TURN_COUNTS_MAX_SIZE_DEFAULT),
+            )),
+        )
         counts = self._consolidation_turn_counts
         # Tests and compatibility paths may construct Orchestrator via __new__()
         # or restore this attribute from persisted plain-dict JSON.
@@ -5529,17 +5536,12 @@ class Orchestrator:
                         user_prompt=user_prompt,
                     )
 
-            if deferred_follow_up is not None:
-                follow_up_response = await self.process_message(
-                    deferred_follow_up["follow_up_input"],
-                    user_id,
-                )
-                return f"{deferred_follow_up['reply_text']}\n\n{follow_up_response}".strip()
-
-            raise RuntimeError(
-                "Internal error: process_message reached an unreachable state "
-                "without returning a response or deferred follow-up"
+            follow_up = deferred_follow_up
+            follow_up_response = await self.process_message(
+                follow_up["follow_up_input"],
+                user_id,
             )
+            return f"{follow_up['reply_text']}\n\n{follow_up_response}".strip()
         finally:
             if emitter is not None:
                 await emitter.flush_pending()

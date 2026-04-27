@@ -42,6 +42,7 @@ VALID_TASK_STATUSES = {s.value for s in TaskStatus}
 VALID_TASK_STATUSES_LIST = [s.value for s in TaskStatus]
 _SQL_TEXT_DEFAULT_EMPTY = "TEXT NOT NULL DEFAULT ''"
 _SQL_INT_DEFAULT_ZERO = "INTEGER NOT NULL DEFAULT 0"
+_MAX_PENDING_TTL_SECONDS = 31_536_000
 
 
 class LedgerMemory:
@@ -727,7 +728,7 @@ class LedgerMemory:
         ttl = self._pending_ttl_seconds() if ttl_seconds is None else max(0, int(ttl_seconds))
         # Cap persisted pending-state TTLs at one year to avoid pathological
         # SQLite datetime intervals while still allowing long local outages.
-        ttl = min(ttl, 31_536_000)
+        ttl = min(ttl, _MAX_PENDING_TTL_SECONDS)
         modifier = f"-{ttl} seconds"
         deleted: Dict[str, int] = {}
 
