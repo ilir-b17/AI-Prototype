@@ -273,6 +273,7 @@ class Orchestrator:
                 0,
                 int(os.getenv("INITIAL_ENERGY_BUDGET", "100")),
             )
+            self._predictive_energy_budget_last_replenished_at = time.time()
             self._predictive_energy_budget_lock: asyncio.Lock = asyncio.Lock()
 
             self.charter_text = self._load_charter()
@@ -313,6 +314,9 @@ class Orchestrator:
         await self._restore_persisted_groq_cooldown()
 
         await self.ledger_memory.seed_initial_goals()
+        restart_callback = getattr(self.cognitive_router, "set_dynamic_tool_restart_callback", None)
+        if callable(restart_callback):
+            restart_callback(self._reload_dynamic_tools_after_worker_restart)
         await self._load_approved_tools()
         await self._load_pending_approvals()
         await self._load_pending_mfa()
@@ -324,7 +328,12 @@ class Orchestrator:
             except Exception as _preload_err:
                 logger.warning("System 1 preload skipped: %s", _preload_err)
         self._compiled_graph = build_orchestrator_graph(self)
-        set_runtime_context(self.ledger_memory, self.core_memory, self.vector_memory)
+        set_runtime_context(
+            self.ledger_memory,
+            self.core_memory,
+            self.vector_memory,
+            orchestrator=self,
+        )
         # Record the host OS now that we're in an async context
         await self.core_memory.update("host_os", platform.system())
         # Startup pruning: remove stale chat_history rows
@@ -2988,14 +2997,6 @@ class Orchestrator:
                 blocked_result = result[_BLOCKED_KEY]
 
         if blocked_result is not None:
-            unused_energy = sum(
-                agent_def.energy_cost
-                for (agent_def, _task_packet), result in zip(batch, results)
-                if not isinstance(result, Exception) and not result.get(_BLOCKED_KEY)
-            )
-            if unused_energy > 0:
-                state = self._refund_energy(state, unused_energy, "parallel_agents_blocked_unused")
-                await self._refund_predictive_energy_budget(unused_energy, "parallel_agents_blocked_unused")
             state[_BLOCKED_KEY] = blocked_result
             return state
 
@@ -3562,6 +3563,7 @@ class Orchestrator:
                 self.pending_tool_approval[user_id] = {
                     "synthesis": payload["synthesis"],
                     "original_state": {"user_input": payload["original_input"], "user_id": user_id},
+                    "_created_at": float(payload.get("_created_at") or time.time()),
                 }
             if pending:
                 logger.info(f"Restored {len(pending)} pending tool approval(s) from DB")
@@ -5284,14 +5286,29 @@ class Orchestrator:
         except Exception as e:
             logger.warning(f"Failed to save chat turn for {user_id}: {e}")
 
+        if self._increment_consolidation_turn_count(user_id):
+            self._fire_and_forget(self._consolidate_memory(user_id))
+
+    def _increment_consolidation_turn_count(self, user_id: str) -> bool:
         if not hasattr(self, "_consolidation_turn_counts"):
             self._consolidation_turn_counts = {}
 
+        max_size = max(1, int(os.getenv("CONSOLIDATION_TURN_COUNTS_MAX_SIZE", "100")))
+        counts = self._consolidation_turn_counts
+        if user_id in counts:
+            current_count = int(counts.pop(user_id) or 0)
+        else:
+            current_count = 0
+
+        counts[user_id] = current_count + 1
+        while len(counts) > max_size:
+            counts.pop(next(iter(counts)), None)
+
         trigger_turns = max(1, _CONSOLIDATION_TRIGGER_TURNS)
-        self._consolidation_turn_counts[user_id] = self._consolidation_turn_counts.get(user_id, 0) + 1
-        if self._consolidation_turn_counts[user_id] >= trigger_turns:
-            self._consolidation_turn_counts[user_id] = 0
-            self._fire_and_forget(self._consolidate_memory(user_id))
+        if counts.get(user_id, 0) >= trigger_turns:
+            counts[user_id] = 0
+            return True
+        return False
 
     def _schedule_response_memory_save(self, user_message: str, final_resp: str) -> None:
         self._fire_and_forget(
@@ -5466,14 +5483,12 @@ class Orchestrator:
                         int(os.getenv("INITIAL_ENERGY_BUDGET", "100")),
                     )
 
-                async with self._predictive_energy_budget_lock:
-                    replenishment = int(os.getenv("ENERGY_REPLENISH_PER_TURN", "5"))
-                    cap = int(os.getenv("INITIAL_ENERGY_BUDGET", "100"))
-                    self._predictive_energy_budget_remaining = min(
-                        self._predictive_energy_budget_remaining + replenishment, cap
-                    )
-                    if hasattr(self, "_energy_budget"):
-                        self._energy_budget = self._predictive_energy_budget_remaining
+                if not hasattr(self, "_predictive_energy_budget_last_replenished_at"):
+                    self._predictive_energy_budget_last_replenished_at = time.time()
+
+                if str(user_id or "").strip() != "heartbeat":
+                    async with self._predictive_energy_budget_lock:
+                        self._replenish_predictive_energy_budget_wallclock_locked()
 
                 reply = await self._try_resume_mfa(user_id, normalized_user_message)
                 if reply is not None:
@@ -5624,23 +5639,36 @@ class Orchestrator:
         except Exception as e:
             logger.error(f"Background tool synthesis failed: {e}", exc_info=True)
 
+    async def aclose(self) -> None:
+        """Close async and sync resources owned by the orchestrator."""
+        set_runtime_context(None, None, None, orchestrator=None)
+
+        tasks = [
+            task
+            for task in list(getattr(self, "_background_tasks", set()) or [])
+            if task is not asyncio.current_task()
+        ]
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+            self._background_tasks.difference_update(tasks)
+
+        if hasattr(self, "cognitive_router") and self.cognitive_router:
+            await self.cognitive_router.close()
+        if hasattr(self, "ledger_memory") and self.ledger_memory:
+            await self.ledger_memory.close()
+        if hasattr(self, "vector_memory") and self.vector_memory:
+            self.vector_memory.close()
+
+        logger.info("Orchestrator resources cleaned up")
+
     def close(self) -> None:
         try:
-            set_runtime_context(None, None, None)
-            if hasattr(self, 'vector_memory') and self.vector_memory:
-                self.vector_memory.close()
-            if hasattr(self, 'cognitive_router') and self.cognitive_router:
-                # Schedule async close — best-effort at shutdown time
-                try:
-                    loop = asyncio.get_event_loop()
-                    if loop.is_running():
-                        loop.create_task(self.cognitive_router.close())
-                        loop.create_task(self.ledger_memory.close())
-                    else:
-                        loop.run_until_complete(self.cognitive_router.close())
-                        loop.run_until_complete(self.ledger_memory.close())
-                except Exception:
-                    pass
-            logger.info("Orchestrator resources cleaned up")
+            loop = asyncio.get_event_loop()
+            if loop.is_running():
+                loop.create_task(self.aclose())
+            else:
+                loop.run_until_complete(self.aclose())
         except Exception as e:
             logger.error(f"Error closing Orchestrator: {e}", exc_info=True)

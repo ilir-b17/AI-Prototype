@@ -715,6 +715,30 @@ class LedgerMemory:
         except Exception as e:
             logger.error(f"Error closing database connection: {e}")
 
+    @staticmethod
+    def _pending_ttl_seconds() -> int:
+        try:
+            return max(0, int(os.getenv("PENDING_STATE_TTL_SECONDS", "86400")))
+        except ValueError:
+            return 86400
+
+    async def purge_expired_pending(self, ttl_seconds: Optional[int] = None) -> Dict[str, int]:
+        """Delete expired pending MFA/HITL/tool-approval rows and return per-table counts."""
+        ttl = self._pending_ttl_seconds() if ttl_seconds is None else max(0, int(ttl_seconds))
+        modifier = f"-{ttl} seconds"
+        deleted: Dict[str, int] = {}
+
+        async with self._lock:
+            for table_name in ("pending_tool_approvals", "pending_hitl_states", "pending_mfa_states"):
+                cursor = await self._db.execute(
+                    f"DELETE FROM {table_name} WHERE datetime(created_at) < datetime('now', ?)",
+                    (modifier,),
+                )
+                deleted[table_name] = int(cursor.rowcount or 0)
+            await self._db.commit()
+
+        return deleted
+
     async def append_cloud_payload_audit(
         self,
         *,
@@ -1732,11 +1756,12 @@ class LedgerMemory:
             await self._db.commit()
 
     async def load_pending_approvals(self) -> dict:
-        """Return {user_id: {synthesis, original_input}} for all pending approvals."""
-        import json
+        """Return {user_id: {synthesis, original_input, _created_at}} for all pending approvals."""
+        await self.purge_expired_pending()
         async with self._lock:
             cursor = await self._db.execute(
-                "SELECT user_id, synthesis_json, original_input FROM pending_tool_approvals"
+                "SELECT user_id, synthesis_json, original_input, "
+                "strftime('%s', created_at) AS created_epoch FROM pending_tool_approvals"
             )
             rows = await cursor.fetchall()
         result = {}
@@ -1745,9 +1770,10 @@ class LedgerMemory:
                 result[row["user_id"]] = {
                     "synthesis": json.loads(row["synthesis_json"]),
                     "original_input": row["original_input"],
+                    "_created_at": float(row["created_epoch"] or 0),
                 }
-            except Exception:
-                pass
+            except Exception as e:
+                logger.warning("Could not deserialize pending approval for '%s': %s", row["user_id"], e)
         return result
 
     async def clear_pending_approval(self, user_id: str) -> None:
@@ -2026,16 +2052,20 @@ class LedgerMemory:
 
     async def load_hitl_states(self) -> dict:
         """Return {user_id: state_dict} for all persisted HITL states."""
-        import json as _json
+        await self.purge_expired_pending()
         async with self._lock:
             cursor = await self._db.execute(
-                "SELECT user_id, state_json FROM pending_hitl_states"
+                "SELECT user_id, state_json, strftime('%s', created_at) AS created_epoch "
+                "FROM pending_hitl_states"
             )
             rows = await cursor.fetchall()
         result = {}
         for row in rows:
             try:
-                result[row["user_id"]] = _json.loads(row["state_json"])
+                state = json.loads(row["state_json"])
+                if isinstance(state, dict) and "_hitl_created_at" not in state:
+                    state["_hitl_created_at"] = float(row["created_epoch"] or 0)
+                result[row["user_id"]] = state
             except Exception as e:
                 logger.warning(f"Could not deserialize HITL state for user '{row['user_id']}': {e}")
         return result
@@ -2090,10 +2120,11 @@ class LedgerMemory:
 
     async def load_mfa_states(self) -> dict:
         """Return {user_id: {name, arguments, _created_at}} for all persisted MFA states."""
-        import json as _json
+        await self.purge_expired_pending()
         async with self._lock:
             cursor = await self._db.execute(
-                "SELECT user_id, tool_name, arguments_json, created_at FROM pending_mfa_states"
+                "SELECT user_id, tool_name, arguments_json, strftime('%s', created_at) AS created_epoch "
+                "FROM pending_mfa_states"
             )
             rows = await cursor.fetchall()
         result = {}
@@ -2101,8 +2132,8 @@ class LedgerMemory:
             try:
                 result[row["user_id"]] = {
                     "name": row["tool_name"],
-                    "arguments": _json.loads(row["arguments_json"]),
-                    "_created_at": row["created_at"],
+                    "arguments": json.loads(row["arguments_json"]),
+                    "_created_at": float(row["created_epoch"] or 0),
                 }
             except Exception as e:
                 logger.warning("Could not deserialize MFA state for '%s': %s", row["user_id"], e)
