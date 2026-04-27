@@ -19,6 +19,7 @@ import tempfile
 import time
 from datetime import datetime
 from typing import Dict, Any, List, Optional, Callable, Awaitable
+import xml.etree.ElementTree as ET
 
 try:
     import psutil
@@ -378,7 +379,7 @@ class Orchestrator:
     def _enforce_charter_policy(self) -> None:
         validate_mfa_configuration()
         allow_missing = os.getenv("ALLOW_MISSING_CHARTER", "false").strip().lower() in {"1", "true", "yes"}
-        if self.charter_text == self._CHARTER_FALLBACK:
+        if getattr(self, "charter_text", "") == self._CHARTER_FALLBACK:
             if not allow_missing:
                 raise RuntimeError(
                     "FATAL: charter.md not found or empty. The moral evaluation framework cannot operate. "
@@ -388,6 +389,14 @@ class Orchestrator:
             logger.warning(
                 "SECURITY: Running without a full charter. Charter enforcement will be minimal."
             )
+            return
+        try:
+            ET.fromstring(str(self.charter_text or ""))
+        except ET.ParseError as exc:
+            if not allow_missing:
+                raise RuntimeError(f"FATAL: malformed charter.md XML: {exc}") from exc
+            logger.warning("SECURITY: Malformed charter allowed by override; using fallback charter.")
+            self.charter_text = self._CHARTER_FALLBACK
 
     def _refresh_sensory_state(self) -> None:
         """Snapshot current machine state into self.sensory_state."""
@@ -4308,6 +4317,28 @@ class Orchestrator:
             f"─────────────────────────────\n"
             f"Reply YES to approve and deploy, or NO to reject."
         )
+        if len(hitl_msg) > 3500:
+            attachment = tempfile.NamedTemporaryFile(
+                "w",
+                encoding="utf-8",
+                suffix=f"_{synthesis['tool_name']}.py",
+                delete=False,
+            )
+            with attachment:
+                attachment.write(str(synthesis["code"]))
+            compact_msg = (
+                f"🔧 TOOL SYNTHESIS REQUEST\n\n"
+                f"System 1 could not answer: \"{state['user_input']}\"\n"
+                f"Gap identified: {gap_description}\n\n"
+                f"Name: {synthesis['tool_name']}\n"
+                f"Description: {synthesis['description']}\n"
+                f"Sandboxed self-test: {test_summary}\n"
+                f"Cryptographic proof (SHA-256 tool+tests): {proof_sha256}\n"
+                f"Audit run id: {synthesis_run_id if synthesis_run_id is not None else 'n/a'}\n\n"
+                "Code attached as Telegram document.\n"
+                "Reply YES to approve and deploy, or NO to reject."
+            )
+            return {"text": compact_msg[:3500], "document_path": attachment.name}
         return hitl_msg
 
     def _extract_router_content(self, result: RouterResult) -> Optional[str]:
@@ -4464,8 +4495,22 @@ class Orchestrator:
             state["final_response"] = output_to_eval
         return state
 
+    def _extract_charter_tier_block(self, charter_text: str, tier_tag: Optional[str] = None) -> str:
+        if tier_tag is None:
+            tier_tag = str(charter_text)
+            charter_text = getattr(self, "charter_text", "")
+        pattern = rf"<{re.escape(tier_tag)}[^>]*>(.*?)</{re.escape(tier_tag)}>"
+        match = re.search(pattern, str(charter_text or ""), flags=re.IGNORECASE | re.DOTALL)
+        if not match:
+            return ""
+        return re.sub(r"\n{3,}", "\n\n", match.group(1).strip())
+
     @staticmethod
-    def _extract_charter_tier_block(charter_text: str, tier_tag: str) -> str:
+    def _extract_charter_tier_block_from_text(charter_text: str, tier_tag: str) -> str:
+        try:
+            ET.fromstring(str(charter_text or ""))
+        except ET.ParseError as exc:
+            return f"[MALFORMED_CHARTER_XML: {exc}]"
         pattern = rf"<{re.escape(tier_tag)}[^>]*>(.*?)</{re.escape(tier_tag)}>"
         match = re.search(pattern, str(charter_text or ""), flags=re.IGNORECASE | re.DOTALL)
         if not match:
@@ -4751,6 +4796,13 @@ class Orchestrator:
         """Checks worker output against the charter. Skipped for direct supervisor responses."""
         state = normalize_state(state)
         output_to_eval = self._get_output_to_evaluate(state)
+
+        if getattr(self, "charter_text", "") == self._CHARTER_FALLBACK:
+            logger.warning("Critic disabled because fallback charter is active.")
+            self._store_moral_decision_trace(state, build_local_skip_decision("fallback_charter"))
+            state["moral_audit_mode"] = "disabled_fallback_charter"
+            state = self._finalize_critic_pass(state, output_to_eval)
+            return state
 
         if not output_to_eval:
             self._store_moral_decision_trace(
@@ -5216,8 +5268,15 @@ class Orchestrator:
     def _is_error_response(response: str) -> bool:
         return any(response.startswith(prefix) for prefix in _ERROR_RESPONSE_PREFIXES)
 
-    async def _persist_chat_turns(self, user_id: str, user_message: str, final_resp: str) -> None:
-        if user_id == "heartbeat" or self._is_error_response(final_resp):
+    async def _persist_chat_turns(
+        self,
+        user_id: str,
+        user_message: str,
+        final_resp: str,
+        *,
+        turn_failed: bool = False,
+    ) -> None:
+        if user_id == "heartbeat" or turn_failed:
             return
         try:
             await self.ledger_memory.save_chat_turn(user_id, "user", user_message)
@@ -5309,8 +5368,18 @@ class Orchestrator:
             return self.cognitive_router.sanitize_response(state["final_response"])
 
         if not has_audio_prompt:
-            await self._remember_user_profile(user_id, user_message)
+            profile_updated = await self._remember_user_profile(user_id, user_message)
             await self._remember_assistant_identity(user_message)
+            lowered_message = user_message.lower()
+            explicit_memory_request = any(
+                marker in lowered_message
+                for marker in ("remember that", "please remember", "remember i ", "remember my ")
+            )
+            if explicit_memory_request and not profile_updated:
+                await self.vector_memory.add_memory_async(
+                    text=user_message,
+                    metadata={"type": "explicit_memory", "source": "user_request"},
+                )
         else:
             logger.info("Audio prompt detected for %s; bypassing text-only fast-path memory hooks.", user_id)
 

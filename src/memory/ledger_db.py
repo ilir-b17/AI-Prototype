@@ -1420,7 +1420,7 @@ class LedgerMemory:
         statuses: Optional[List[str]] = None,
     ) -> List[dict]:
         """Return Task rows that still have unresolved depends_on_ids."""
-        statuses = statuses or ["pending", "active"]
+        statuses = statuses or ["pending", "active", "deferred_due_to_energy"]
         if not statuses:
             return []
 

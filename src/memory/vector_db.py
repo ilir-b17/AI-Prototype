@@ -83,6 +83,7 @@ class VectorMemory:
                 )
                 logger.info("Created fresh collection after recovery")
 
+            self._normalize_legacy_timestamps()
             logger.info(f"VectorMemory initialized with persistence at {self.persist_dir}")
         except Exception as e:
             logger.error(f"Failed to initialize VectorMemory: {e}")
@@ -92,6 +93,45 @@ class VectorMemory:
         if self._closed or self.collection is None:
             raise RuntimeError("VectorMemory is closed")
         return self.collection
+
+    @staticmethod
+    def _normalize_timestamp_value(value: Any) -> Optional[str]:
+        raw = str(value or "").strip()
+        if not raw:
+            return None
+        if raw.endswith("Z"):
+            raw = raw[:-1] + "+00:00"
+        try:
+            parsed = datetime.fromisoformat(raw)
+        except ValueError:
+            return None
+        if parsed.tzinfo is not None:
+            parsed = parsed.astimezone(timezone.utc).replace(tzinfo=None)
+        return parsed.strftime("%Y-%m-%dT%H:%M:%S")
+
+    def _normalize_legacy_timestamps(self) -> int:
+        try:
+            collection = self._require_open_collection()
+            results = collection.get(include=["metadatas"])
+            ids = list(results.get("ids") or [])
+            metadatas = list(results.get("metadatas") or [])
+            update_ids: List[str] = []
+            update_metadatas: List[Dict[str, Any]] = []
+            for memory_id, metadata in zip(ids, metadatas):
+                if not isinstance(metadata, dict):
+                    continue
+                normalized = self._normalize_timestamp_value(metadata.get("timestamp"))
+                if normalized and normalized != metadata.get("timestamp"):
+                    updated = dict(metadata)
+                    updated["timestamp"] = normalized
+                    update_ids.append(memory_id)
+                    update_metadatas.append(updated)
+            if update_ids:
+                collection.update(ids=update_ids, metadatas=update_metadatas)
+            return len(update_ids)
+        except Exception as exc:
+            logger.debug("Vector timestamp normalization skipped: %s", exc)
+            return 0
 
     def add_memory(
         self,
