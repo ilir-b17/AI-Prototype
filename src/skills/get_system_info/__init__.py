@@ -1,6 +1,6 @@
 import platform
 import logging
-from datetime import datetime
+from datetime import datetime, timezone
 import json
 import psutil
 
@@ -10,7 +10,7 @@ logger = logging.getLogger(__name__)
 def get_system_info() -> str:
     """Returns current datetime, timezone, and host hardware platform details."""
     try:
-        now = datetime.now().astimezone()
+        now = datetime.now().astimezone(timezone.utc)
         tz = now.strftime("%Z %z")
 
         # Hardware specs

@@ -512,9 +512,25 @@ class NocturnalConsolidationSlice1:
     @staticmethod
     def _extract_json_text(raw_response: str) -> str:
         text = str(raw_response or "").strip()
-        if text.startswith("```"):
-            text = re.sub(r"^```(?:json)?\s*", "", text, flags=re.IGNORECASE)
-            text = re.sub(r"\s*```$", "", text).strip()
+
+        # Try to find a fenced code block (```json ... ``` or ``` ... ```) anywhere in the response
+        fenced = re.search(r"```(?:json)?\s*([\s\S]*?)\s*```", text, flags=re.IGNORECASE)
+        if fenced:
+            return fenced.group(1).strip()
+
+        # Try to extract the first complete JSON object or array
+        for start_char, end_char in (("{", "}"), ("[", "]")):
+            start = text.find(start_char)
+            if start != -1:
+                end = text.rfind(end_char)
+                if end > start:
+                    candidate = text[start : end + 1]
+                    try:
+                        json.loads(candidate)
+                        return candidate
+                    except json.JSONDecodeError:
+                        pass
+
         return text
 
     @staticmethod

@@ -647,11 +647,13 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         except Exception:
             energy = "unknown"
 
+    failed_preview = f" ({', '.join(failed_names[:5])})" if failed_names else ""
+
     text = (
         "AIDEN status\n"
         f"Loaded skills: {loaded_skills}\n"
         f"Failed skills: {len(failed_names)}"
-        f"{f' ({', '.join(failed_names[:5])})' if failed_names else ''}\n"
+        f"{failed_preview}\n"
         f"Pending MFA: {len(getattr(orchestrator_inst, 'pending_mfa', {}) or {})}\n"
         f"Pending HITL: {len(getattr(orchestrator_inst, 'pending_hitl_state', {}) or {})}\n"
         f"Predictive energy budget: {energy}"

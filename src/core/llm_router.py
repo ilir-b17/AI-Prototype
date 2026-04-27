@@ -338,6 +338,7 @@ class CognitiveRouter:
 
         Removes:
         - <think>…</think> and <reasoning>…</reasoning> blocks (local model CoT)
+        - <agent_output>…</agent_output> structured blocks
         - [CRITIC FEEDBACK: …] injected annotations
         - WORKERS: […] supervisor tags
         - [ADMIN GUIDANCE: …] and [HEARTBEAT TASK …] prefixes
@@ -349,6 +350,7 @@ class CognitiveRouter:
         # Chain-of-thought blocks produced by some local models
         text = re.sub(r'<think>.*?</think>', '', text, flags=re.DOTALL | re.IGNORECASE)
         text = re.sub(r'<reasoning>.*?</reasoning>', '', text, flags=re.DOTALL | re.IGNORECASE)
+        text = re.sub(r'<agent_output>.*?</agent_output>', '', text, flags=re.DOTALL | re.IGNORECASE)
 
         # Internal annotation tags injected by the orchestrator loop
         text = re.sub(r'\[CRITIC FEEDBACK[^\n]*\n?', '', text, flags=re.IGNORECASE)
@@ -367,9 +369,27 @@ class CognitiveRouter:
             flags=re.IGNORECASE,
         )
 
-        # Internal planning/scratchpad sections the model sometimes generates
-        # Strips: ## ⚙️ Section Title, [Output Draft], [Internal Critique], [Finalized Deliverable]
-        text = re.sub(r'^#{1,3}\s.*$', '', text, flags=re.MULTILINE)
+        # Internal planning/scratchpad sections the model sometimes generates.
+        # Keep ordinary user-facing markdown headings; only strip known internal headers.
+        internal_heading_markers = (
+            "scratch",
+            "scratchpad",
+            "plan",
+            "internal critique",
+            "critic feedback",
+            "output draft",
+            "finalized deliverable",
+            "reasoning",
+        )
+        filtered_lines = []
+        for line in text.splitlines():
+            stripped = line.lstrip()
+            if stripped.startswith("#"):
+                heading = stripped.lstrip("#").strip().lower()
+                if any(heading.startswith(marker) for marker in internal_heading_markers):
+                    continue
+            filtered_lines.append(line)
+        text = "\n".join(filtered_lines)
         text = re.sub(r'\[Output Draft\][^\[]*', '', text, flags=re.DOTALL | re.IGNORECASE)
         text = re.sub(r'\[Internal Critique\][^\[]*', '', text, flags=re.DOTALL | re.IGNORECASE)
         text = re.sub(r'\[Finalized Deliverable\]\s*', '', text, flags=re.IGNORECASE)

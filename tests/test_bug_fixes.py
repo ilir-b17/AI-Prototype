@@ -1234,6 +1234,48 @@ class TestTranscriptRegressionFixes:
         orchestrator._try_fast_path_response.assert_awaited_once_with(loaded_state)
 
     @pytest.mark.asyncio
+    async def test_finalize_user_response_recovers_when_sanitizer_returns_blank(self):
+        orchestrator = Orchestrator.__new__(Orchestrator)
+        orchestrator.cognitive_router = MagicMock()
+        orchestrator.cognitive_router.sanitize_response = MagicMock(return_value="")
+        orchestrator.ledger_memory = _InMemoryLedger()
+        orchestrator._consolidate_memory = AsyncMock()
+        orchestrator._save_memory_async = AsyncMock()
+        orchestrator._fire_and_forget = _close_fire_and_forget
+
+        result = await Orchestrator._finalize_user_response(
+            orchestrator,
+            "test_user",
+            "Please send the score by email",
+            "### Email sent",
+        )
+
+        assert result == "### Email sent"
+        history = await orchestrator.ledger_memory.get_chat_history("test_user", limit=4)
+        assert history[-1]["role"] == "assistant"
+        assert history[-1]["content"] == "### Email sent"
+
+    @pytest.mark.asyncio
+    async def test_process_message_blank_resume_reply_gets_non_empty_fallback(self):
+        orchestrator = Orchestrator.__new__(Orchestrator)
+        orchestrator.pending_mfa = {}
+        orchestrator.pending_hitl_state = {}
+        orchestrator.pending_tool_approval = {}
+        orchestrator._ready = asyncio.Event()
+        orchestrator._ready.set()
+        orchestrator._get_user_lock = AsyncMock(return_value=asyncio.Lock())
+        orchestrator._try_resume_mfa = AsyncMock(return_value="")
+        orchestrator._try_resume_tool_approval = AsyncMock(return_value=None)
+
+        result = await Orchestrator.process_message(
+            orchestrator,
+            "subject line: Inter result; email body content just the final score of the match",
+            "test_user",
+        )
+
+        assert result == "I couldn't generate a response. Please retry."
+
+    @pytest.mark.asyncio
     async def test_process_message_multi_turn_memory_and_capability_flow(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
             async def fake_route_to_system_1(messages, allowed_tools=None, **_kwargs):

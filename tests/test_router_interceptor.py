@@ -319,6 +319,27 @@ class TestSanitizeResponse:
         assert "<reasoning>" not in result
         assert "Final answer." in result
 
+    def test_strips_agent_output_block(self):
+        text = (
+            "Email sent successfully.\n"
+            "<agent_output>{\"success\": true, \"summary\": \"sent\"}</agent_output>"
+        )
+        result = CognitiveRouter.sanitize_response(text)
+        assert "<agent_output>" not in result
+        assert "Email sent successfully." in result
+
+    def test_keeps_user_facing_markdown_heading(self):
+        text = "### Email Sent\nThe final score was 2-2."
+        result = CognitiveRouter.sanitize_response(text)
+        assert "### Email Sent" in result
+        assert "The final score was 2-2." in result
+
+    def test_strips_internal_scratch_heading(self):
+        text = "## Scratchpad\ninternal notes\nFinal answer."
+        result = CognitiveRouter.sanitize_response(text)
+        assert "## Scratchpad" not in result
+        assert "Final answer." in result
+
     def test_strips_workers_tag(self):
         text = "Here is my answer.\nWORKERS: []\n"
         result = CognitiveRouter.sanitize_response(text)

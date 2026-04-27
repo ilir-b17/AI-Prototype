@@ -12,6 +12,7 @@ import logging
 import json
 import hashlib
 import asyncio
+import ast
 import math
 import re
 import sys
@@ -40,12 +41,17 @@ from src.core.runtime_context import set_runtime_context
 from src.core.state_model import AgentState, normalize_state
 from src.core.workflow_graph import build_orchestrator_graph
 from src.core.security import validate_mfa_configuration, verify_mfa_challenge
-from src.core import cloud_redaction
+from src.core.orchestration import capabilities as capability_helpers
+from src.core.orchestration import agent_executor, energy as energy_service, graph_runner, llm_gateway
+from src.core.orchestration import memory_service, moral_governor, pending_state, schedulers
+from src.core.orchestration import plan_normalization, prompt_payload, supervisor_parsing
+from src.core.orchestration import supervisor as supervisor_service
 from src.core.progress import ProgressEmitter, reset_emitter, set_current_emitter
 from src.core.nocturnal_consolidation import NocturnalConsolidationSlice1
 from src.core.goal_planner import GoalPlanner, PlanningResult
 from src.core.energy_judge import EnergyJudge, EnergyEvaluation
 from src.core.energy_roi_engine import EnergyROIEngine, EnergyDecision
+from src.core.synthesis_pipeline import SynthesisPipeline
 from src.core.moral_ledger import (
     MORAL_DIMENSIONS,
     MORAL_RUBRIC_VERSION,
@@ -303,6 +309,7 @@ class Orchestrator:
             self._consolidation_turn_counts: OrderedDict = OrderedDict()
             self._synthesis_in_progress: Dict[str, float] = {}
             self.outbound_queue: Optional[asyncio.Queue] = None
+            self.synthesis_pipeline = self._build_synthesis_pipeline()
             self.sensory_state: Dict[str, str] = {}
             # Background task registry — holds strong references to prevent GC (ISSUE-002)
             self._background_tasks: set = set()
@@ -319,6 +326,65 @@ class Orchestrator:
         except Exception as e:
             logger.error(f"Failed to initialize Orchestrator: {e}", exc_info=True)
             raise
+
+    async def _noop_async(self, *_args: Any, **_kwargs: Any) -> None:
+        return None
+
+    def _build_synthesis_pipeline(self) -> SynthesisPipeline:
+        on_tools_changed = getattr(self, "_invalidate_capabilities_cache", None)
+        if not callable(on_tools_changed):
+            on_tools_changed = lambda: None
+
+        process_message_fn = getattr(self, "process_message", None)
+        if not callable(process_message_fn):
+            process_message_fn = self._noop_async
+
+        route_to_system_2_redacted = getattr(self, "_route_to_system_2_redacted", None)
+        if not callable(route_to_system_2_redacted):
+            route_to_system_2_redacted = self._noop_async
+
+        fire_and_forget = getattr(self, "_fire_and_forget", None)
+        if not callable(fire_and_forget):
+            fire_and_forget = lambda coro: asyncio.create_task(coro)
+
+        notify_admin = getattr(self, "_notify_admin", None)
+        if not callable(notify_admin):
+            notify_admin = self._noop_async
+
+        if not hasattr(self, "pending_tool_approval"):
+            self.pending_tool_approval = {}
+
+        return SynthesisPipeline(
+            cognitive_router=getattr(self, "cognitive_router", None),
+            ledger_memory=getattr(self, "ledger_memory", None),
+            core_memory=getattr(self, "core_memory", None),
+            pending_tool_approval=self.pending_tool_approval,
+            on_tools_changed=on_tools_changed,
+            process_message_fn=process_message_fn,
+            route_to_system_2_redacted=route_to_system_2_redacted,
+            fire_and_forget=fire_and_forget,
+            notify_admin=notify_admin,
+            outbound_queue=getattr(self, "outbound_queue", None),
+        )
+
+    def _get_synthesis_pipeline(self) -> SynthesisPipeline:
+        pipeline = getattr(self, "synthesis_pipeline", None)
+        if pipeline is None:
+            pipeline = self._build_synthesis_pipeline()
+            self.synthesis_pipeline = pipeline
+
+        pipeline.cognitive_router = getattr(self, "cognitive_router", None)
+        pipeline.ledger_memory = getattr(self, "ledger_memory", None)
+        pipeline.core_memory = getattr(self, "core_memory", None)
+        pipeline.pending_tool_approval = getattr(self, "pending_tool_approval", {})
+        pipeline.outbound_queue = getattr(self, "outbound_queue", None)
+
+        instance_dict = getattr(self, "__dict__", {})
+        if "_run_synthesis_self_test" in instance_dict:
+            pipeline._run_synthesis_self_test = instance_dict["_run_synthesis_self_test"]
+        if "_execute_synthesis_repair_loop" in instance_dict:
+            pipeline._execute_synthesis_repair_loop = instance_dict["_execute_synthesis_repair_loop"]
+        return pipeline
 
     async def async_init(self) -> None:
         """
@@ -466,9 +532,10 @@ class Orchestrator:
 
     async def _sensory_update_loop(self) -> None:
         """Background task: refresh sensory_state every 60 seconds."""
-        while True:
-            await asyncio.sleep(60)
-            self._refresh_sensory_state()
+        await schedulers.sensory_update_loop(
+            refresh_sensory_state=self._refresh_sensory_state,
+            interval_seconds=60,
+        )
 
     def _get_sensory_context(self) -> str:
         s = self.sensory_state
@@ -670,8 +737,33 @@ class Orchestrator:
             r"\b(time|date|timezone|cpu|memory|ram|disk|os|platform|system info)\b", lowered
         ):
             score += 2.0
+        elif tool_name == "get_stock_price" and re.search(
+            r"\b(stock|price|quote|ticker|market|trading|trade)\b", lowered
+        ):
+            # Symbol-centric stock questions can have little lexical overlap with
+            # the schema description (e.g. "How is NVDA trading today?").
+            score += 2.0
+            if len([
+                tok for tok in re.findall(r"\b([A-Z]{1,5})\b", user_message)
+                if tok not in Orchestrator._TICKER_STOPWORDS
+            ]) == 1:
+                score += 0.75
+        elif tool_name == "weather_current" and re.search(
+            r"\b(weather|temperature|forecast|rain|raining|cold|hot|warm|sunny|cloudy|snow|snowing|wind|humid)\b",
+            lowered,
+        ):
+            # Explanatory weather questions should still route through graph mode.
+            if not re.search(r"\b(cause|causes|pattern|patterns|climate|science|why)\b", lowered):
+                score += 2.0
+        elif tool_name == "unit_converter" and re.search(
+            r"\b(convert|km|miles|kg|pounds|fahrenheit|celsius|bytes|gb|mb|kb|ounce|ounces|litre|liter|gallon)\b",
+            lowered,
+        ):
+            score += 2.0
         elif tool_name == "web_search" and re.search(
-            r"\b(news|headline|headlines|breaking|trending)\b", lowered
+            r"\b(news|headline|headlines|breaking|trending"
+            r"|scores?|results?|standings|fixtures?|match(?:es)?|league)\b",
+            lowered,
         ):
             score += 2.5
         return score
@@ -737,8 +829,14 @@ class Orchestrator:
         if tool_name == "get_stock_price":
             return bool(re.search(r"\b(stock|price|quote|ticker|market|trading|trade)\b", lowered))
         if tool_name == "web_search":
-            return bool(re.search(r"\b(weather|news|latest|current|today|now|headline|headlines|score)\b", lowered))
+            return bool(re.search(
+                r"\b(weather|news|latest|current|today|now|headline|headlines"
+                r"|scores?|results?|standings|fixtures?|match(?:es)?|league)\b",
+                lowered,
+            ))
         if tool_name == "weather_current":
+            if re.search(r"\b(cause|causes|pattern|patterns|climate|science|why)\b", lowered):
+                return False
             return bool(re.search(r"\b(weather|temperature|forecast|rain|raining|cold|hot|warm|sunny|cloudy|snow|snowing|wind|humid)\b", lowered))
         if tool_name == "unit_converter":
             return bool(re.search(r"\b(convert|km|miles|kg|pounds|fahrenheit|celsius|bytes|gb|mb|kb|ounce|ounces|litre|liter|gallon)\b", lowered))
@@ -829,84 +927,23 @@ class Orchestrator:
 
     @staticmethod
     def _extract_audio_bytes(payload: Dict[str, Any]) -> bytes:
-        if not isinstance(payload, dict):
-            return b""
-        raw = payload.get("audio_bytes")
-        if isinstance(raw, bytes):
-            return raw
-        if isinstance(raw, bytearray):
-            return bytes(raw)
-        if isinstance(raw, memoryview):
-            return raw.tobytes()
-        return b""
+        return prompt_payload.extract_audio_bytes(payload)
 
     @classmethod
     def _coerce_user_prompt_payload(cls, user_message: Any) -> Dict[str, Any]:
-        if isinstance(user_message, dict):
-            payload = dict(user_message)
-            text = str(
-                payload.get("text")
-                or payload.get("user_input")
-                or payload.get("content")
-                or ""
-            ).strip()
-            audio_bytes = cls._extract_audio_bytes(payload)
-            if not text and audio_bytes:
-                mime = str(payload.get("audio_mime_type") or "audio/ogg")
-                text = f"[Voice note · {len(audio_bytes)} bytes · {mime}]"
-
-            normalized: Dict[str, Any] = {
-                "text": text,
-                "audio_bytes": audio_bytes,
-                "audio_mime_type": str(payload.get("audio_mime_type") or "audio/ogg"),
-                "audio_source": str(payload.get("audio_source") or ""),
-                "audio_file_id": str(payload.get("audio_file_id") or ""),
-            }
-            return normalized
-
-        text = str(user_message or "").strip()
-        return {
-            "text": text,
-            "audio_bytes": b"",
-            "audio_mime_type": "",
-            "audio_source": "",
-            "audio_file_id": "",
-        }
+        return prompt_payload.coerce_user_prompt_payload(user_message)
 
     @classmethod
     def _state_has_audio_prompt(cls, state: Dict[str, Any]) -> bool:
-        prompt = state.get("user_prompt")
-        if not isinstance(prompt, dict):
-            return False
-        return bool(cls._extract_audio_bytes(prompt))
+        return prompt_payload.state_has_audio_prompt(state)
 
     @classmethod
     def _build_user_prompt_message(cls, state: Dict[str, Any]) -> Dict[str, Any]:
-        user_text = str(state.get("user_input") or "")
-        message: Dict[str, Any] = {
-            "role": "user",
-            "content": f"<user_input>{user_text}</user_input>",
-        }
-        prompt = state.get("user_prompt")
-        if not isinstance(prompt, dict):
-            return message
-
-        audio_bytes = cls._extract_audio_bytes(prompt)
-        if audio_bytes:
-            message["audio_bytes"] = audio_bytes
-            message["audio_mime_type"] = str(prompt.get("audio_mime_type") or "audio/ogg")
-        return message
+        return prompt_payload.build_user_prompt_message(state)
 
     @classmethod
     def _strip_audio_bytes_for_persistence(cls, state: Dict[str, Any]) -> Dict[str, Any]:
-        sanitized = normalize_state(dict(state))
-        prompt = sanitized.get("user_prompt")
-        if isinstance(prompt, dict) and "audio_bytes" in prompt:
-            prompt = dict(prompt)
-            prompt.pop("audio_bytes", None)
-            sanitized["user_prompt"] = prompt
-        sanitized.pop("_energy_gate_cleared", None)
-        return sanitized
+        return prompt_payload.strip_audio_bytes_for_persistence(state)
 
     @staticmethod
     def _normalize_display_name(raw_name: str) -> str:
@@ -925,8 +962,21 @@ class Orchestrator:
             flags=re.IGNORECASE,
         )
         if name_match:
+            # Guard against negated phrases like "no, my name is not there" or
+            # "my name is not available" by checking for a negation word that
+            # immediately precedes the match, and by rejecting names whose
+            # first word is a common non-name stop word.
+            _STOP_NAME_WORDS = frozenset({
+                "not", "there", "here", "anywhere", "nowhere",
+                "nothing", "everything", "something", "available",
+                "known", "given", "provided",
+            })
+            match_start = name_match.start()
+            preceding = text[max(0, match_start - 30):match_start].lower()
+            is_negated = bool(re.search(r"\b(no|not|n't|never|nope)\s*$", preceding.rstrip()))
             raw_name = Orchestrator._normalize_display_name(name_match.group(1))
-            if raw_name:
+            first_word = raw_name.split()[0].lower() if raw_name else ""
+            if raw_name and not is_negated and first_word not in _STOP_NAME_WORDS:
                 updates["name"] = raw_name
 
         identity_match = re.search(
@@ -983,62 +1033,30 @@ class Orchestrator:
         return None
 
     async def _remember_user_profile(self, user_id: str, user_message: str) -> bool:
-        if not user_id or not hasattr(self, "core_memory"):
-            return False
-
-        updates = self._extract_user_profile_updates(user_message)
-        if not updates:
-            return False
-
-        core_state = await self.core_memory.get_all()
-        profiles = dict(core_state.get("user_profiles", {}) or {})
-        profile = dict(profiles.get(user_id, {}) or {})
-        changed = False
-
-        for key, value in updates.items():
-            if profile.get(key) != value:
-                profile[key] = value
-                changed = True
-
-        if not changed:
-            return False
-
-        profiles[user_id] = profile
-        await self.core_memory.update("user_profiles", profiles)
-        return True
+        return await memory_service.remember_user_profile(
+            core_memory=getattr(self, "core_memory", None),
+            user_id=user_id,
+            user_message=user_message,
+            extract_updates=self._extract_user_profile_updates,
+        )
 
     async def _get_user_profile(self, user_id: str) -> Dict[str, Any]:
-        if not user_id or not hasattr(self, "core_memory"):
-            return {}
-        core_state = await self.core_memory.get_all()
-        profiles = dict(core_state.get("user_profiles", {}) or {})
-        return dict(profiles.get(user_id, {}) or {})
+        return await memory_service.get_user_profile(
+            core_memory=getattr(self, "core_memory", None),
+            user_id=user_id,
+        )
 
     async def _remember_assistant_identity(self, user_message: str) -> Optional[str]:
-        if not hasattr(self, "core_memory"):
-            return None
-
-        assistant_name = self._extract_assistant_identity_update(user_message)
-        if not assistant_name:
-            return None
-
-        core_state = await self.core_memory.get_all()
-        assistant_profile = dict(core_state.get("assistant_profile", {}) or {})
-        if assistant_profile.get("name") == assistant_name:
-            return assistant_name
-
-        assistant_profile["name"] = assistant_name
-        await self.core_memory.update("assistant_profile", assistant_profile)
-        return assistant_name
+        return await memory_service.remember_assistant_identity(
+            core_memory=getattr(self, "core_memory", None),
+            user_message=user_message,
+            extract_update=self._extract_assistant_identity_update,
+        )
 
     async def _get_assistant_name(self) -> str:
-        if not hasattr(self, "core_memory"):
-            return "AIDEN"
-
-        core_state = await self.core_memory.get_all()
-        assistant_profile = dict(core_state.get("assistant_profile", {}) or {})
-        assistant_name = str(assistant_profile.get("name", "")).strip()
-        return assistant_name or "AIDEN"
+        return await memory_service.get_assistant_name(
+            core_memory=getattr(self, "core_memory", None),
+        )
 
     def _get_registry_skill_names(self) -> List[str]:
         registry = getattr(self.cognitive_router, "registry", None)
@@ -1269,6 +1287,18 @@ class Orchestrator:
                 "what did you share",
                 "what did you just say",
                 "what did you just send",
+                # Recall-phrased variants
+                "recall your last repl",
+                "recall your last message",
+                "what was your last repl",
+                "what was your last message",
+                "what did you last say",
+                "what did you reply",
+                "remind me what you said",
+                "what was the last thing you said",
+                "what was the last thing you wrote",
+                "can you repeat your last",
+                "repeat your last repl",
             )
         )
 
@@ -1284,6 +1314,127 @@ class Orchestrator:
         return bool(
             Orchestrator._CONFIRMATORY_FOLLOWUP_RE.match(user_message or "")
         )
+
+    @staticmethod
+    def _is_send_email_confirmation(user_message: str) -> bool:
+        lowered = (user_message or "").strip().lower().strip(".!?")
+        return lowered in {
+            "please do",
+            "do it",
+            "yes",
+            "yes please",
+            "ok",
+            "okay",
+            "go ahead",
+            "send it",
+            "send this",
+            "send the email",
+            "please send it",
+            "please send the email",
+        }
+
+    @staticmethod
+    def _extract_send_email_call_from_text(text: str) -> Optional[Dict[str, str]]:
+        if "send_email" not in str(text or ""):
+            return None
+
+        matches = list(re.finditer(r"send_email\s*\((?P<args>.*?)\)", str(text), flags=re.DOTALL))
+        for match in reversed(matches):
+            values = Orchestrator._parse_send_email_call_args(match.group("args"))
+            if Orchestrator._send_email_draft_is_complete(values):
+                return values
+        return None
+
+    @staticmethod
+    def _parse_send_email_call_args(arg_blob: str) -> Dict[str, str]:
+        try:
+            parsed = ast.parse(f"send_email({arg_blob})", mode="eval")
+        except SyntaxError:
+            return {}
+
+        call = parsed.body
+        if not isinstance(call, ast.Call):
+            return {}
+        if not isinstance(call.func, ast.Name) or call.func.id != "send_email":
+            return {}
+
+        values: Dict[str, str] = {}
+        values.update(Orchestrator._extract_send_email_positional_args(call))
+        values.update(Orchestrator._extract_send_email_keyword_args(call))
+        return values
+
+    @staticmethod
+    def _extract_send_email_positional_args(call: ast.Call) -> Dict[str, str]:
+        values: Dict[str, str] = {}
+        positional_names = ("recipient", "subject", "body", "attachment_path")
+        for index, arg in enumerate(call.args[: len(positional_names)]):
+            literal = Orchestrator._ast_string_literal(arg)
+            if literal is not None:
+                values[positional_names[index]] = literal
+        return values
+
+    @staticmethod
+    def _extract_send_email_keyword_args(call: ast.Call) -> Dict[str, str]:
+        values: Dict[str, str] = {}
+        allowed_keys = {"recipient", "subject", "body", "attachment_path"}
+        for keyword in call.keywords:
+            if keyword.arg is None:
+                continue
+            key = "recipient" if keyword.arg == "to" else keyword.arg
+            if key not in allowed_keys:
+                continue
+            literal = Orchestrator._ast_string_literal(keyword.value)
+            if literal is not None:
+                values[key] = literal
+        return values
+
+    @staticmethod
+    def _ast_string_literal(node: ast.AST) -> Optional[str]:
+        if isinstance(node, ast.Constant) and isinstance(node.value, str):
+            return node.value
+        return None
+
+    @staticmethod
+    def _send_email_draft_is_complete(values: Dict[str, str]) -> bool:
+        return all(str(values.get(key) or "").strip() for key in ("recipient", "subject", "body"))
+
+    @classmethod
+    def _extract_last_send_email_draft(cls, chat_history: List[Dict[str, str]]) -> Optional[Dict[str, str]]:
+        for turn in reversed(chat_history or []):
+            if turn.get("role") != "assistant":
+                continue
+            draft = cls._extract_send_email_call_from_text(str(turn.get("content") or ""))
+            if draft:
+                return draft
+        return None
+
+    @staticmethod
+    def _format_send_email_tool_result(result: RouterResult) -> str:
+        if result.status != "ok":
+            return str(result.content or "I could not send the email.").strip()
+        content = str(result.content or "").strip()
+        try:
+            payload = json.loads(content)
+        except json.JSONDecodeError:
+            return content or "Email request completed."
+
+        if str(payload.get("status") or "").lower() == "success":
+            return str(payload.get("message") or "Email sent.").strip()
+        message = str(payload.get("message") or "Unknown email error").strip()
+        return f"I could not send the email: {message}"
+
+    async def _try_confirm_send_email_draft(
+        self,
+        user_message: str,
+        chat_history: List[Dict[str, str]],
+    ) -> Optional[str]:
+        if not self._is_send_email_confirmation(user_message):
+            return None
+        draft = self._extract_last_send_email_draft(chat_history)
+        if not draft:
+            return None
+        result = await self.cognitive_router._execute_tool("send_email", draft)
+        return self._format_send_email_tool_result(result)
 
     @staticmethod
     def _recall_last_assistant_message(chat_history: List[Dict[str, str]]) -> Optional[str]:
@@ -1509,6 +1660,10 @@ class Orchestrator:
         if self._is_last_reply_question(user_message):
             return self._recall_last_assistant_message(chat_history)
 
+        email_confirmation_response = await self._try_confirm_send_email_draft(user_message, chat_history)
+        if email_confirmation_response:
+            return email_confirmation_response
+
         # Confirmatory follow-ups like "Did you search for it?" / "Have you found it?"
         # should acknowledge the previous action, not re-trigger a tool.
         if self._is_confirmatory_followup(user_message):
@@ -1718,124 +1873,46 @@ class Orchestrator:
 
     def _get_capabilities_string(self) -> str:
         """Build an ultra-lean Level-1 catalog: name + description only."""
-        rows = self._build_capability_catalog_rows()
-        if not rows:
-            return "Available skills catalog (name: description): none loaded"
-        return "Available skills catalog (name: description):\n" + "\n".join(rows)
+        return capability_helpers.get_capabilities_string(
+            self._load_capability_catalog_entries()
+        )
 
     def _build_capability_catalog_rows(self) -> List[str]:
-        rows: List[str] = []
-        for item in self._load_capability_catalog_entries():
-            name = str(item.get("name") or "").strip()
-            description = str(item.get("description") or "").strip()
-            if name and description:
-                rows.append(f"- {name}: {description}")
-        return rows
+        return capability_helpers.build_capability_catalog_rows(
+            self._load_capability_catalog_entries()
+        )
 
     def _load_capability_catalog_entries(self) -> List[Dict[str, str]]:
-        catalog_getter = getattr(self.cognitive_router.registry, "get_skill_catalog", None)
-        if callable(catalog_getter):
-            try:
-                raw_catalog = catalog_getter()
-                if isinstance(raw_catalog, list):
-                    return [item for item in raw_catalog if isinstance(item, dict)]
-            except Exception as exc:
-                logger.warning("Failed to load skill catalog from registry: %s", exc)
-
-        # Backward-compatible fallback for tests/mocks that still expose get_schemas only.
-        fallback: List[Dict[str, str]] = []
-        for schema in self.cognitive_router.registry.get_schemas():
-            fallback.append(
-                {
-                    "name": str(schema.get("name") or "").strip(),
-                    "description": str(schema.get("description") or "").strip(),
-                }
-            )
-        return fallback
+        registry = getattr(getattr(self, "cognitive_router", None), "registry", None)
+        return capability_helpers.load_capability_catalog_entries(registry, log=logger)
 
     def _load_executable_capability_catalog_entries(self) -> List[Dict[str, str]]:
-        registry = getattr(self.cognitive_router, "registry", None)
-        if registry is not None:
-            executable_getter = getattr(registry, "get_executable_skill_catalog", None)
-            if callable(executable_getter):
-                try:
-                    entries = executable_getter()
-                    if isinstance(entries, list):
-                        return [item for item in entries if isinstance(item, dict)]
-                except Exception as exc:
-                    logger.warning("Failed to load executable skill catalog from registry: %s", exc)
-        return self._load_capability_catalog_entries()
+        registry = getattr(getattr(self, "cognitive_router", None), "registry", None)
+        return capability_helpers.load_executable_capability_catalog_entries(registry, log=logger)
 
     def _build_scoped_skill_runtime_context(self, skill_name: str) -> str:
         """Load full SKILL.md body on demand for the current execution turn only."""
-        registry = getattr(self.cognitive_router, "registry", None)
-        if registry is None:
-            return ""
-
-        get_skill_body = getattr(registry, "get_skill_body", None)
-        if not callable(get_skill_body):
-            return ""
-
-        raw_body = str(get_skill_body(skill_name) or "").strip()
-        if not raw_body:
-            return ""
-
-        description = ""
-        for item in self._load_capability_catalog_entries():
-            if str(item.get("name") or "").strip() == skill_name:
-                description = str(item.get("description") or "").strip()
-                break
-
-        return (
-            "<scoped_skill_context>\n"
-            f"Skill: {skill_name}\n"
-            f"Description: {description}\n"
-            "Scope: immediate execution turn only\n\n"
-            "SKILL_BODY:\n"
-            f"{raw_body}\n"
-            "</scoped_skill_context>"
+        registry = getattr(getattr(self, "cognitive_router", None), "registry", None)
+        return capability_helpers.build_scoped_skill_runtime_context(
+            registry,
+            skill_name,
+            self._load_capability_catalog_entries(),
         )
 
     @staticmethod
     def _capability_catalog_tokens(text: str) -> set[str]:
-        return {
-            token
-            for token in re.findall(_ROUTING_TOKEN_RE, str(text or "").lower())
-            if len(token) > 2 and token not in _CATALOG_MATCH_STOPWORDS
-        }
+        return capability_helpers.capability_catalog_tokens(text)
 
     def _find_local_skill_catalog_match(
         self,
         gap_description: str,
         suggested_tool_name: str,
     ) -> Optional[Dict[str, str]]:
-        query_tokens = self._capability_catalog_tokens(gap_description)
-        query_tokens |= self._capability_catalog_tokens(str(suggested_tool_name or "").replace("_", " "))
-        if not query_tokens:
-            return None
-
-        best_item: Optional[Dict[str, str]] = None
-        best_score = 0.0
-
-        for item in self._load_executable_capability_catalog_entries():
-            name = str(item.get("name") or "").strip()
-            if not name or name in _CATALOG_META_TOOL_NAMES:
-                continue
-
-            name_tokens = self._capability_catalog_tokens(name.replace("_", " "))
-            desc_tokens = self._capability_catalog_tokens(item.get("description", ""))
-
-            score = 0.0
-            if suggested_tool_name and name.lower() == str(suggested_tool_name).strip().lower():
-                score += 6.0
-            score += 3.0 * len(query_tokens & name_tokens)
-            score += 1.5 * len(query_tokens & desc_tokens)
-
-            if score > best_score:
-                best_item = {"name": name, "description": str(item.get("description") or "").strip()}
-                best_score = score
-
-        return best_item if best_score >= 1.5 else None
+        return capability_helpers.find_local_skill_catalog_match(
+            gap_description,
+            suggested_tool_name,
+            self._load_executable_capability_catalog_entries(),
+        )
 
     async def _try_resolve_capability_gap_locally(
         self,
@@ -1902,21 +1979,14 @@ class Orchestrator:
     @staticmethod
     def _is_system_1_error(result: Optional[RouterResult]) -> bool:
         """Detect System 1 error payloads that should trigger System 2 fallback."""
-        return bool(
-            result
-            and result.status == "ok"
-            and isinstance(result.content, str)
-            and result.content.startswith(_SYSTEM_1_ERROR_PREFIX)
-        )
+        return llm_gateway.is_system_1_error(result, _SYSTEM_1_ERROR_PREFIX)
 
     @staticmethod
     def _is_system_2_error(result: Optional[RouterResult]) -> bool:
         """Detect placeholder System 2 error payloads that should trigger fallback."""
-        return bool(
-            result
-            and result.status == "ok"
-            and isinstance(result.content, str)
-            and result.content.startswith((_SYSTEM_2_ERROR_PREFIX, _SYSTEM_2_EMPTY_PREFIX))
+        return llm_gateway.is_system_2_error(
+            result,
+            (_SYSTEM_2_ERROR_PREFIX, _SYSTEM_2_EMPTY_PREFIX),
         )
 
     @staticmethod
@@ -1926,7 +1996,7 @@ class Orchestrator:
         allow_sensitive_context: bool = False,
         max_chars: int = 12000,
     ) -> str:
-        return cloud_redaction.redact_text_for_cloud(
+        return llm_gateway.redact_text_for_cloud(
             text,
             allow_sensitive_context=allow_sensitive_context,
             max_chars=max_chars,
@@ -1938,7 +2008,7 @@ class Orchestrator:
         *,
         allow_sensitive_context: bool = False,
     ) -> List[Dict[str, str]]:
-        return cloud_redaction.redact_messages_for_cloud(
+        return llm_gateway.redact_messages_for_cloud(
             messages,
             allow_sensitive_context=allow_sensitive_context,
         )
@@ -1948,7 +2018,7 @@ class Orchestrator:
         messages: List[Dict[str, str]],
         allowed_tools: Optional[List[str]],
     ) -> str:
-        return cloud_redaction.compute_payload_sha256(messages, allowed_tools)
+        return llm_gateway.cloud_payload_audit_sha256(messages, allowed_tools)
 
     async def _append_cloud_payload_audit_if_supported(
         self,
@@ -1959,20 +2029,15 @@ class Orchestrator:
         allow_sensitive_context: bool,
         payload_sha256: str,
     ) -> None:
-        ledger = getattr(self, "ledger_memory", None)
-        append_fn = getattr(ledger, "append_cloud_payload_audit", None)
-        if not callable(append_fn):
-            return
-        try:
-            await append_fn(
-                purpose=purpose,
-                message_count_before=message_count_before,
-                message_count_after=message_count_after,
-                allow_sensitive_context=allow_sensitive_context,
-                payload_sha256=payload_sha256,
-            )
-        except Exception as e:
-            logger.warning("Failed to append cloud payload audit entry for %s: %s", purpose, e)
+        await llm_gateway.append_cloud_payload_audit_if_supported(
+            getattr(self, "ledger_memory", None),
+            purpose=purpose,
+            message_count_before=message_count_before,
+            message_count_after=message_count_after,
+            allow_sensitive_context=allow_sensitive_context,
+            payload_sha256=payload_sha256,
+            log=logger,
+        )
 
     async def _route_to_system_2_redacted(
         self,
@@ -1982,38 +2047,21 @@ class Orchestrator:
         purpose: str = "system_2",
         allow_sensitive_context: bool = False,
     ) -> RouterResult:
-        minimized_messages = self._redact_messages_for_cloud(
+        return await llm_gateway.route_to_system_2_redacted(
+            self.cognitive_router,
+            getattr(self, "ledger_memory", None),
             messages,
-            allow_sensitive_context=allow_sensitive_context,
-        )
-        logger.info(
-            "System 2 payload redacted for %s: %d -> %d message(s)",
-            purpose,
-            len(messages),
-            len(minimized_messages),
-        )
-        await self._append_cloud_payload_audit_if_supported(
-            purpose=purpose,
-            message_count_before=len(messages),
-            message_count_after=len(minimized_messages),
-            allow_sensitive_context=allow_sensitive_context,
-            payload_sha256=self._cloud_payload_audit_sha256(minimized_messages, allowed_tools),
-        )
-        return await self.cognitive_router.route_to_system_2(
-            minimized_messages,
             allowed_tools=allowed_tools,
+            purpose=purpose,
+            allow_sensitive_context=allow_sensitive_context,
+            log=logger,
         )
 
     def _get_system_1_gate_metrics(self) -> Dict[str, Any]:
-        getter = getattr(self.cognitive_router, "get_system_1_gate_metrics", None)
-        if not callable(getter):
-            return {}
-        try:
-            metrics = getter()
-        except Exception as e:
-            logger.debug(f"Unable to read System 1 gate metrics: {e}")
-            return {}
-        return metrics if isinstance(metrics, dict) else {}
+        return llm_gateway.get_system_1_gate_metrics(
+            getattr(self, "cognitive_router", None),
+            log=logger,
+        )
 
     def _log_system_1_gate_pressure(
         self,
@@ -2021,27 +2069,11 @@ class Orchestrator:
         before_metrics: Dict[str, Any],
         after_metrics: Dict[str, Any],
     ) -> None:
-        if not after_metrics:
-            return
-
-        before_wait_events = int(before_metrics.get("wait_events", 0) or 0)
-        after_wait_events = int(after_metrics.get("wait_events", 0) or 0)
-        waiting_requests = int(after_metrics.get("waiting_requests", 0) or 0)
-        new_wait_events = max(0, after_wait_events - before_wait_events)
-
-        if new_wait_events == 0 and waiting_requests == 0:
-            return
-
-        logger.info(
-            "System 1 gate pressure after %s: active=%s waiting=%s max=%s new_wait_events=%s total_wait=%.3fs avg_wait=%.3fs peak_waiting=%s",
+        llm_gateway.log_system_1_gate_pressure(
             context,
-            int(after_metrics.get("active_requests", 0) or 0),
-            waiting_requests,
-            int(after_metrics.get("max_concurrency", 0) or 0),
-            new_wait_events,
-            float(after_metrics.get("total_wait_seconds", 0.0) or 0.0),
-            float(after_metrics.get("average_wait_seconds", 0.0) or 0.0),
-            int(after_metrics.get("peak_waiting_requests", 0) or 0),
+            before_metrics,
+            after_metrics,
+            log=logger,
         )
 
     async def _route_to_system_1(
@@ -2052,148 +2084,86 @@ class Orchestrator:
         deadline_seconds: Optional[float] = None,
         context: str = "orchestrator",
     ) -> RouterResult:
-        before_metrics = self._get_system_1_gate_metrics()
-        route_call = self.cognitive_router.route_to_system_1(messages, allowed_tools=allowed_tools)
-        try:
-            if deadline_seconds is None:
-                return await route_call
-            return await asyncio.wait_for(route_call, timeout=deadline_seconds)
-        finally:
-            after_metrics = self._get_system_1_gate_metrics()
-            self._log_system_1_gate_pressure(context, before_metrics, after_metrics)
+        return await llm_gateway.route_to_system_1(
+            self.cognitive_router,
+            messages,
+            allowed_tools=allowed_tools,
+            deadline_seconds=deadline_seconds,
+            context=context,
+            log=logger,
+        )
 
     async def _get_archival_context(self, query: str) -> str:
         """Retrieve top archival memory snippets relevant to the user query."""
-        if not query:
-            return ""
-        _max_chunk = int(os.getenv("MAX_ARCHIVAL_CHUNK_CHARS", "2000"))
-        _max_total = int(os.getenv("MAX_ARCHIVAL_TOTAL_CHARS", "6000"))
-        try:
-            results = await self.vector_memory.query_memory_async(query, n_results=3)
-            if not results:
-                return ""
-            lines = ["<Archival_Memory>"]
-            total = 0
-            for item in results:
-                snippet = (item.get("document", "") or "")[:_max_chunk]
-                if not snippet:
-                    continue
-                if total + len(snippet) > _max_total:
-                    break
-                lines.append(f"  <Memory>{snippet}</Memory>")
-                total += len(snippet)
-            lines.append("</Archival_Memory>")
-            return "\n".join(lines)
-        except Exception as e:
-            logger.warning(f"Archival memory lookup failed: {e}")
-            return ""
-
-    def _energy_gate_available(self) -> bool:
-        return (
-            getattr(self, "_predictive_energy_budget_lock", None) is not None
-            and hasattr(self, "_predictive_energy_budget_remaining")
+        return await memory_service.get_archival_context(
+            vector_memory=self.vector_memory,
+            query=query,
+            max_chunk_chars=int(os.getenv("MAX_ARCHIVAL_CHUNK_CHARS", "2000")),
+            max_total_chars=int(os.getenv("MAX_ARCHIVAL_TOTAL_CHARS", "6000")),
+            log=logger,
         )
 
+    def _energy_gate_available(self) -> bool:
+        return energy_service.energy_gate_available(self)
+
     async def _get_predictive_energy_budget_remaining(self) -> int:
-        if not self._energy_gate_available():
-            return max(0, int(os.getenv("INITIAL_ENERGY_BUDGET", "100")))
-        async with self._predictive_energy_budget_lock:
-            return max(0, int(self._predictive_energy_budget_remaining))
+        return await energy_service.get_predictive_energy_budget_remaining(
+            self,
+            gate_available=self._energy_gate_available,
+        )
 
     @staticmethod
     def _resolve_energy_replenish_per_hour() -> float:
-        raw_rate = str(os.getenv("ENERGY_REPLENISH_PER_HOUR", "30") or "").strip()
-        try:
-            rate = float(raw_rate)
-        except ValueError:
-            logger.warning("Invalid ENERGY_REPLENISH_PER_HOUR=%r. Falling back to 30.", raw_rate)
-            rate = 30.0
-        return max(0.0, rate)
+        return energy_service.resolve_energy_replenish_per_hour(log=logger)
 
     @staticmethod
     def _resolve_energy_replenish_per_heartbeat() -> int:
-        raw_value = str(os.getenv("ENERGY_REPLENISH_PER_HEARTBEAT", "5") or "").strip()
-        try:
-            amount = int(raw_value)
-        except ValueError:
-            logger.warning("Invalid ENERGY_REPLENISH_PER_HEARTBEAT=%r. Falling back to 5.", raw_value)
-            amount = 5
-        return max(0, amount)
+        return energy_service.resolve_energy_replenish_per_heartbeat(log=logger)
+
+    @classmethod
+    def _resolve_energy_replenish_per_turn(cls) -> int:
+        return energy_service.resolve_energy_replenish_per_turn(cls, log=logger)
 
     @classmethod
     def _warn_deprecated_energy_replenish_turn_env_once(cls) -> None:
-        if cls._deprecated_energy_replenish_turn_warning_logged:
-            return
-        raw_deprecated = str(os.getenv("ENERGY_REPLENISH_PER_TURN", "") or "").strip()
-        if not raw_deprecated:
-            return
-        logger.warning(
-            "ENERGY_REPLENISH_PER_TURN is deprecated and ignored. "
-            "Use ENERGY_REPLENISH_PER_HOUR for wall-clock replenishment instead."
-        )
-        cls._deprecated_energy_replenish_turn_warning_logged = True
+        energy_service.warn_deprecated_energy_replenish_turn_env_once(cls, log=logger)
 
     def _compute_predictive_energy_replenishment_points_wallclock_locked(self, *, now: Optional[float] = None) -> int:
-        current_time = float(time.time() if now is None else now)
-        last_replenished_at = float(
-            getattr(self, "_predictive_energy_budget_last_replenished_at", current_time)
+        return energy_service.compute_predictive_energy_replenishment_points_wallclock_locked(
+            self,
+            now=now,
+            resolve_per_hour=self._resolve_energy_replenish_per_hour,
+            time_fn=time.time,
         )
-        if current_time <= last_replenished_at:
-            return 0
-        replenish_per_hour = self._resolve_energy_replenish_per_hour()
-        if replenish_per_hour <= 0:
-            self._predictive_energy_budget_last_replenished_at = current_time
-            return 0
-        elapsed_seconds = current_time - last_replenished_at
-        points = int((elapsed_seconds / 3600.0) * replenish_per_hour)
-        if points <= 0:
-            return 0
-        consumed_seconds = (float(points) / replenish_per_hour) * 3600.0
-        self._predictive_energy_budget_last_replenished_at = last_replenished_at + consumed_seconds
-        return points
 
     def _apply_predictive_energy_tick_locked(self, amount: int) -> int:
-        if amount <= 0:
-            return 0
-        cap = max(0, int(os.getenv("INITIAL_ENERGY_BUDGET", "100")))
-        before = max(0, int(getattr(self, "_predictive_energy_budget_remaining", 0)))
-        self._predictive_energy_budget_remaining = min(cap, before + int(amount))
-        if hasattr(self, "_energy_budget"):
-            self._energy_budget = self._predictive_energy_budget_remaining
-        return int(self._predictive_energy_budget_remaining) - before
+        return energy_service.apply_predictive_energy_tick_locked(self, amount)
 
     def _replenish_predictive_energy_budget_wallclock_locked(self, *, now: Optional[float] = None) -> int:
-        self._warn_deprecated_energy_replenish_turn_env_once()
-        points = self._compute_predictive_energy_replenishment_points_wallclock_locked(now=now)
-        return self._apply_predictive_energy_tick_locked(points)
+        return energy_service.replenish_predictive_energy_budget_wallclock_locked(
+            self,
+            now=now,
+            warn_deprecated=self._warn_deprecated_energy_replenish_turn_env_once,
+            compute_points=self._compute_predictive_energy_replenishment_points_wallclock_locked,
+            apply_tick=self._apply_predictive_energy_tick_locked,
+        )
 
     async def _refund_predictive_energy_budget(self, amount: int, reason: str) -> None:
-        amount = max(0, int(amount))
-        if amount <= 0:
-            return
-        if not self._energy_gate_available():
-            return
-        cap = max(0, int(os.getenv("INITIAL_ENERGY_BUDGET", "100")))
-        async with self._predictive_energy_budget_lock:
-            self._predictive_energy_budget_remaining = min(
-                cap, self._predictive_energy_budget_remaining + amount
-            )
-            if hasattr(self, "_energy_budget"):
-                self._energy_budget = self._predictive_energy_budget_remaining
-        logger.info(
-            "Energy budget refunded: +%s (%s). Remaining=%s",
+        await energy_service.refund_predictive_energy_budget(
+            self,
             amount,
             reason,
-            self._predictive_energy_budget_remaining,
+            gate_available=self._energy_gate_available,
+            log=logger,
         )
 
     async def _tick_predictive_energy_budget(self, amount: int, reason: str) -> int:
-        if amount <= 0:
-            return 0
-        before = await self._get_predictive_energy_budget_remaining()
-        await self._refund_predictive_energy_budget(int(amount), reason)
-        after = await self._get_predictive_energy_budget_remaining()
-        return max(0, after - before)
+        return await energy_service.tick_predictive_energy_budget(
+            amount,
+            reason,
+            get_remaining=self._get_predictive_energy_budget_remaining,
+            refund=self._refund_predictive_energy_budget,
+        )
 
     async def _try_reserve_predictive_energy_budget(
         self,
@@ -2202,25 +2172,14 @@ class Orchestrator:
         min_reserve: int,
         reason: str,
     ) -> bool:
-        if not self._energy_gate_available():
-            return True
-
-        cost = max(0, int(predicted_cost))
-        reserve = max(0, int(min_reserve))
-        async with self._predictive_energy_budget_lock:
-            remaining = max(0, int(self._predictive_energy_budget_remaining))
-            if remaining - cost < reserve:
-                return False
-            self._predictive_energy_budget_remaining = remaining - cost
-            if hasattr(self, "_energy_budget"):
-                self._energy_budget = self._predictive_energy_budget_remaining
-            logger.info(
-                "Predictive energy budget reserved: -%s (%s). Remaining=%s",
-                cost,
-                reason,
-                self._predictive_energy_budget_remaining,
-            )
-            return True
+        return await energy_service.try_reserve_predictive_energy_budget(
+            self,
+            predicted_cost=predicted_cost,
+            min_reserve=min_reserve,
+            reason=reason,
+            gate_available=self._energy_gate_available,
+            log=logger,
+        )
 
     @staticmethod
     def _build_energy_evaluation_record(
@@ -2230,36 +2189,15 @@ class Orchestrator:
         available_energy: int,
         context: str,
     ) -> Dict[str, Any]:
-        return {
-            "context": str(context or ""),
-            "available_energy": int(available_energy),
-            "estimated_effort": int(evaluation.estimated_effort),
-            "expected_value": int(evaluation.expected_value),
-            "defer_count": int(decision.defer_count),
-            "used_fallback": bool(evaluation.used_fallback),
-            "fallback_reason": str(evaluation.fallback_reason or ""),
-            "should_execute": bool(decision.should_execute),
-            "reason": str(decision.reason or ""),
-            "roi": float(decision.roi),
-            "base_roi": float(decision.base_roi),
-            "effective_roi": float(decision.effective_roi),
-            "predicted_cost": int(decision.predicted_cost),
-            "reserve_after_execution": int(decision.reserve_after_execution),
-            "roi_threshold": float(decision.roi_threshold),
-            "min_reserve": int(decision.min_reserve),
-            "fairness_boost_multiplier": float(decision.fairness_boost_multiplier),
-            "max_defer_count": int(decision.max_defer_count),
-            "defer_cooldown_seconds": int(decision.defer_cooldown_seconds),
-            "evaluated_at": datetime.now().isoformat(),
-        }
+        return energy_service.build_energy_evaluation_record(
+            evaluation=evaluation,
+            decision=decision,
+            available_energy=available_energy,
+            context=context,
+        )
 
     async def _route_energy_judge_messages(self, messages: List[Dict[str, str]]) -> RouterResult:
-        return await self._route_to_system_1(
-            messages,
-            allowed_tools=[],
-            deadline_seconds=45.0,
-            context="energy_judge",
-        )
+        return await energy_service.route_energy_judge_messages(self, messages)
 
     async def _evaluate_energy_for_context(
         self,
@@ -2269,55 +2207,19 @@ class Orchestrator:
         epic: Optional[Dict[str, Any]],
         additional_context: str,
     ) -> tuple[EnergyEvaluation, EnergyDecision, int]:
-        available_energy = await self._get_predictive_energy_budget_remaining()
-        defer_count = int(task.get("defer_count") or 0)
-        evaluation = await self.energy_judge.evaluate_with_system1(
+        return await energy_service.evaluate_energy_for_context(
+            self,
             task=task,
             story=story,
             epic=epic,
-            route_to_system_1=self._route_energy_judge_messages,
             additional_context=additional_context,
         )
-        decision = self.energy_roi_engine.evaluate(
-            estimated_effort=evaluation.estimated_effort,
-            expected_value=evaluation.expected_value,
-            available_energy=available_energy,
-            defer_count=defer_count,
-        )
-        return evaluation, decision, available_energy
 
     def _build_synthesized_ad_hoc_energy_context(
         self,
         state: Dict[str, Any],
     ) -> Dict[str, Optional[Dict[str, Any]]]:
-        user_message = str(state.get("user_input") or "").strip()
-        complexity = max(1, self._estimate_request_complexity(user_message) + 1)
-        history_context = self._build_goal_planning_context(state)
-
-        task = {
-            "title": user_message,
-            "acceptance_criteria": "Provide a correct and concise answer to the current user request.",
-            "estimated_energy": min(10, complexity),
-            "status": "pending",
-            "depends_on_ids": [],
-            "defer_count": 0,
-        }
-        story = {
-            "title": "Ad-hoc user response",
-            "status": "active",
-            "acceptance_criteria": "Answer the user request with useful and policy-compliant output.",
-        }
-        epic = {
-            "title": "Sustain reliable operator assistance",
-            "status": "active",
-            "acceptance_criteria": "Serve user requests while preserving energy reserves for critical work.",
-        }
-        return {
-            "task": task,
-            "story": story,
-            "epic": epic,
-            "additional_context": history_context,
-        }
+        return energy_service.build_synthesized_ad_hoc_energy_context(self, state)
 
     @staticmethod
     def _format_ad_hoc_energy_deferral_message(
@@ -2325,12 +2227,9 @@ class Orchestrator:
         decision: EnergyDecision,
         available_energy: int,
     ) -> str:
-        return (
-            "Deferred due to energy policy. "
-            f"Reason: {decision.reason}. "
-            f"ROI={decision.roi:.2f} (base={decision.base_roi:.2f}, defer_count={decision.defer_count}), "
-            f"predicted_cost={decision.predicted_cost}, "
-            f"available_budget={int(available_energy)}, reserve_floor={decision.min_reserve}."
+        return energy_service.format_ad_hoc_energy_deferral_message(
+            decision=decision,
+            available_energy=available_energy,
         )
 
     async def _try_ad_hoc_dispatch_energy_gate(
@@ -2339,69 +2238,12 @@ class Orchestrator:
         *,
         dispatch_context: str,
     ) -> Optional[str]:
-        if not self._energy_gate_available():
-            return None
-
-        user_id = str(state.get("user_id") or "")
-        if user_id == "heartbeat":
-            return None
-
-        user_message = str(state.get("user_input") or "").strip()
-        if not user_message:
-            return None
-
-        context = self._build_synthesized_ad_hoc_energy_context(state)
-        evaluation, decision, available_energy = await self._evaluate_energy_for_context(
-            task=context["task"] or {},
-            story=context["story"],
-            epic=context["epic"],
-            additional_context=str(context.get("additional_context") or ""),
+        return await energy_service.try_ad_hoc_dispatch_energy_gate(
+            self,
+            state,
+            dispatch_context=dispatch_context,
+            log=logger,
         )
-
-        if not decision.should_execute:
-            message = self._format_ad_hoc_energy_deferral_message(
-                decision=decision,
-                available_energy=available_energy,
-            )
-            logger.warning(
-                "Ad-hoc dispatch deferred by energy gate (%s): %s",
-                dispatch_context,
-                message,
-            )
-            return message
-
-        reserved = await self._try_reserve_predictive_energy_budget(
-            predicted_cost=decision.predicted_cost,
-            min_reserve=decision.min_reserve,
-            reason=f"ad_hoc:{dispatch_context}:{user_id}",
-        )
-        if not reserved:
-            current_budget = await self._get_predictive_energy_budget_remaining()
-            race_decision = self.energy_roi_engine.evaluate(
-                estimated_effort=evaluation.estimated_effort,
-                expected_value=evaluation.expected_value,
-                available_energy=current_budget,
-                defer_count=decision.defer_count,
-            )
-            message = self._format_ad_hoc_energy_deferral_message(
-                decision=race_decision,
-                available_energy=current_budget,
-            )
-            logger.warning(
-                "Ad-hoc dispatch deferred after budget reservation race (%s): %s",
-                dispatch_context,
-                message,
-            )
-            return message
-
-        logger.info(
-            "Ad-hoc dispatch approved by energy gate (%s): roi=%.2f cost=%s remaining=%s",
-            dispatch_context,
-            decision.roi,
-            decision.predicted_cost,
-            await self._get_predictive_energy_budget_remaining(),
-        )
-        return None
 
     def _new_state(
         self,
@@ -2543,30 +2385,21 @@ class Orchestrator:
 
     def _deduct_energy(self, state: Dict[str, Any], amount: int, reason: str) -> Dict[str, Any]:
         """Deduct energy and raise HITL if exhausted."""
-        state["energy_remaining"] = state.get("energy_remaining", 100) - amount
-        logger.debug(f"Energy -{amount} ({reason}). Remaining: {state['energy_remaining']}")
-        if state["energy_remaining"] <= 0:
-            raise RequiresHITLError(
-                f"Energy Budget Exhausted: The system consumed all cognitive energy on this task.\n"
-                f"Question: How should I prioritize the remaining work for: '{state.get('user_input', '')}'"
-            )
-        return state
+        return energy_service.deduct_energy(
+            state,
+            amount,
+            reason,
+            RequiresHITLError,
+            log=logger,
+        )
 
     def _refund_energy(self, state: Dict[str, Any], amount: int, reason: str) -> Dict[str, Any]:
         """Refund energy deducted by a failed or timed-out operation."""
-        state["energy_remaining"] = state.get("energy_remaining", 0) + amount
-        logger.debug("Energy +%d refunded (%s). Remaining: %d", amount, reason, state["energy_remaining"])
-        return state
+        return energy_service.refund_energy(state, amount, reason, log=logger)
 
     @staticmethod
     def _merge_plan_text(existing: str, incoming: str) -> str:
-        existing = str(existing or "").strip()
-        incoming = str(incoming or "").strip()
-        if not existing:
-            return incoming
-        if not incoming or incoming in existing:
-            return existing
-        return f"{existing}\n{incoming}"
+        return plan_normalization.merge_plan_text(existing, incoming)
 
     @staticmethod
     def _make_plan_step(
@@ -2577,69 +2410,7 @@ class Orchestrator:
         depends_on: Optional[List[str]] = None,
         preferred_model: str = "",
     ) -> Dict[str, Any]:
-        return {
-            "agent": agent_name,
-            "task": task,
-            "reason": reason,
-            "depends_on": list(depends_on or []),
-            "preferred_model": preferred_model,
-        }
-
-    @staticmethod
-    def _normalize_plan_dependencies(raw_dependencies: Any) -> List[str]:
-        if raw_dependencies is None:
-            return []
-
-        items = raw_dependencies if isinstance(raw_dependencies, (list, tuple, set)) else [raw_dependencies]
-        normalized: List[str] = []
-        for item in items:
-            dependency = str(item).strip()
-            if dependency and dependency not in normalized:
-                normalized.append(dependency)
-        return normalized
-
-    @staticmethod
-    def _merge_plan_dependencies(existing: List[str], incoming: List[str]) -> List[str]:
-        merged = list(existing or [])
-        for dependency in incoming or []:
-            if dependency not in merged:
-                merged.append(dependency)
-        return merged
-
-    @staticmethod
-    def _normalize_model_preference(raw_value: Any) -> str:
-        preferred_model = str(raw_value or "").strip().lower()
-        return preferred_model if preferred_model in {"system_1", "system_2"} else ""
-
-    @staticmethod
-    def _normalize_plan_step(step: Any) -> Optional[Dict[str, Any]]:
-        if isinstance(step, str):
-            agent_name = step.strip()
-            if not agent_name:
-                return None
-            return Orchestrator._make_plan_step(agent_name)
-
-        if not isinstance(step, dict):
-            return None
-
-        agent_name = str(step.get("agent") or step.get("name") or "").strip()
-        if not agent_name:
-            return None
-
-        task = str(
-            step.get("task")
-            or step.get("instructions")
-            or step.get("objective")
-            or ""
-        ).strip()
-        reason = str(step.get("reason") or step.get("why") or "").strip()
-        depends_on = Orchestrator._normalize_plan_dependencies(
-            step.get("depends_on") or step.get("requires") or step.get("inputs")
-        )
-        preferred_model = Orchestrator._normalize_model_preference(
-            step.get("preferred_model") or step.get("model")
-        )
-        return Orchestrator._make_plan_step(
+        return plan_normalization.make_plan_step(
             agent_name,
             task=task,
             reason=reason,
@@ -2647,30 +2418,24 @@ class Orchestrator:
             preferred_model=preferred_model,
         )
 
+    @staticmethod
+    def _normalize_plan_dependencies(raw_dependencies: Any) -> List[str]:
+        return plan_normalization.normalize_plan_dependencies(raw_dependencies)
+
+    @staticmethod
+    def _merge_plan_dependencies(existing: List[str], incoming: List[str]) -> List[str]:
+        return plan_normalization.merge_plan_dependencies(existing, incoming)
+
+    @staticmethod
+    def _normalize_model_preference(raw_value: Any) -> str:
+        return plan_normalization.normalize_model_preference(raw_value)
+
+    @staticmethod
+    def _normalize_plan_step(step: Any) -> Optional[Dict[str, Any]]:
+        return plan_normalization.normalize_plan_step(step)
+
     def _normalize_current_plan(self, plan: List[Any]) -> List[Dict[str, Any]]:
-        normalized: List[Dict[str, Any]] = []
-        by_agent: Dict[str, Dict[str, Any]] = {}
-
-        for raw_step in plan or []:
-            step = self._normalize_plan_step(raw_step)
-            if step is None:
-                continue
-
-            existing = by_agent.get(step["agent"])
-            if existing is None:
-                normalized.append(step)
-                by_agent[step["agent"]] = step
-                continue
-
-            existing["task"] = self._merge_plan_text(existing["task"], step["task"])
-            existing["reason"] = self._merge_plan_text(existing["reason"], step["reason"])
-            existing["depends_on"] = self._merge_plan_dependencies(
-                existing.get("depends_on", []),
-                step.get("depends_on", []),
-            )
-            existing["preferred_model"] = existing.get("preferred_model") or step.get("preferred_model", "")
-
-        return normalized
+        return plan_normalization.normalize_current_plan(plan)
 
     def _get_requested_plan_steps(self, state: Dict[str, Any]) -> List[Dict[str, Any]]:
         return self._normalize_current_plan(list(state.get("current_plan", []) or []))
@@ -2816,10 +2581,17 @@ class Orchestrator:
                 parts.append(str(step))
         return "\n".join(part for part in parts if part)
 
-    def _is_triviality_bypass_blocked(self, state: Dict[str, Any], inspection_text: str) -> bool:
+    def _is_triviality_bypass_blocked(
+        self,
+        state: Dict[str, Any],
+        inspection_text: str,
+        output_to_eval: str,
+    ) -> bool:
         if state.get("critic_instructions"):
             return True
         if int(state.get("iteration_count") or 0) > 0:
+            return True
+        if not str(output_to_eval or "").strip():
             return True
         if not str(inspection_text or "").strip():
             return True
@@ -2852,7 +2624,7 @@ class Orchestrator:
         output_to_eval: str,
     ) -> Optional[MoralDecision]:
         inspection_text = self._build_moral_triviality_text(state, output_to_eval)
-        if self._is_triviality_bypass_blocked(state, inspection_text):
+        if self._is_triviality_bypass_blocked(state, inspection_text, output_to_eval):
             return None
 
         user_input = str(state.get("user_input") or "").strip()
@@ -2887,132 +2659,35 @@ class Orchestrator:
 
     async def _route_supervisor_request(self, messages: List[Dict]) -> Optional["RouterResult"]:
         """Try System 1, fall back to System 2.  Returns None on total failure."""
-        router_result: Optional[RouterResult] = None
-        try:
-            logger.info("Routing Supervisor through System 1 (Local Model)")
-            router_result = await self._route_to_system_1(
-                messages,
-                allowed_tools=[],
-                deadline_seconds=150.0,
-                context="supervisor",
-            )
-            if self._is_system_1_error(router_result):
-                logger.warning("System 1 returned an error payload in supervisor; escalating to System 2.")
-                router_result = None
-        except asyncio.TimeoutError:
-            logger.error("System 1 timed out in supervisor (150 s). Escalating to System 2.", exc_info=True)
-        except Exception as s1_err:
-            logger.error(f"System 1 raised an exception in supervisor: {s1_err!r}. Escalating.", exc_info=True)
-
-        if router_result is not None:
-            return router_result
-
-        if not self.cognitive_router.get_system_2_available():
-            return None
-
-        try:
-            logger.info("Escalating Supervisor to System 2")
-            router_result = await asyncio.wait_for(
-                self._route_to_system_2_redacted(
-                    messages,
-                    allowed_tools=[],
-                    purpose="supervisor_fallback",
-                    allow_sensitive_context=False,
-                ),
-                timeout=60.0,
-            )
-            return router_result
-        except asyncio.TimeoutError:
-            logger.error("System 2 timed out in supervisor (60 s).", exc_info=True)
-        except Exception as s2_err:
-            logger.error(f"System 2 raised an exception in supervisor: {s2_err!r}.", exc_info=True)
-        return None
+        return await supervisor_service.route_supervisor_request(
+            messages,
+            deps=supervisor_service.SupervisorRouteDeps(
+                route_to_system_1=self._route_to_system_1,
+                route_to_system_2_redacted=self._route_to_system_2_redacted,
+                is_system_1_error=self._is_system_1_error,
+                cognitive_router=self.cognitive_router,
+                log=logger,
+            ),
+        )
 
     @staticmethod
     def _extract_workers_payload(response: str) -> tuple[str, Optional[str]]:
-        marker = "WORKERS:"
-        if marker not in response:
-            return response.strip(), None
-
-        marker_index = response.rfind(marker)
-        answer = response[:marker_index].strip()
-        payload = response[marker_index + len(marker):].strip()
-        if payload.startswith("```"):
-            payload = re.sub(r"^```(?:json)?\s*", "", payload, flags=re.IGNORECASE)
-            payload = re.sub(r"\s*```$", "", payload).strip()
-        return answer, payload or None
+        return supervisor_parsing.extract_workers_payload(response)
 
     @staticmethod
     def _decode_workers_payload(workers_payload: str) -> Optional[Any]:
-        if not workers_payload:
-            return None
-        try:
-            decoded, end_index = json.JSONDecoder().raw_decode(workers_payload)
-        except ValueError:
-            return None
-
-        # Local models (e.g. gemma4:e4b) frequently append a prose explanation
-        # after the JSON array.  Since raw_decode() already validated and extracted
-        # a complete JSON value, the trailing text is harmless commentary.  Rejecting
-        # the entire payload here silently drops the agent dispatch plan, which is
-        # far worse than accepting a noisy suffix, so we log and proceed.
-        trailing = workers_payload[end_index:].strip()
-        if trailing:
-            logger.warning(
-                "_decode_workers_payload: model appended trailing text after JSON "
-                "(%r … first 60 chars of payload: %r); ignoring suffix and proceeding.",
-                trailing[:60],
-                workers_payload[:60],
-            )
-        return decoded
+        return supervisor_parsing.decode_workers_payload(workers_payload, log=logger)
 
     @staticmethod
     def _is_structured_plan_packet(step: Any) -> bool:
-        if not isinstance(step, dict):
-            return False
-
-        agent_name = str(step.get("agent") or step.get("name") or "").strip()
-        if not agent_name:
-            return False
-
-        task = str(step.get("task") or step.get("instructions") or step.get("objective") or "").strip()
-        reason = str(step.get("reason") or step.get("why") or "").strip()
-        return bool(task or reason)
+        return supervisor_parsing.is_structured_plan_packet(step)
 
     def _is_structured_plan_payload(self, payload: Any) -> bool:
-        if not isinstance(payload, list):
-            return False
-        return all(self._is_structured_plan_packet(step) for step in payload)
+        return supervisor_parsing.is_structured_plan_payload(payload)
 
     def _parse_supervisor_response(self, response: str, state: Dict[str, Any]) -> Dict[str, Any]:
         """Parse the WORKERS tag from *response* and update *state* in-place."""
-        response_text = response.strip()
-        answer, workers_payload = self._extract_workers_payload(response_text)
-
-        if workers_payload is None:
-            state["current_plan"] = []
-            state["final_response"] = answer or response.strip()
-            return state
-
-        decoded_payload = self._decode_workers_payload(workers_payload)
-        if not self._is_structured_plan_payload(decoded_payload):
-            logger.warning("Supervisor produced invalid or non-structured WORKERS payload: %r", workers_payload)
-            state["current_plan"] = []
-            fallback_answer = answer if (answer and len(answer.strip()) >= 40) else response_text
-            if fallback_answer == response_text:
-                fallback_answer = re.sub(r"WORKERS:\s*.*$", "", fallback_answer, flags=re.DOTALL).strip()
-            state["final_response"] = fallback_answer or answer or response_text
-            return state
-
-        normalized_plan = self._normalize_current_plan(decoded_payload)
-        if normalized_plan:
-            state["current_plan"] = normalized_plan
-            if answer:
-                state["worker_outputs"]["supervisor_context"] = answer
-        else:
-            state["current_plan"] = []
-            state["final_response"] = answer or response_text
-        return state
+        return supervisor_parsing.parse_supervisor_response(response, state, log=logger)
 
     def _get_agent_registry(self) -> AgentRegistry:
         registry = getattr(self, "agent_registry", None)
@@ -3203,79 +2878,58 @@ class Orchestrator:
 
         return self._group_execution_batches(batched, step_order), skipped_cycles
 
+    def _agent_executor_deps(self) -> agent_executor.AgentExecutorDeps:
+        return agent_executor.AgentExecutorDeps(
+            normalize_state=normalize_state,
+            deduct_energy=self._deduct_energy,
+            refund_energy=self._refund_energy,
+            refund_predictive_energy_budget=self._refund_predictive_energy_budget,
+            build_agent_state_snapshot=self._build_agent_state_snapshot,
+            run_agent=self._run_agent,
+            build_execution_batches=self._build_execution_batches,
+            get_requested_plan_steps=self._get_requested_plan_steps,
+            build_agent_handoff=self._build_agent_handoff,
+            route_agent_request=self._route_agent_request,
+            route_to_system_1=self._route_to_system_1,
+            route_to_system_2_redacted=self._route_to_system_2_redacted,
+            is_system_1_error=self._is_system_1_error,
+            is_system_2_error=self._is_system_2_error,
+            handle_cognitive_escalation=self._handle_cognitive_escalation,
+            get_capabilities_string=self._get_capabilities_string,
+            get_step_preferred_model=self._get_step_preferred_model,
+            core_memory=getattr(self, "core_memory", None),
+            cognitive_router=getattr(self, "cognitive_router", None),
+            charter_text=getattr(self, "charter_text", ""),
+            blocked_key=_BLOCKED_KEY,
+            hitl_error_type=RequiresHITLError,
+            log=logger,
+        )
+
     @staticmethod
     def _build_agent_state_snapshot(state: Dict[str, Any]) -> Dict[str, Any]:
-        snapshot = dict(state)
-        snapshot["chat_history"] = list(state.get("chat_history", []) or [])
-        snapshot["current_plan"] = list(state.get("current_plan", []) or [])
-        snapshot["worker_outputs"] = dict(state.get("worker_outputs", {}) or {})
-        return snapshot
+        return agent_executor.build_agent_state_snapshot(state)
 
     async def _run_parallel_agent_batch(
         self,
         batch: List[tuple[AgentDefinition, Dict[str, Any]]],
         state: Dict[str, Any],
     ) -> Dict[str, Any]:
-        batch_names = [agent_def.name for agent_def, _ in batch]
-        state = self._deduct_energy(state, sum(agent_def.energy_cost for agent_def, _ in batch), f"parallel_agents:{batch_names}")
-        base_state = self._build_agent_state_snapshot(state)
-        results = await asyncio.gather(
-            *[
-                self._run_agent(
-                    agent_def,
-                    self._build_agent_state_snapshot(base_state),
-                    task_packet=task_packet,
-                    deduct_energy=False,
-                )
-                for agent_def, task_packet in batch
-            ],
-            return_exceptions=True,
+        return await agent_executor.run_parallel_agent_batch(
+            batch,
+            state,
+            deps=self._agent_executor_deps(),
         )
-
-        blocked_result = None
-        for (agent_def, _task_packet), result in zip(batch, results):
-            if isinstance(result, RequiresHITLError):
-                logger.warning("Parallel agent %s requested HITL: %s", agent_def.name, result)
-                raise result
-            if not isinstance(result, Exception) and result.get(_BLOCKED_KEY) and blocked_result is None:
-                blocked_result = result[_BLOCKED_KEY]
-
-        if blocked_result is not None:
-            # The batch was already launched and charged as a unit before gather().
-            # The old refund path incorrectly refunded completed sibling agents:
-            # their work was consumed even though one sibling returned a block.
-            state[_BLOCKED_KEY] = blocked_result
-            return state
-
-        for (agent_def, _task_packet), result in zip(batch, results):
-            if isinstance(result, Exception):
-                logger.error("Parallel agent %s failed with exception: %s", agent_def.name, result, exc_info=True)
-                state["worker_outputs"][agent_def.name] = f"Error: {agent_def.name} failed with exception: {result}"
-                continue
-
-            agent_output = dict(result.get("worker_outputs", {}) or {}).get(agent_def.name)
-            if agent_output is not None:
-                state["worker_outputs"][agent_def.name] = agent_output
-        return state
 
     async def _try_route_agent_system_1(
         self,
         messages: List[Dict[str, str]],
         agent_def: AgentDefinition,
     ) -> Optional[RouterResult]:
-        try:
-            router_result = await self._route_to_system_1(
-                messages,
-                allowed_tools=agent_def.allowed_tools,
-                deadline_seconds=60.0,
-                context=agent_def.name,
-            )
-            if self._is_system_1_error(router_result):
-                return None
-            return router_result
-        except Exception as e:
-            logger.error("%s failed on System 1: %s", agent_def.name, e)
-            return None
+        return await agent_executor.try_route_agent_system_1(
+            messages,
+            agent_def,
+            deps=self._agent_executor_deps(),
+        )
 
     async def _try_route_agent_system_2(
         self,
@@ -3285,25 +2939,11 @@ class Orchestrator:
         task_packet: Optional[Dict[str, Any]] = None,
         state: Optional[Dict[str, Any]] = None,
     ) -> Optional[RouterResult]:
-        if not self.cognitive_router.get_system_2_available():
-            return None
-
-        try:
-            router_result = await asyncio.wait_for(
-                self._route_to_system_2_redacted(
-                    messages,
-                    allowed_tools=agent_def.allowed_tools,
-                    purpose=f"{agent_def.name}_fallback",
-                    allow_sensitive_context=False,
-                ),
-                timeout=60.0,
-            )
-            if self._is_system_2_error(router_result):
-                return None
-            return router_result
-        except Exception as e:
-            logger.error("%s failed on System 2: %s", agent_def.name, e)
-            return None
+        return await agent_executor.try_route_agent_system_2(
+            messages,
+            agent_def,
+            deps=self._agent_executor_deps(),
+        )
 
     async def _route_agent_request(
         self,
@@ -3313,40 +2953,12 @@ class Orchestrator:
         *,
         state: Optional[Dict[str, Any]] = None,
     ) -> tuple[Optional[RouterResult], bool]:
-        preferred_model = self._get_step_preferred_model(task_packet, agent_def)
-
-        if preferred_model == "system_2":
-            attempted_system_2 = self.cognitive_router.get_system_2_available()
-            logger.info("Routing %s through System 2 (agent preference)", agent_def.name)
-            router_result = await self._try_route_agent_system_2(
-                messages,
-                agent_def,
-                task_packet=task_packet,
-                state=state,
-            )
-            if router_result is not None:
-                return router_result, attempted_system_2
-
-            logger.info(
-                "Falling back %s to System 1 after preferred System 2 path was unavailable or failed",
-                agent_def.name,
-            )
-            return await self._try_route_agent_system_1(messages, agent_def), attempted_system_2
-
-        logger.info("Routing %s through System 1", agent_def.name)
-        router_result = await self._try_route_agent_system_1(messages, agent_def)
-        if router_result is not None:
-            return router_result, False
-
-        attempted_system_2 = self.cognitive_router.get_system_2_available()
-        if attempted_system_2:
-            logger.info("Escalating %s to System 2 after System 1 failure", agent_def.name)
-        return await self._try_route_agent_system_2(
+        return await agent_executor.route_agent_request(
             messages,
             agent_def,
             task_packet=task_packet,
-            state=state,
-        ), attempted_system_2
+            deps=self._agent_executor_deps(),
+        )
 
     async def _run_agent(
         self,
@@ -3356,81 +2968,25 @@ class Orchestrator:
         task_packet: Optional[Dict[str, Any]] = None,
         deduct_energy: bool = True,
     ) -> Dict[str, Any]:
-        state = normalize_state(state)
-        if deduct_energy:
-            state = self._deduct_energy(state, agent_def.energy_cost, agent_def.name)
-        try:
-            core_mem_str = await self.core_memory.get_context_string()
-
-            capabilities_str = self._get_capabilities_string()
-            handoff = self._build_agent_handoff(agent_def, state, task_packet=task_packet)
-            messages = [
-                {
-                    "role": "system",
-                    "content": f"{agent_def.system_prompt}\n{self.charter_text}\n{core_mem_str}\n\n{capabilities_str}",
-                },
-                {"role": "user", "content": handoff},
-            ]
-            router_result, attempted_system_2 = await self._route_agent_request(
-                messages,
-                agent_def,
-                task_packet=task_packet,
-                state=state,
-            )
-        except Exception as _agent_exc:
-            if deduct_energy:
-                state = self._refund_energy(state, agent_def.energy_cost, f"{agent_def.name}_exception")
-            raise _agent_exc
-
-        if router_result is None:
-            if deduct_energy:
-                state = self._refund_energy(state, agent_def.energy_cost, f"{agent_def.name}_null_result")
-            if attempted_system_2:
-                state["worker_outputs"][agent_def.name] = (
-                    f"Error: {agent_def.name} failed after System 1 error and System 2 fallback."
-                )
-            else:
-                state["worker_outputs"][agent_def.name] = (
-                    f"Error: {agent_def.name} failed and System 2 is not configured."
-                )
-            return state
-
-        if router_result.status == "cognitive_escalation":
-            solution = await self._handle_cognitive_escalation(state, router_result)
-            state["worker_outputs"][agent_def.name] = solution
-            return state
-
-        if router_result.status != "ok":
-            state[_BLOCKED_KEY] = router_result
-        else:
-            state["worker_outputs"][agent_def.name] = router_result.content
-
-        return state
+        return await agent_executor.run_agent(
+            agent_def,
+            state,
+            task_packet=task_packet,
+            deduct_energy=deduct_energy,
+            deps=self._agent_executor_deps(),
+        )
 
     async def _notify_admin(self, message: str) -> None:
         """Send a message to the admin via the outbound queue (used by heartbeat)."""
-        if self.outbound_queue is not None:
-            await self.outbound_queue.put(message)
-        else:
-            logger.info(f"[Admin notification (no queue)]: {message}")
+        await schedulers.notify_admin(getattr(self, "outbound_queue", None), message, log=logger)
 
     @staticmethod
     def _heartbeat_result_indicates_failure(result: str) -> bool:
-        lowered = str(result or "").lower()
-        return any(
-            marker in lowered
-            for marker in ("error", "cannot", "unable", "failed", "i cannot", "i am unable")
-        )
+        return schedulers.heartbeat_result_indicates_failure(result)
 
     @staticmethod
     def _build_heartbeat_execution_prompt(task: Dict[str, Any]) -> str:
-        return (
-            f"[HEARTBEAT TASK #{task['id']}]: {task['title']}\n"
-            f"You MUST execute this task right now by calling the appropriate tools. "
-            f"Do NOT describe what you plan to do — use your tools and report the actual results. "
-            f"If the task requires storing data, call update_core_memory or update_ledger explicitly. "
-            f"If you cannot complete it, explain exactly why."
-        )
+        return schedulers.build_heartbeat_execution_prompt(task)
 
     @staticmethod
     def _is_executable_heartbeat_task_candidate(
@@ -3438,140 +2994,48 @@ class Orchestrator:
         unresolved_task_ids: set[int],
         parent_ids: set[int],
     ) -> bool:
-        if str(node.get("tier") or "") != "Task":
-            return False
-        if str(node.get("status") or "").lower() not in {"pending", "deferred_due_to_energy"}:
-            return False
-
-        task_id = int(node.get("id") or 0)
-        if task_id <= 0:
-            return False
-        return task_id not in unresolved_task_ids and task_id not in parent_ids
+        return schedulers.is_executable_heartbeat_task_candidate(
+            node,
+            unresolved_task_ids,
+            parent_ids,
+        )
 
     async def _select_executable_heartbeat_tasks(self) -> List[Dict[str, Any]]:
         """Return executable Task candidates with Story/Epic context for energy scoring."""
-        candidates = await self.ledger_memory.get_energy_evaluation_candidates(
-            statuses=["pending", "deferred_due_to_energy"],
+        return await schedulers.select_executable_heartbeat_tasks(
+            ledger_memory=self.ledger_memory,
+            is_candidate=self._is_executable_heartbeat_task_candidate,
         )
-        if not candidates:
-            return []
-
-        active_nodes = await self.ledger_memory.get_active_objective_tree()
-        unresolved_rows = await self.ledger_memory.get_tasks_with_unresolved_dependencies(
-            statuses=["pending", "deferred_due_to_energy"],
-        )
-        unresolved_task_ids = {int(row["id"]) for row in unresolved_rows}
-        parent_ids = {
-            int(node["parent_id"])
-            for node in active_nodes
-            if node.get("parent_id") is not None
-        }
-
-        executable: List[Dict[str, Any]] = []
-        for candidate in candidates:
-            task = dict(candidate.get("task") or {})
-            domain = str(task.get("agent_domain") or "").strip().lower()
-            if domain not in {"", "aiden"}:
-                continue
-            if self._is_executable_heartbeat_task_candidate(task, unresolved_task_ids, parent_ids):
-                executable.append(candidate)
-
-        executable.sort(
-            key=lambda candidate: (
-                int((candidate.get("task") or {}).get("priority") or 999),
-                int((candidate.get("task") or {}).get("estimated_energy") or 999999),
-                int((candidate.get("task") or {}).get("id") or 0),
-            )
-        )
-        return executable
 
     async def _select_executable_heartbeat_task(self) -> Optional[Dict[str, Any]]:
         """Pick the next executable Task leaf with all dependencies resolved."""
-        candidates = await self._select_executable_heartbeat_tasks()
-        if not candidates:
-            return None
-        return dict(candidates[0].get("task") or {})
+        return await schedulers.select_executable_heartbeat_task(
+            self._select_executable_heartbeat_tasks,
+        )
 
     @staticmethod
     def _summarize_domain_task_result(result_payload: Dict[str, Any]) -> str:
-        for key in ("summary", "result_summary", "final_answer", "message", "result", "content"):
-            value = result_payload.get(key)
-            if isinstance(value, str) and value.strip():
-                return value.strip()[:_DOMAIN_RESULT_SUMMARY_MAX_LENGTH]
-        compact = json.dumps(result_payload, ensure_ascii=False)
-        return compact[:_DOMAIN_RESULT_SUMMARY_MAX_LENGTH] if compact else "No summary provided"
+        return schedulers.summarize_domain_task_result(
+            result_payload,
+            max_length=_DOMAIN_RESULT_SUMMARY_MAX_LENGTH,
+        )
 
     @staticmethod
     def _extract_domain_task_error(result_payload: Dict[str, Any]) -> str:
-        for key in ("error", "message", "details", "reason"):
-            value = result_payload.get(key)
-            if isinstance(value, str) and value.strip():
-                return value.strip()[:_DOMAIN_RESULT_SUMMARY_MAX_LENGTH]
-        compact = json.dumps(result_payload, ensure_ascii=False)
-        return compact[:_DOMAIN_RESULT_SUMMARY_MAX_LENGTH] if compact else "Unknown error"
+        return schedulers.extract_domain_task_error(
+            result_payload,
+            max_length=_DOMAIN_RESULT_SUMMARY_MAX_LENGTH,
+        )
 
     async def _notify_completed_domain_tasks(self) -> None:
-        query_pending = getattr(self.ledger_memory, "get_completed_tasks_pending_notification", None)
-        if not callable(query_pending):
-            return
-        try:
-            pending = await query_pending(limit=25)
-        except Exception as exc:
-            logger.warning("Domain result monitor: query failed: %s", exc, exc_info=True)
-            return
-
-        if not pending:
-            return
-
-        notified_ids: List[int] = []
-        for task in pending:
-            task_id = int(task.get("id") or 0)
-            if task_id <= 0:
-                continue
-            domain = str(task.get("agent_domain") or "").strip().lower()
-            if domain not in _NOTIFIABLE_DOMAIN_RESULTS:
-                logger.debug(
-                    "Domain result monitor: skipping task #%s for non-notifiable domain '%s'.",
-                    task_id,
-                    domain,
-                )
-                continue
-
-            title = str(task.get("title") or "").strip() or f"Task #{task_id}"
-            status = str(task.get("status") or "").strip().lower()
-            get_task_result = getattr(self.ledger_memory, "get_task_result", None)
-            if callable(get_task_result):
-                result_payload = await get_task_result(task_id) or {}
-            else:
-                result_payload = {}
-
-            try:
-                if status == "completed":
-                    summary = self._summarize_domain_task_result(result_payload)
-                    await self._notify_admin(f"Google Agent completed: {title} — {summary}")
-                    notified_ids.append(task_id)
-                elif status in {"failed", "blocked"}:
-                    error = self._extract_domain_task_error(result_payload)
-                    await self._notify_admin(
-                        f"Google Agent blocked: {title} — {error}. Reply to investigate."
-                    )
-                    notified_ids.append(task_id)
-            except Exception as exc:
-                logger.warning(
-                    "Domain result monitor: notification failed for task #%s: %s",
-                    task_id,
-                    exc,
-                    exc_info=True,
-                )
-
-        if notified_ids:
-            mark_notified = getattr(self.ledger_memory, "mark_tasks_admin_notified", None)
-            if not callable(mark_notified):
-                return
-            try:
-                await mark_notified(notified_ids)
-            except Exception as exc:
-                logger.warning("Domain result monitor: failed to mark notified tasks: %s", exc, exc_info=True)
+        await schedulers.notify_completed_domain_tasks(
+            ledger_memory=self.ledger_memory,
+            notify_admin_fn=self._notify_admin,
+            summarize_result=self._summarize_domain_task_result,
+            extract_error=self._extract_domain_task_error,
+            notifiable_domains=_NOTIFIABLE_DOMAIN_RESULTS,
+            log=logger,
+        )
 
     async def _handle_heartbeat_task_failure(
         self,
@@ -3580,34 +3044,15 @@ class Orchestrator:
         reason: str,
         result_excerpt: str,
     ) -> None:
-        task_id = int(task["id"])
-        strike_count = await self._increment_heartbeat_failure_count(task_id)
-
-        if strike_count >= _HEARTBEAT_FAILURE_STRIKES:
-            await self.ledger_memory.update_objective_status(task_id, "blocked")
-            await self.ledger_memory.ensure_parent_chain_active(task_id)
-            await self._notify_admin(
-                "HITL REQUIRED: Task blocked after repeated heartbeat failures.\n"
-                f"  Task #{task_id}: {task['title']}\n"
-                f"  Strikes: {strike_count}\n"
-                f"  Reason: {reason}\n"
-                f"  Latest result: {result_excerpt[:220]}"
-            )
-            logger.warning(
-                "Heartbeat: Task #%s blocked after %s failures (%s)",
-                task_id,
-                strike_count,
-                reason,
-            )
-            return
-
-        await self.ledger_memory.update_objective_status(task_id, "pending")
-        logger.warning(
-            "Heartbeat: Task #%s failure strike %s/%s (%s)",
-            task_id,
-            strike_count,
-            _HEARTBEAT_FAILURE_STRIKES,
-            reason,
+        await schedulers.handle_heartbeat_task_failure(
+            task=task,
+            reason=reason,
+            result_excerpt=result_excerpt,
+            ledger_memory=self.ledger_memory,
+            increment_failure_count=self._increment_heartbeat_failure_count,
+            notify_admin_fn=self._notify_admin,
+            failure_strikes=_HEARTBEAT_FAILURE_STRIKES,
+            log=logger,
         )
 
     async def _defer_heartbeat_task_due_to_energy(
@@ -3619,20 +3064,14 @@ class Orchestrator:
         available_energy: int,
         race: bool = False,
     ) -> None:
-        await self.ledger_memory.defer_task_due_to_energy(
-            task_id,
-            evaluation_record,
-            cooldown_seconds=int(decision.defer_cooldown_seconds),
-        )
-        logger.info(
-            "Heartbeat: Deferred task #%s%s (%s). roi=%.2f cost=%s available=%s reserve_floor=%s",
-            task_id,
-            " after budget race" if race else "",
-            decision.reason,
-            decision.roi,
-            decision.predicted_cost,
-            available_energy,
-            decision.min_reserve,
+        await energy_service.defer_heartbeat_task_due_to_energy(
+            self,
+            task_id=task_id,
+            decision=decision,
+            evaluation_record=evaluation_record,
+            available_energy=available_energy,
+            race=race,
+            log=logger,
         )
 
     async def _execute_heartbeat_task(
@@ -3641,148 +3080,50 @@ class Orchestrator:
         task: Dict[str, Any],
         decision: EnergyDecision,
     ) -> None:
-        task_id = int(task["id"])
-        logger.info(
-            "Heartbeat: Accepting executable task #%s: %s (roi=%.2f cost=%s budget=%s)",
-            task_id,
-            str(task.get("title") or "")[:60],
-            decision.roi,
-            decision.predicted_cost,
-            await self._get_predictive_energy_budget_remaining(),
+        await schedulers.execute_heartbeat_task(
+            task=task,
+            decision=decision,
+            ledger_memory=self.ledger_memory,
+            process_message=self.process_message,
+            get_predictive_energy_budget_remaining=self._get_predictive_energy_budget_remaining,
+            build_prompt=self._build_heartbeat_execution_prompt,
+            result_indicates_failure=self._heartbeat_result_indicates_failure,
+            handle_failure=self._handle_heartbeat_task_failure,
+            clear_failure_count=self._clear_heartbeat_failure_count,
+            notify_admin_fn=self._notify_admin,
+            heartbeat_interval=HEARTBEAT_INTERVAL,
+            log=logger,
         )
-        await self.ledger_memory.update_objective_status(task_id, "active")
-
-        timeout_seconds = HEARTBEAT_INTERVAL * 0.9
-        prompt = self._build_heartbeat_execution_prompt(task)
-
-        try:
-            result = await asyncio.wait_for(
-                self.process_message(user_message=prompt, user_id="heartbeat"),
-                timeout=timeout_seconds,
-            )
-        except asyncio.TimeoutError:
-            await self._handle_heartbeat_task_failure(
-                task,
-                reason="timeout",
-                result_excerpt=f"Timed out after {int(timeout_seconds)}s",
-            )
-            return
-        except Exception as e:
-            await self._handle_heartbeat_task_failure(
-                task,
-                reason="exception",
-                result_excerpt=str(e),
-            )
-            return
-
-        if self._heartbeat_result_indicates_failure(result):
-            await self._handle_heartbeat_task_failure(
-                task,
-                reason="execution_failure",
-                result_excerpt=result,
-            )
-            return
-
-        await self.ledger_memory.update_objective_status(task_id, "completed")
-        await self._clear_heartbeat_failure_count(task_id)
-
-        summary = (
-            f"Heartbeat completed task #{task_id}:\n"
-            f"  Task: {task.get('title', '')}\n"
-            f"  Predicted Energy Cost: {decision.predicted_cost}\n"
-            f"  Remaining Predictive Budget: {await self._get_predictive_energy_budget_remaining()}\n"
-            f"  Result: {str(result)[:220]}"
-        )
-        await self._notify_admin(summary)
-        logger.info("Heartbeat: Task #%s completed.", task_id)
 
     async def _run_heartbeat_cycle(self) -> None:
-        if not hasattr(self, "_predictive_energy_budget_lock"):
-            self._predictive_energy_budget_lock = asyncio.Lock()
-        if not hasattr(self, "_predictive_energy_budget_remaining"):
-            self._predictive_energy_budget_remaining = max(
-                0, int(os.getenv("INITIAL_ENERGY_BUDGET", "100"))
-            )
-        async with self._predictive_energy_budget_lock:
-            self._apply_predictive_energy_tick_locked(
-                self._resolve_energy_replenish_per_heartbeat()
-            )
-        await self._notify_completed_domain_tasks()
-        logger.info("Heartbeat: Querying objective backlog for executable Tasks...")
-        candidate_contexts = await self._select_executable_heartbeat_tasks()
-
-        if not candidate_contexts:
-            logger.info("Heartbeat: No executable dependency-resolved tasks available.")
-            return
-
-        for candidate in candidate_contexts:
-            task = dict(candidate.get("task") or {})
-            story = candidate.get("story")
-            epic = candidate.get("epic")
-
-            task_id = int(task.get("id") or 0)
-            if task_id <= 0:
-                continue
-
-            evaluation, decision, available_energy = await self._evaluate_energy_for_context(
-                task=task,
-                story=story,
-                epic=epic,
-                additional_context="heartbeat_dispatch",
-            )
-            evaluation_record = self._build_energy_evaluation_record(
-                evaluation=evaluation,
-                decision=decision,
-                available_energy=available_energy,
-                context="heartbeat",
-            )
-
-            if not decision.should_execute:
-                await self._defer_heartbeat_task_due_to_energy(
-                    task_id=task_id,
-                    decision=decision,
-                    evaluation_record=evaluation_record,
-                    available_energy=available_energy,
+        def _ensure_energy_budget() -> None:
+            if not hasattr(self, "_predictive_energy_budget_lock"):
+                self._predictive_energy_budget_lock = asyncio.Lock()
+            if not hasattr(self, "_predictive_energy_budget_remaining"):
+                self._predictive_energy_budget_remaining = max(
+                    0, int(os.getenv("INITIAL_ENERGY_BUDGET", "100"))
                 )
-                continue
 
-            reserved = await self._try_reserve_predictive_energy_budget(
-                predicted_cost=decision.predicted_cost,
-                min_reserve=decision.min_reserve,
-                reason=f"heartbeat_task:{task_id}",
+        _ensure_energy_budget()
+        await schedulers.run_heartbeat_cycle(
+            schedulers.HeartbeatCycleDeps(
+                ensure_energy_budget=_ensure_energy_budget,
+                predictive_energy_budget_lock=self._predictive_energy_budget_lock,
+                apply_predictive_energy_tick_locked=self._apply_predictive_energy_tick_locked,
+                resolve_energy_replenish_per_heartbeat=self._resolve_energy_replenish_per_heartbeat,
+                notify_completed_domain_tasks=self._notify_completed_domain_tasks,
+                select_executable_heartbeat_tasks=self._select_executable_heartbeat_tasks,
+                evaluate_energy_for_context=self._evaluate_energy_for_context,
+                build_energy_evaluation_record=self._build_energy_evaluation_record,
+                defer_heartbeat_task_due_to_energy=self._defer_heartbeat_task_due_to_energy,
+                try_reserve_predictive_energy_budget=self._try_reserve_predictive_energy_budget,
+                get_predictive_energy_budget_remaining=self._get_predictive_energy_budget_remaining,
+                energy_roi_engine=getattr(self, "energy_roi_engine", None),
+                ledger_memory=self.ledger_memory,
+                execute_heartbeat_task=self._execute_heartbeat_task,
+                log=logger,
             )
-            if not reserved:
-                current_budget = await self._get_predictive_energy_budget_remaining()
-                race_decision = self.energy_roi_engine.evaluate(
-                    estimated_effort=evaluation.estimated_effort,
-                    expected_value=evaluation.expected_value,
-                    available_energy=current_budget,
-                    defer_count=decision.defer_count,
-                )
-                race_record = self._build_energy_evaluation_record(
-                    evaluation=evaluation,
-                    decision=race_decision,
-                    available_energy=current_budget,
-                    context="heartbeat",
-                )
-                await self._defer_heartbeat_task_due_to_energy(
-                    task_id=task_id,
-                    decision=race_decision,
-                    evaluation_record=race_record,
-                    available_energy=current_budget,
-                    race=True,
-                )
-                continue
-
-            await self.ledger_memory.record_task_energy_evaluation(
-                task_id,
-                evaluation_record,
-                clear_next_eligible=True,
-            )
-            await self._execute_heartbeat_task(task=task, decision=decision)
-            return
-
-        logger.info("Heartbeat: All executable tasks were deferred by energy policy.")
+        )
 
     async def _heartbeat_loop(self) -> None:
         """
@@ -3794,147 +3135,52 @@ class Orchestrator:
         previous run is still in progress when the next interval fires, the
         new cycle is skipped (ISSUE-004).
         """
-        logger.info("Heartbeat loop started.")
-        _heartbeat_lock = asyncio.Lock()
-        while True:
-            await asyncio.sleep(HEARTBEAT_INTERVAL)
-            if _heartbeat_lock.locked():
-                logger.warning("Heartbeat: Previous run still in progress. Skipping this cycle.")
-                continue
-            async with _heartbeat_lock:
-                try:
-                    await self._run_heartbeat_cycle()
-                except Exception as e:
-                    logger.error(f"Heartbeat error: {e}", exc_info=True)
+        await schedulers.heartbeat_loop(
+            run_heartbeat_cycle_fn=self._run_heartbeat_cycle,
+            heartbeat_interval=HEARTBEAT_INTERVAL,
+            log=logger,
+        )
 
     def _prune_email_processed_history(self, now_ts: Optional[float] = None) -> None:
-        cutoff = float(now_ts if now_ts is not None else time.time()) - 86400.0
-        self._email_processed_timestamps = [
-            ts for ts in (self._email_processed_timestamps or []) if ts >= cutoff
-        ]
+        self._email_processed_timestamps = schedulers.prune_email_processed_history(
+            getattr(self, "_email_processed_timestamps", []),
+            now_ts,
+        )
 
     async def _run_email_poll_cycle(self) -> None:
-        self._email_poll_last_run_at = datetime.now()
-        self._prune_email_processed_history()
-        try:
-            raw_result = await read_inbox()
-        except Exception as exc:
-            logger.warning("Email poll: read_inbox failed: %s", exc, exc_info=True)
-            return
-
-        try:
-            result = json.loads(str(raw_result or ""))
-        except Exception as exc:
-            logger.warning("Email poll: read_inbox returned invalid JSON: %s", exc, exc_info=True)
-            return
-
-        if str(result.get("status") or "").strip().lower() != "success":
-            logger.warning(
-                "Email poll: inbox read failed: %s",
-                str(result.get("message") or "unknown error"),
-            )
-            return
-
-        emails = result.get("emails") or []
-        if not isinstance(emails, list):
-            logger.warning("Email poll: invalid inbox payload type for emails: %s", type(emails).__name__)
-            return
-
-        for item in emails:
-            if not isinstance(item, dict):
-                continue
-            try:
-                sender = str(item.get("sender") or "unknown sender").strip() or "unknown sender"
-                subject = str(item.get("subject") or "(no subject)").strip() or "(no subject)"
-                body = str(item.get("body") or "")
-                attachment_paths_raw = item.get("attachment_paths") or []
-                attachment_paths = (
-                    [str(path) for path in attachment_paths_raw]
-                    if isinstance(attachment_paths_raw, list)
-                    else []
-                )
-                acceptance_payload = {
-                    "sender": sender,
-                    "subject": subject,
-                    "date": str(item.get("date") or ""),
-                    "message_id": str(item.get("message_id") or ""),
-                    "body": body,
-                    "attachment_paths": attachment_paths,
-                }
-                title = f"Process email request: {subject} from {sender}"
-                objective_id = await self.ledger_memory.add_objective(
-                    tier="Task",
-                    title=title,
-                    estimated_energy=20,
-                    origin="email",
-                    acceptance_criteria=json.dumps(acceptance_payload, ensure_ascii=False),
-                )
-                await self.ledger_memory.set_task_agent_domain(objective_id, "google")
-                self._email_processed_timestamps.append(time.time())
-                logger.info("Email poll: created task #%s for new email: %s", objective_id, title)
-            except Exception as exc:
-                logger.warning("Email poll: failed to create objective from email: %s", exc, exc_info=True)
-
-        self._prune_email_processed_history()
+        self._email_poll_last_run_at, self._email_processed_timestamps = await schedulers.run_email_poll_cycle(
+            ledger_memory=self.ledger_memory,
+            processed_timestamps=getattr(self, "_email_processed_timestamps", []),
+            read_inbox_fn=read_inbox,
+            now_fn=datetime.now,
+            time_fn=time.time,
+            log=logger,
+        )
 
     async def _email_poll_loop(self) -> None:
-        logger.info("Email poll loop started.")
-        _email_poll_lock = asyncio.Lock()
-        while True:
-            await asyncio.sleep(EMAIL_POLL_INTERVAL)
-            if _email_poll_lock.locked():
-                logger.warning("Email poll: Previous run still in progress. Skipping this cycle.")
-                continue
-            async with _email_poll_lock:
-                try:
-                    await self._run_email_poll_cycle()
-                except Exception as exc:
-                    logger.warning("Email poll loop error: %s", exc, exc_info=True)
+        await schedulers.email_poll_loop(
+            run_email_poll_cycle_fn=self._run_email_poll_cycle,
+            email_poll_interval=EMAIL_POLL_INTERVAL,
+            log=logger,
+        )
 
     async def get_email_poll_status(self) -> Dict[str, Any]:
         self._prune_email_processed_history()
-        last_poll_text = (
-            self._email_poll_last_run_at.strftime("%Y-%m-%d %H:%M:%S")
-            if self._email_poll_last_run_at is not None
-            else "never"
+        return await schedulers.get_email_poll_status(
+            ledger_memory=self.ledger_memory,
+            last_run_at=getattr(self, "_email_poll_last_run_at", None),
+            processed_timestamps=getattr(self, "_email_processed_timestamps", []),
         )
-        pending_google_tasks = await self.ledger_memory.get_pending_tasks_for_domain("google", limit=10000)
-        return {
-            "last_poll_time": last_poll_text,
-            "emails_processed_last_24h": len(self._email_processed_timestamps or []),
-            "pending_google_tasks": len(pending_google_tasks or []),
-        }
 
     async def _memory_consolidation_loop(self) -> None:
         """Background task: periodically consolidate chat history into long-term memory."""
-        logger.info("Memory consolidation loop started.")
-        while True:
-            await asyncio.sleep(MEMORY_CONSOLIDATION_INTERVAL)
-            try:
-                user_ids = await self.ledger_memory.get_recent_user_ids(limit=20)
-                if not user_ids:
-                    continue
-                for user_id in user_ids:
-                    await self._consolidate_memory(user_id)
-                # Periodic DB pruning — delete old chat rows and vector memories
-                try:
-                    deleted = await self.ledger_memory.prune_old_chat_history(
-                        days=int(os.getenv("CHAT_HISTORY_MAX_DAYS", "90")),
-                        keep_minimum=int(os.getenv("CHAT_HISTORY_MIN_ROWS", "20")),
-                    )
-                    if deleted:
-                        logger.info("Consolidation pruning: removed %d chat_history rows.", deleted)
-                except Exception as _p_err:
-                    logger.warning("Periodic chat history pruning failed: %s", _p_err)
-                try:
-                    await asyncio.to_thread(
-                        self.vector_memory.prune_old_memories,
-                        int(os.getenv("VECTOR_MEMORY_MAX_DAYS", "180")),
-                    )
-                except Exception as _vp_err:
-                    logger.warning("Periodic vector memory pruning failed: %s", _vp_err)
-            except Exception as e:
-                logger.warning(f"Memory consolidation loop error: {e}", exc_info=True)
+        await schedulers.memory_consolidation_loop(
+            ledger_memory=self.ledger_memory,
+            vector_memory=self.vector_memory,
+            consolidate_memory=self._consolidate_memory,
+            interval_seconds=MEMORY_CONSOLIDATION_INTERVAL,
+            log=logger,
+        )
 
     async def _score_nocturnal_candidates(self, messages: List[Dict[str, str]]) -> RouterResult:
         if self.cognitive_router.get_system_2_available():
@@ -3963,19 +3209,13 @@ class Orchestrator:
         Uses asyncio.to_thread() so the blocking ChromaDB call does not
         stall the event loop.
         """
-        from datetime import timezone as _tz
-        try:
-            if len(text) < MEMORY_SAVE_THRESHOLD:
-                return
-            await self.vector_memory.add_memory_async(
-                text=text,
-                metadata={
-                    "type": "conversation",
-                    "timestamp": datetime.now(_tz.utc).strftime(_UTC_TIMESTAMP_FMT),
-                },
-            )
-        except Exception as e:
-            logger.warning(f"Async memory save failed: {e}")
+        await memory_service.save_memory_async(
+            vector_memory=self.vector_memory,
+            text=text,
+            memory_save_threshold=MEMORY_SAVE_THRESHOLD,
+            utc_timestamp_format=_UTC_TIMESTAMP_FMT,
+            log=logger,
+        )
 
     async def _load_approved_tools(self) -> None:
         """Re-register all previously approved dynamic tools from the DB at startup."""
@@ -4043,52 +3283,38 @@ class Orchestrator:
 
     async def _restore_heartbeat_failure_counts(self) -> None:
         """Restore heartbeat task-failure strike counts from persisted system_state."""
-        try:
-            raw_value = await self.ledger_memory.get_system_state(_HEARTBEAT_FAILURE_STATE_KEY)
-            if not raw_value:
-                self._heartbeat_failure_counts = {}
-                return
-
-            decoded = json.loads(raw_value)
-            if not isinstance(decoded, dict):
-                self._heartbeat_failure_counts = {}
-                return
-
-            restored: Dict[int, int] = {}
-            for raw_task_id, raw_count in decoded.items():
-                try:
-                    task_id = int(raw_task_id)
-                    count = int(raw_count)
-                except (TypeError, ValueError):
-                    continue
-                if task_id > 0 and count > 0:
-                    restored[task_id] = count
-            self._heartbeat_failure_counts = restored
-        except Exception as e:
-            logger.warning("Failed to restore heartbeat failure counts: %s", e)
-            self._heartbeat_failure_counts = {}
+        self._heartbeat_failure_counts = await schedulers.restore_heartbeat_failure_counts(
+            ledger_memory=self.ledger_memory,
+            state_key=_HEARTBEAT_FAILURE_STATE_KEY,
+            log=logger,
+        )
 
     async def _persist_heartbeat_failure_counts(self) -> None:
-        payload = {
-            str(task_id): int(count)
-            for task_id, count in self._heartbeat_failure_counts.items()
-            if int(count) > 0
-        }
-        await self.ledger_memory.set_system_state(
-            _HEARTBEAT_FAILURE_STATE_KEY,
-            json.dumps(payload, sort_keys=True),
+        await schedulers.persist_heartbeat_failure_counts(
+            ledger_memory=self.ledger_memory,
+            counts=getattr(self, "_heartbeat_failure_counts", {}),
+            state_key=_HEARTBEAT_FAILURE_STATE_KEY,
         )
 
     async def _increment_heartbeat_failure_count(self, task_id: int) -> int:
-        current = int(self._heartbeat_failure_counts.get(task_id, 0)) + 1
-        self._heartbeat_failure_counts[task_id] = current
-        await self._persist_heartbeat_failure_counts()
-        return current
+        if not hasattr(self, "_heartbeat_failure_counts"):
+            self._heartbeat_failure_counts = {}
+        return await schedulers.increment_heartbeat_failure_count(
+            ledger_memory=self.ledger_memory,
+            counts=self._heartbeat_failure_counts,
+            task_id=task_id,
+            state_key=_HEARTBEAT_FAILURE_STATE_KEY,
+        )
 
     async def _clear_heartbeat_failure_count(self, task_id: int) -> None:
-        if task_id in self._heartbeat_failure_counts:
-            self._heartbeat_failure_counts.pop(task_id, None)
-            await self._persist_heartbeat_failure_counts()
+        if not hasattr(self, "_heartbeat_failure_counts"):
+            self._heartbeat_failure_counts = {}
+        await schedulers.clear_heartbeat_failure_count(
+            ledger_memory=self.ledger_memory,
+            counts=self._heartbeat_failure_counts,
+            task_id=task_id,
+            state_key=_HEARTBEAT_FAILURE_STATE_KEY,
+        )
 
     def _fire_and_forget(self, coro) -> asyncio.Task:
         """Schedule a coroutine as a background task with a strong GC-safe reference (ISSUE-002).
@@ -4097,57 +3323,26 @@ class Orchestrator:
         when it completes, so the set never grows unboundedly while still
         preventing the garbage collector from destroying mid-flight tasks.
         """
-        task_name = getattr(coro, "__name__", "")
-        if not task_name and hasattr(coro, "cr_code"):
-            task_name = getattr(coro.cr_code, "co_name", "")
-        if not task_name:
-            task_name = repr(coro)
-
-        task = asyncio.create_task(coro)
-        self._background_tasks.add(task)
-
-        def _on_done(t: asyncio.Task) -> None:
-            self._background_tasks.discard(t)
-            if t.cancelled():
-                return
-            exc = t.exception()
-            if exc is not None:
-                logger.error(
-                    "Background task '%s' raised an unhandled exception: %s",
-                    task_name,
-                    exc,
-                    exc_info=exc,
-                )
-
-        task.add_done_callback(_on_done)
-        return task
+        if not hasattr(self, "_background_tasks"):
+            self._background_tasks = set()
+        return schedulers.fire_and_forget(
+            coro,
+            background_tasks=self._background_tasks,
+            log=logger,
+        )
 
     async def _get_user_lock(self, user_id: str) -> asyncio.Lock:
         """Return the per-user asyncio.Lock with LRU eviction to bound memory usage."""
-        _max = max(1, int(os.getenv("USER_LOCKS_MAX_SIZE", "500")))
-        async with self._user_locks_lock:
-            if user_id in self._user_locks:
-                # Move to end (most-recently-used)
-                self._user_locks[user_id] = self._user_locks.pop(user_id)
-                return self._user_locks[user_id]
-            lock = asyncio.Lock()
-            self._user_locks[user_id] = lock
-            # Evict oldest idle entries when over the cap. Never evict a locked
-            # lock or a second concurrent message for the same user can acquire
-            # a new lock and race pending MFA/HITL/tool-approval state.
-            while len(self._user_locks) > _max:
-                evict_key = next(
-                    (
-                        key
-                        for key, candidate_lock in self._user_locks.items()
-                        if key != user_id and not candidate_lock.locked()
-                    ),
-                    None,
-                )
-                if evict_key is None:
-                    break
-                self._user_locks.pop(evict_key, None)
-            return lock
+        if not hasattr(self, "_user_locks"):
+            self._user_locks = OrderedDict()
+        if not hasattr(self, "_user_locks_lock"):
+            self._user_locks_lock = asyncio.Lock()
+        return await schedulers.get_user_lock(
+            user_id=user_id,
+            user_locks=self._user_locks,
+            user_locks_lock=self._user_locks_lock,
+            max_size=max(1, int(os.getenv("USER_LOCKS_MAX_SIZE", "500"))),
+        )
 
     @staticmethod
     def _get_synthesis_self_test_timeout_seconds() -> float:
@@ -4827,123 +4022,41 @@ class Orchestrator:
 
     async def supervisor_node(self, state: Dict[str, Any]) -> Dict[str, Any]:
         """Plans execution. Tries System 1 (local) first per Directive 1.3; escalates to System 2 only on failure."""
-        state = normalize_state(state)
-
-        if not state.get("_energy_gate_cleared"):
-            deferred = await self._try_ad_hoc_dispatch_energy_gate(
-                state,
-                dispatch_context="graph_dispatch",
-            )
-            if deferred is not None:
-                state["current_plan"] = []
-                state["final_response"] = deferred
-                return state
-            state["_energy_gate_cleared"] = True
-
-        state = self._deduct_energy(state, ENERGY_COST_SUPERVISOR, "supervisor")
-        user_input = state["user_input"]
-        core_mem_str = await self.core_memory.get_context_string()
-        archival_context = await self._get_archival_context(user_input)
-        capabilities_str = self._get_capabilities_string()
-        archival_block = f"{archival_context}\n\n" if archival_context else ""
-
-        system_prompt = build_supervisor_prompt(
-            charter_text=self.charter_text,
-            core_mem_str=core_mem_str,
-            archival_block=archival_block,
-            capabilities_str=capabilities_str,
-            agent_descriptions=self._get_agent_descriptions(),
-            sensory_context=self._get_sensory_context(),
-            os_name=self.sensory_state.get("os", platform.system()),
-            downloads_dir=self.prompt_config.downloads_dir,
+        return await supervisor_service.supervisor_node(
+            state,
+            deps=supervisor_service.SupervisorNodeDeps(
+                normalize_state=normalize_state,
+                try_ad_hoc_dispatch_energy_gate=self._try_ad_hoc_dispatch_energy_gate,
+                deduct_energy=self._deduct_energy,
+                refund_energy=self._refund_energy,
+                core_memory=self.core_memory,
+                get_archival_context=self._get_archival_context,
+                get_capabilities_string=self._get_capabilities_string,
+                get_agent_descriptions=self._get_agent_descriptions,
+                get_sensory_context=self._get_sensory_context,
+                build_user_prompt_message=self._build_user_prompt_message,
+                route_supervisor_request=self._route_supervisor_request,
+                handle_cognitive_escalation=self._handle_cognitive_escalation,
+                parse_supervisor_response=self._parse_supervisor_response,
+                build_supervisor_prompt=build_supervisor_prompt,
+                charter_text=self.charter_text,
+                prompt_config=self.prompt_config,
+                sensory_state=self.sensory_state,
+                system_1_error_prefix=_SYSTEM_1_ERROR_PREFIX,
+                blocked_key=_BLOCKED_KEY,
+                energy_cost_supervisor=ENERGY_COST_SUPERVISOR,
+                cognitive_router=self.cognitive_router,
+                hitl_error_type=RequiresHITLError,
+                log=logger,
+            ),
         )
-
-        messages = [{"role": "system", "content": system_prompt}]
-        for turn in state.get("chat_history", []):
-            messages.append({"role": turn["role"], "content": turn["content"]})
-        if state.get("critic_instructions"):
-            messages.append({"role": "system", "content": state["critic_instructions"]})
-        messages.append(self._build_user_prompt_message(state))
-
-        try:
-            router_result = await self._route_supervisor_request(messages)
-
-            if router_result is not None and router_result.status == "cognitive_escalation":
-                solution = await self._handle_cognitive_escalation(state, router_result)
-                # Route through worker_outputs so critic_node evaluates the answer against the charter
-                state["worker_outputs"]["system_2_escalation"] = solution
-                state["current_plan"] = [{"agent": "system_2_escalation", "task": "", "reason": "cognitive escalation", "depends_on": [], "preferred_model": "system_2"}]
-                return state
-
-            if router_result is not None and router_result.status != "ok":
-                state[_BLOCKED_KEY] = router_result
-                return state
-
-            response = router_result.content if router_result else None
-
-            if not response or response.startswith(_SYSTEM_1_ERROR_PREFIX) or response.startswith("[System 2"):
-                logger.warning(f"Supervisor received error or no response: {response!r}")
-                state["current_plan"] = []
-                if not self.cognitive_router.get_system_2_available():
-                    state["final_response"] = (
-                        "I was unable to process this request locally. This task likely requires "
-                        "capabilities beyond my local model (e.g. internet access or complex reasoning). "
-                        "To enable this, configure a System 2 provider by setting GROQ_API_KEY in your .env file. "
-                        "Groq offers a free tier at console.groq.com."
-                    )
-                else:
-                    state["final_response"] = "Both local and cloud reasoning failed on this request. Please try rephrasing or simplifying the task."
-                return state
-
-            state = self._parse_supervisor_response(response, state)
-
-        except asyncio.TimeoutError:
-            logger.error("Supervisor node timeout (60s)")
-            state = self._refund_energy(state, ENERGY_COST_SUPERVISOR, "supervisor_timeout")
-            state["current_plan"] = []
-            state["final_response"] = "Planning timed out. Please try again."
-        except RequiresHITLError:
-            raise
-        except Exception as e:
-            logger.error(f"Supervisor Node failed: {e}", exc_info=True)
-            state = self._refund_energy(state, ENERGY_COST_SUPERVISOR, "supervisor_error")
-            state["current_plan"] = []
-            state["final_response"] = "Supervisor encountered an error. Please try again."
-
-        return state
 
     async def execute_workers_node(self, state: Dict[str, Any]) -> Dict[str, Any]:
         """LangGraph worker-execution node: runs all workers declared in current_plan."""
-        state = normalize_state(state)
-        if not state.get("current_plan"):
-            if not state.get("final_response"):
-                state["final_response"] = "No response could be generated. Please try again."
-            return state
-
-        state["current_plan"] = self._get_requested_plan_steps(state)
-        executed_agent = False
-        execution_batches, skipped_cycles = self._build_execution_batches(state["current_plan"])
-        for skipped in skipped_cycles:
-            state["worker_outputs"][skipped] = (
-                f"Warning: agent '{skipped}' was skipped due to a cyclic dependency in the plan."
-            )
-        for batch in execution_batches:
-            if not batch:
-                continue
-
-            executed_agent = True
-            if len(batch) == 1:
-                agent_def, task_packet = batch[0]
-                state = await self._run_agent(agent_def, state, task_packet=task_packet)
-            else:
-                state = await self._run_parallel_agent_batch(batch, state)
-
-            if state.get(_BLOCKED_KEY):
-                return state
-
-        if not executed_agent and not state.get("final_response"):
-            state["final_response"] = "No registered agent could execute the current plan."
-        return state
+        return await agent_executor.execute_workers_node(
+            state,
+            deps=self._agent_executor_deps(),
+        )
 
     async def research_agent(self, state: Dict[str, Any]) -> Dict[str, Any]:
         """Compatibility wrapper for the built-in research agent."""
@@ -5266,186 +4379,79 @@ class Orchestrator:
             return state
         return self._finalize_critic_pass(state, output_to_eval)
 
+    def _critic_node_deps(self) -> moral_governor.CriticNodeDeps:
+        return moral_governor.CriticNodeDeps(
+            normalize_state=normalize_state,
+            get_output_to_evaluate=self._get_output_to_evaluate,
+            store_moral_decision_trace=self._store_moral_decision_trace,
+            build_local_skip_decision=build_local_skip_decision,
+            try_triviality_bypass_decision=self._try_triviality_bypass_decision,
+            should_run_critic_review=self._should_run_critic_review,
+            deduct_energy=self._deduct_energy,
+            refund_energy=self._refund_energy,
+            build_critic_messages=self._build_critic_messages,
+            route_critic_request=self._route_critic_request,
+            handle_cognitive_escalation=self._handle_cognitive_escalation,
+            apply_critic_response=self._apply_critic_response,
+            persist_moral_audit_log=self._persist_moral_audit_log,
+            finalize_critic_pass=self._finalize_critic_pass,
+            suspend_task_for_moral_halt=self._suspend_task_for_moral_halt,
+            notify_admin=self._notify_admin,
+            spawn_debug_task=self._spawn_debug_task,
+            charter_text=getattr(self, "charter_text", ""),
+            charter_fallback=self._CHARTER_FALLBACK,
+            energy_cost_critic=ENERGY_COST_CRITIC,
+            blocked_key=_BLOCKED_KEY,
+            hitl_error_type=RequiresHITLError,
+            log=logger,
+        )
+
     async def critic_node(self, state: Dict[str, Any]) -> Dict[str, Any]:
         """Checks worker output against the charter. Skipped for direct supervisor responses."""
-        state = normalize_state(state)
-        output_to_eval = self._get_output_to_evaluate(state)
-
-        if getattr(self, "charter_text", "") == self._CHARTER_FALLBACK:
-            logger.warning("Critic disabled because fallback charter is active.")
-            self._store_moral_decision_trace(state, build_local_skip_decision("fallback_charter"))
-            state["moral_audit_mode"] = "disabled_fallback_charter"
-            state = self._finalize_critic_pass(state, output_to_eval)
-            return state
-
-        if not output_to_eval:
-            self._store_moral_decision_trace(
-                state,
-                build_local_skip_decision("empty_output"),
-            )
-            state["critic_feedback"] = "PASS"
-            await self._persist_moral_audit_log(state, output_to_eval)
-            return state
-
-        bypass_decision = self._try_triviality_bypass_decision(state, output_to_eval)
-        if bypass_decision is not None:
-            self._store_moral_decision_trace(state, bypass_decision)
-            state = self._finalize_critic_pass(state, output_to_eval)
-            await self._persist_moral_audit_log(state, output_to_eval)
-            return state
-
-        if not self._should_run_critic_review(state, output_to_eval):
-            self._store_moral_decision_trace(
-                state,
-                build_local_skip_decision("short_or_no_review_needed"),
-            )
-            state = self._finalize_critic_pass(state, output_to_eval)
-            await self._persist_moral_audit_log(state, output_to_eval)
-            return state
-
-        state = self._deduct_energy(state, ENERGY_COST_CRITIC, "critic")
-        messages = self._build_critic_messages(state, output_to_eval)
-
-        try:
-            router_result = await self._route_critic_request(messages)
-            if router_result.status == "cognitive_escalation":
-                solution = await self._handle_cognitive_escalation(state, router_result)
-                state = self._apply_critic_response(state, output_to_eval, solution)
-            elif router_result.status != "ok":
-                state[_BLOCKED_KEY] = router_result
-                return state
-            else:
-                state = self._apply_critic_response(state, output_to_eval, router_result.content)
-            await self._persist_moral_audit_log(state, output_to_eval)
-        except Exception as e:
-            logger.warning(f"Critic node failed/timed out: {e}. Defaulting to PASS.", exc_info=True)
-            state = self._refund_energy(state, ENERGY_COST_CRITIC, "critic_error")
-            self._store_moral_decision_trace(
-                state,
-                build_local_skip_decision("critic_error_fallback"),
-            )
-            state = self._finalize_critic_pass(state, output_to_eval)
-            await self._persist_moral_audit_log(state, output_to_eval)
-
-        if state.get("moral_halt_required"):
-            halt_summary = str(state.get("moral_halt_summary") or "Severe moral violation detected.").strip()
-            suspended_task_id = await self._suspend_task_for_moral_halt(state)
-            hitl_message = f"HITL REQUIRED: Moral governor halt. {halt_summary[:280]}"
-            if suspended_task_id is not None:
-                hitl_message += f" Task #{suspended_task_id} suspended."
-
-            try:
-                await self._notify_admin(hitl_message)
-            except Exception as e:
-                logger.warning("Failed to notify admin for moral halt: %s", e)
-
-            raise RequiresHITLError(hitl_message)
-
-        if state["iteration_count"] >= 3 and state["critic_feedback"] != "PASS":
-            await self._spawn_debug_task(state)
-            raise RequiresHITLError(
-                "Critic rejected output 3 times. Guidance needed.\n"
-                "Question: How should I proceed to satisfy the charter?"
-            )
-
-        return state
+        return await moral_governor.critic_node(
+            state,
+            deps=self._critic_node_deps(),
+        )
 
     async def _consolidate_memory(self, user_id: str) -> None:
         """Run deep nocturnal consolidation pipeline (extract -> filter -> score -> write-back)."""
-        try:
-            turns = await self.ledger_memory.get_chat_history(user_id, limit=20)
-            if len(turns) < 6:
-                return
-
-            recent_logs = await self.ledger_memory.get_logs(limit=20)
-            critic_logs = [
-                entry for entry in recent_logs
-                if "critic" in str(entry.get("message", "")).lower()
-                or str(entry.get("context", "")).lower().find("critic") != -1
-            ]
-            try:
-                blueprint_entries = await self.vector_memory.query_memory_async(
-                    "System 2 Reasoning Blueprint",
-                    n_results=5,
-                )
-            except Exception:
-                blueprint_entries = []
-
-            filtered_candidates = await self.nocturnal_consolidation.extract_and_filter_candidates(
-                user_id=user_id,
-                chat_history=turns,
-                worker_outputs={},
-                critic_feedback="",
-                blueprint_entries=blueprint_entries,
-                ledger_logs=critic_logs,
-                vector_memory=self.vector_memory,
-            )
-
-            if not filtered_candidates:
-                await self.ledger_memory.trim_chat_history(user_id, keep_last=5)
-                return
-
-            scored_candidates = await self.nocturnal_consolidation.score_candidates_with_system2(
-                filtered_candidates,
-                route_to_system_2=self._score_nocturnal_candidates,
-                redactor=self._redact_text_for_cloud,
-                threshold=float(os.getenv("NOCTURNAL_Q_THRESHOLD", "3.0")),
-            )
-            write_result = await self.nocturnal_consolidation.write_back_scored_candidates(
-                scored_candidates,
-                core_memory=self.core_memory,
-                vector_memory=self.vector_memory,
-                ledger_memory=self.ledger_memory,
-                threshold=float(os.getenv("NOCTURNAL_Q_THRESHOLD", "3.0")),
-            )
-
-            await self.ledger_memory.trim_chat_history(user_id, keep_last=5)
-            if write_result.get("stored_total", 0) > 0:
-                logger.info(
-                    "Nocturnal consolidation stored memories for %s: %s",
-                    user_id,
-                    write_result,
-                )
-        except asyncio.TimeoutError:
-            logger.warning("Memory consolidation skipped: LLM did not respond within 90s")
-        except Exception as e:
-            logger.warning(f"Memory consolidation failed: {type(e).__name__}: {e}", exc_info=True)
+        await memory_service.consolidate_memory(
+            user_id=user_id,
+            ledger_memory=self.ledger_memory,
+            vector_memory=self.vector_memory,
+            core_memory=self.core_memory,
+            nocturnal_consolidation=self.nocturnal_consolidation,
+            score_nocturnal_candidates=self._score_nocturnal_candidates,
+            redactor=self._redact_text_for_cloud,
+            threshold=float(os.getenv("NOCTURNAL_Q_THRESHOLD", "3.0")),
+            log=logger,
+        )
 
     async def _try_resume_mfa(self, user_id: str, user_message: str) -> Optional[str]:
         """Handle MFA challenge response. Returns a reply string, or None if not in MFA flow."""
-        if user_id not in self.pending_mfa:
-            return None
-        pending_tool = self.pending_mfa[user_id]
-        age = time.time() - pending_tool.get("_created_at", 0)
-        if age > _PENDING_STATE_TTL_SECONDS:
-            del self.pending_mfa[user_id]
-            self._fire_and_forget(self.ledger_memory.clear_mfa_state(user_id))
-            logger.info("Expired stale pending_mfa for %s (age %.0fs).", user_id, age)
-            return None
-        del self.pending_mfa[user_id]
-        self._fire_and_forget(self.ledger_memory.clear_mfa_state(user_id))
-        if not verify_mfa_challenge(user_message):
-            return "Error: MFA authorization failed. Action aborted."
-        exec_result = await self.cognitive_router._execute_tool(
-            pending_tool["name"], pending_tool["arguments"]
+        return await pending_state.try_resume_mfa(
+            user_id=user_id,
+            user_message=user_message,
+            pending_mfa=self.pending_mfa,
+            ledger_memory=self.ledger_memory,
+            execute_tool=self.cognitive_router._execute_tool,
+            handle_blocked_result=self._handle_blocked_result,
+            verify_mfa_challenge=verify_mfa_challenge,
+            fire_and_forget=self._fire_and_forget,
+            ttl_seconds=_PENDING_STATE_TTL_SECONDS,
+            time_fn=time.time,
+            log=logger,
         )
-        if exec_result.status == "ok":
-            return exec_result.content
-        return await self._handle_blocked_result(exec_result, pending_tool.get("user_id", user_id), {})
 
     async def _pop_pending_tool_approval_payload(self, user_id: str) -> Optional[Dict[str, Any]]:
-        if user_id not in self.pending_tool_approval:
-            return None
-        payload = self.pending_tool_approval[user_id]
-        age = time.time() - payload.get("_created_at", 0)
-        if age > _PENDING_STATE_TTL_SECONDS:
-            self.pending_tool_approval.pop(user_id, None)
-            await self.ledger_memory.clear_pending_approval(user_id)
-            logger.info("Expired stale pending_tool_approval for %s (age %.0fs).", user_id, age)
-            return None
-        self.pending_tool_approval.pop(user_id, None)
-        await self.ledger_memory.clear_pending_approval(user_id)
-        return payload
+        return await pending_state.pop_pending_tool_approval_payload(
+            user_id=user_id,
+            pending_tool_approval=self.pending_tool_approval,
+            ledger_memory=self.ledger_memory,
+            ttl_seconds=_PENDING_STATE_TTL_SECONDS,
+            time_fn=time.time,
+            log=logger,
+        )
 
     async def _reject_synthesized_tool(
         self,
@@ -5566,50 +4572,15 @@ class Orchestrator:
 
     async def _try_resume_tool_approval(self, user_id: str, user_message: str) -> Optional[Any]:
         """Handle YES/NO tool synthesis approval. Returns a reply string, or None if not pending."""
-        payload = await self._pop_pending_tool_approval_payload(user_id)
-        if payload is None:
-            return None
-
-        synthesis = payload["synthesis"]
-        original_state = payload["original_state"]
-        synthesis_run_id = payload.get("synthesis_run_id") or synthesis.get("synthesis_run_id")
-        attempts_used = int(synthesis.get("synthesis_attempts_used") or 0)
-        tool_name = str(synthesis.get("tool_name") or "")
-
-        if not user_message.strip().upper().startswith("YES"):
-            return await self._reject_synthesized_tool(
-                user_id=user_id,
-                synthesis_run_id=synthesis_run_id,
-                attempts_used=attempts_used,
-                synthesis=synthesis,
-            )
-
-        mismatch = await self._verify_synthesis_payload_digest(
-            synthesis=synthesis,
-            synthesis_run_id=synthesis_run_id,
-            attempts_used=attempts_used,
-            tool_name=tool_name,
+        return await pending_state.try_resume_tool_approval(
+            user_id=user_id,
+            user_message=user_message,
+            pop_payload=self._pop_pending_tool_approval_payload,
+            reject_synthesized_tool=self._reject_synthesized_tool,
+            verify_synthesis_payload_digest=self._verify_synthesis_payload_digest,
+            deploy_approved_synthesized_tool=self._deploy_approved_synthesized_tool,
+            handle_synthesized_tool_deploy_failure=self._handle_synthesized_tool_deploy_failure,
         )
-        if mismatch:
-            return mismatch
-
-        try:
-            return await self._deploy_approved_synthesized_tool(
-                user_id=user_id,
-                tool_name=tool_name,
-                synthesis=synthesis,
-                synthesis_run_id=synthesis_run_id,
-                attempts_used=attempts_used,
-                original_state=original_state,
-            )
-        except Exception as e:
-            return await self._handle_synthesized_tool_deploy_failure(
-                tool_name=tool_name,
-                synthesis=synthesis,
-                synthesis_run_id=synthesis_run_id,
-                attempts_used=attempts_used,
-                error=e,
-            )
 
     async def _load_state(
         self,
@@ -5619,131 +4590,74 @@ class Orchestrator:
         user_prompt: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """Return a state dict: resumes a HITL conversation if pending, else creates fresh."""
-        if user_id in self.pending_hitl_state:
-            _hitl_entry = self.pending_hitl_state[user_id]
-            _age = time.time() - _hitl_entry.get("_hitl_created_at", 0)
-            if _age > _PENDING_STATE_TTL_SECONDS:
-                self.pending_hitl_state.pop(user_id, None)
-                try:
-                    await self.ledger_memory.clear_hitl_state(user_id)
-                except Exception:
-                    pass
-                logger.warning("Expired stale pending_hitl_state for %s (age %.0fs); creating fresh state.", user_id, _age)
-                # Fall through to fresh state below
-            else:
-                state = normalize_state(self.pending_hitl_state.pop(user_id))
-                previous_iteration_count = int(state.get("iteration_count", 0) or 0)
-                previous_critic_feedback = state.get("critic_feedback")
-                # Clear the persisted DB record now that we've resumed (ISSUE-013)
-                try:
-                    await self.ledger_memory.clear_hitl_state(user_id)
-                except Exception as e:
-                    logger.warning(f"Failed to clear HITL state from DB for {user_id}: {e}")
-                state["admin_guidance"] = user_message
-                state["user_input"] += f"\n[ADMIN GUIDANCE: {user_message}]"
-                state["user_prompt"] = dict(user_prompt or {})
-                state["iteration_count"] = 0
-                state["current_plan"] = []
-                state["_energy_gate_cleared"] = False
-                # Track how many HITL cycles have been spent on this task (ISSUE-005)
-                state["hitl_count"] = state.get("hitl_count", 0) + 1
-                # Cap recharge to 75 so energy budget is never fully restored — this
-                # ensures a perpetually failing task eventually becomes unrecoverable
-                # rather than cycling indefinitely at full energy (ISSUE-005).
-                state["energy_remaining"] = min(state.get("energy_remaining", 0) + 50, 75)
-                # If the admin has guided this task 3+ times or the critic
-                # already exhausted its retry budget, abandon it.
-                if state["hitl_count"] >= 3 or (
-                    previous_iteration_count >= 3
-                    and previous_critic_feedback != "PASS"
-                ):
-                    logger.warning(
-                        f"HITL cycle limit (3) reached for user {user_id}. "
-                        f"Abandoning task: {state.get('user_input', '')[:80]}"
-                    )
-                    state["final_response"] = (
-                        "This task has been attempted 3 times with admin guidance and "
-                        "could not be completed. The request has been abandoned to prevent "
-                        "an infinite loop. Please rephrase or break it into smaller steps."
-                    )
-                return normalize_state(state)
-        state = self._new_state(user_id, user_message, user_prompt=user_prompt)
-        state["user_prompt"] = dict(user_prompt or {})
-        if user_id != "heartbeat":
-            try:
-                state["chat_history"] = await self.ledger_memory.get_chat_history(
-                    user_id,
-                    limit=_RECENT_CHAT_HISTORY_LIMIT,
-                )
-            except Exception as e:
-                logger.warning(f"Failed to load chat history for {user_id}: {e}")
-        return normalize_state(state)
+        return await memory_service.load_state(
+            user_id=user_id,
+            user_message=user_message,
+            user_prompt=user_prompt,
+            pending_hitl_state=self.pending_hitl_state,
+            ledger_memory=self.ledger_memory,
+            new_state=self._new_state,
+            normalize_state=normalize_state,
+            ttl_seconds=_PENDING_STATE_TTL_SECONDS,
+            recent_chat_history_limit=_RECENT_CHAT_HISTORY_LIMIT,
+            time_fn=time.time,
+            log=logger,
+        )
 
     @staticmethod
     def _has_ready_final_response(state: Dict[str, Any]) -> bool:
-        return bool(state.get("final_response") and not state.get("current_plan"))
+        return graph_runner.has_ready_final_response(state)
 
     async def _consume_blocked_result(self, state: Dict[str, Any], user_id: str) -> Optional[str]:
-        blocked_result = state.pop(_BLOCKED_KEY, None)
-        if blocked_result is None:
-            return None
-        return await self._handle_blocked_result(blocked_result, user_id, state)
+        return await graph_runner.consume_blocked_result(
+            state,
+            user_id,
+            blocked_key=_BLOCKED_KEY,
+            handle_blocked_result=self._handle_blocked_result,
+        )
 
     @staticmethod
     def _apply_critic_retry_instructions(state: Dict[str, Any]) -> None:
-        if state["iteration_count"] > 0:
-            constraints = [
-                str(item).strip()
-                for item in (state.get("moral_remediation_constraints", []) or [])
-                if str(item).strip()
-            ]
-            constraint_clause = ""
-            if constraints:
-                constraint_clause = " Remediation constraints: " + " | ".join(constraints[:6]) + "."
-            state["critic_instructions"] = (
-                f"[CRITIC FEEDBACK: {state['critic_feedback']}.{constraint_clause} Fix your output.]"
-            )
+        graph_runner.apply_critic_retry_instructions(state)
 
     async def _run_manual_graph_pass(
         self,
         state: Dict[str, Any],
         user_id: str,
     ) -> tuple[Dict[str, Any], Optional[str]]:
-        for node in (self.supervisor_node, self.execute_workers_node, self.critic_node):
-            state = await node(state)
-            blocked_response = await self._consume_blocked_result(state, user_id)
-            if blocked_response is not None:
-                return state, blocked_response
-        return state, None
+        return await graph_runner.run_manual_graph_pass(
+            state=state,
+            user_id=user_id,
+            supervisor_node=self.supervisor_node,
+            execute_workers_node=self.execute_workers_node,
+            critic_node=self.critic_node,
+            consume_blocked_result=self._consume_blocked_result,
+        )
 
     async def _run_graph_pass(
         self,
         state: Dict[str, Any],
         user_id: str,
     ) -> tuple[Dict[str, Any], Optional[str]]:
-        if self._compiled_graph is not None:
-            state = await self._compiled_graph.ainvoke(state)
-            return state, await self._consume_blocked_result(state, user_id)
-        return await self._run_manual_graph_pass(state, user_id)
+        return await graph_runner.run_graph_pass(
+            state=state,
+            user_id=user_id,
+            compiled_graph=getattr(self, "_compiled_graph", None),
+            consume_blocked_result=self._consume_blocked_result,
+            run_manual_graph_pass=self._run_manual_graph_pass,
+        )
 
     @staticmethod
     def _reset_after_critic_rejection(state: Dict[str, Any]) -> None:
-        state["final_response"] = ""
-        state["worker_outputs"] = {}
-        state["current_plan"] = []
-        state["moral_halt_required"] = False
-        state["moral_halt_summary"] = ""
+        graph_runner.reset_after_critic_rejection(state)
 
     @staticmethod
     def _ensure_final_response(state: Dict[str, Any], max_iterations: int) -> None:
-        if state["iteration_count"] >= max_iterations and state.get("critic_feedback") != "PASS":
-            state["final_response"] = "Unable to fulfill this request — output repeatedly failed internal safety checks."
-        if not state.get("final_response"):
-            state["final_response"] = "No valid response could be generated."
+        graph_runner.ensure_final_response(state, max_iterations)
 
     @staticmethod
     def _is_error_response(response: str) -> bool:
-        return any(response.startswith(prefix) for prefix in _ERROR_RESPONSE_PREFIXES)
+        return graph_runner.is_error_response(response, _ERROR_RESPONSE_PREFIXES)
 
     async def _persist_chat_turns(
         self,
@@ -5753,122 +4667,109 @@ class Orchestrator:
         *,
         turn_failed: bool = False,
     ) -> None:
-        if user_id == "heartbeat" or turn_failed:
-            return
-        try:
-            await self.ledger_memory.save_chat_turn(user_id, "user", user_message)
-            await self.ledger_memory.save_chat_turn(user_id, "assistant", final_resp)
-        except Exception as e:
-            logger.warning(f"Failed to save chat turn for {user_id}: {e}")
-
-        if self._increment_consolidation_turn_count(user_id):
-            self._fire_and_forget(self._consolidate_memory(user_id))
-
-        # Persist the current counter so it survives restarts.
-        # Only fire-and-forget when the ledger returns a real coroutine (not a test mock).
-        try:
-            current = int(self._consolidation_turn_counts.get(user_id, 0) or 0)
-            coro = self.ledger_memory.set_system_state(
-                f"consolidation_turns:{user_id}", str(current)
-            )
-            if asyncio.iscoroutine(coro):
-                self._fire_and_forget(coro)
-        except Exception as _e:
-            logger.debug("Consolidation counter persistence skipped: %s", _e)
-
-    def _increment_consolidation_turn_count(self, user_id: str) -> bool:
         if not hasattr(self, "_consolidation_turn_counts"):
             self._consolidation_turn_counts = OrderedDict()
+        await memory_service.persist_chat_turns(
+            user_id=user_id,
+            user_message=user_message,
+            final_resp=final_resp,
+            turn_failed=turn_failed,
+            ledger_memory=self.ledger_memory,
+            increment_consolidation_turn_count=self._increment_consolidation_turn_count,
+            consolidate_memory=self._consolidate_memory,
+            fire_and_forget=self._fire_and_forget,
+            consolidation_turn_counts=self._consolidation_turn_counts,
+            log=logger,
+        )
 
-        max_size = max(
-            1,
-            int(os.getenv(
+    def _increment_consolidation_turn_count(self, user_id: str) -> bool:
+        counts, triggered = memory_service.increment_consolidation_turn_count(
+            counts=getattr(self, "_consolidation_turn_counts", OrderedDict()),
+            user_id=user_id,
+            max_size=int(os.getenv(
                 "CONSOLIDATION_TURN_COUNTS_MAX_SIZE",
                 str(_CONSOLIDATION_TURN_COUNTS_MAX_SIZE_DEFAULT),
             )),
+            trigger_turns=_CONSOLIDATION_TRIGGER_TURNS,
         )
-        counts = self._consolidation_turn_counts
-        # Tests and compatibility paths may construct Orchestrator via __new__()
-        # or restore this attribute from persisted plain-dict JSON.
-        if not isinstance(counts, OrderedDict):
-            counts = OrderedDict(counts)
-            self._consolidation_turn_counts = counts
-
-        current_count = int(counts.get(user_id, 0) or 0)
-        if user_id in counts:
-            counts.move_to_end(user_id)
-        else:
-            counts[user_id] = current_count
-
-        counts[user_id] = current_count + 1
-        while len(counts) > max_size:
-            counts.popitem(last=False)
-
-        trigger_turns = max(1, _CONSOLIDATION_TRIGGER_TURNS)
-        if counts.get(user_id, 0) >= trigger_turns:
-            counts[user_id] = 0
-            return True
-        return False
+        self._consolidation_turn_counts = counts
+        return triggered
 
     def _schedule_response_memory_save(self, user_message: str, final_resp: str) -> None:
-        self._fire_and_forget(
-            self._save_memory_async(f"User: {user_message}\nAssistant: {final_resp}")
+        memory_service.schedule_response_memory_save(
+            fire_and_forget=self._fire_and_forget,
+            save_memory_async=self._save_memory_async,
+            user_message=user_message,
+            final_resp=final_resp,
         )
 
+    @staticmethod
+    def _ensure_non_empty_response_text(value: Any) -> str:
+        text = str(value or "").strip()
+        if text:
+            return text
+        return "I couldn't generate a response. Please retry."
+
+    @staticmethod
+    def _recover_displayable_response(raw_response: Any, sanitized_response: Any) -> str:
+        return memory_service.recover_displayable_response(raw_response, sanitized_response)
+
     async def _finalize_user_response(self, user_id: str, user_message: str, response: str) -> str:
-        final_resp = self.cognitive_router.sanitize_response(response)
-        await self._persist_chat_turns(user_id, user_message, final_resp)
-        self._schedule_response_memory_save(user_message, final_resp)
-        return final_resp
+        return await memory_service.finalize_user_response(
+            user_id=user_id,
+            user_message=user_message,
+            response=response,
+            sanitizer=self.cognitive_router.sanitize_response,
+            persist_chat_turns=self._persist_chat_turns,
+            schedule_response_memory_save=self._schedule_response_memory_save,
+        )
 
     async def _run_graph_loop(self, state: Dict[str, Any], user_id: str, user_message: str) -> str:
         """Execute the supervisor → workers → critic loop. Returns the final sanitized response."""
-        state = normalize_state(state)
-        max_iterations = 3
-
-        # Fast-exit if the state already carries a final response before we enter
-        # the loop — e.g. when the HITL cycle limit has been reached (ISSUE-005).
-        if self._has_ready_final_response(state):
-            return self.cognitive_router.sanitize_response(state["final_response"])
-
-        while state["iteration_count"] < max_iterations:
-            blocked_response = await self._consume_blocked_result(state, user_id)
-            if blocked_response is not None:
-                return blocked_response
-
-            self._apply_critic_retry_instructions(state)
-            state, blocked_response = await self._run_graph_pass(state, user_id)
-            if blocked_response is not None:
-                return blocked_response
-
-            if state["critic_feedback"] == "PASS":
-                state["critic_instructions"] = ""
-                break
-            logger.warning(f"Critic rejected output on iteration {state['iteration_count']}")
-            # Clear the stale plan so the supervisor re-plans with the Critic
-            # feedback injected via state["critic_instructions"] (ISSUE-006).
-            self._reset_after_critic_rejection(state)
-
-        self._ensure_final_response(state, max_iterations)
-        return await self._finalize_user_response(user_id, user_message, state["final_response"])
+        return await graph_runner.run_graph_loop(
+            state,
+            user_id,
+            user_message,
+            deps=graph_runner.GraphLoopDeps(
+                normalize_state=normalize_state,
+                consume_blocked_result=self._consume_blocked_result,
+                apply_critic_retry_instructions=self._apply_critic_retry_instructions,
+                run_graph_pass=self._run_graph_pass,
+                reset_after_critic_rejection=self._reset_after_critic_rejection,
+                ensure_final_response=self._ensure_final_response,
+                finalize_user_response=self._finalize_user_response,
+                sanitizer=self.cognitive_router.sanitize_response,
+                log=logger,
+            ),
+        )
 
     async def _try_resume_tool_approval_compat(self, user_id: str, user_message: str) -> Optional[Any]:
-        pipeline = getattr(self, "synthesis_pipeline", None)
-        resume_fn = getattr(pipeline, "try_resume_tool_approval", None)
-        if callable(resume_fn):
-            outcome = await resume_fn(user_id, user_message)
-            if outcome is None:
-                return None
-            reply_text = str(getattr(outcome, "reply_text", outcome) or "")
-            follow_up_input = getattr(outcome, "follow_up_input", None)
-            if follow_up_input is None:
-                return reply_text
-            follow_up_text = str(follow_up_input or "").strip()
-            return {
-                "reply_text": reply_text,
-                "_deferred_follow_up_input": follow_up_text,
-            }
-        return await self._try_resume_tool_approval(user_id, user_message)
+        return await pending_state.try_resume_tool_approval_compat(
+            user_id=user_id,
+            user_message=user_message,
+            synthesis_pipeline=self._get_synthesis_pipeline(),
+            fallback_resume=self._try_resume_tool_approval,
+        )
+
+    async def _persist_hitl_state_from_error(
+        self,
+        state: Dict[str, Any],
+        hitl_error: Exception,
+        user_id: str,
+    ) -> str:
+        return await pending_state.persist_hitl_state_from_error(
+            state=state,
+            hitl_error=hitl_error,
+            user_id=user_id,
+            pending_hitl_state=self.pending_hitl_state,
+            admin_user_id=str(getattr(self, "_admin_user_id", "") or ""),
+            ledger_memory=self.ledger_memory,
+            strip_audio_bytes_for_persistence=self._strip_audio_bytes_for_persistence,
+            extract_heartbeat_task_id=self._extract_heartbeat_task_id,
+            fire_and_forget=self._fire_and_forget,
+            outbound_queue=getattr(self, "outbound_queue", None),
+            time_fn=time.time,
+        )
 
     async def _run_user_turn_locked(
         self,
@@ -5877,68 +4778,28 @@ class Orchestrator:
         user_message: str,
         user_prompt: Dict[str, Any],
     ) -> str:
-        has_audio_prompt = bool(self._extract_audio_bytes(user_prompt))
-
-        state = await self._load_state(
-            user_id,
-            user_message,
+        return await graph_runner.run_user_turn_locked(
+            user_id=user_id,
+            user_message=user_message,
             user_prompt=user_prompt,
+            deps=graph_runner.UserTurnDeps(
+                extract_audio_bytes=self._extract_audio_bytes,
+                load_state=self._load_state,
+                sanitizer=self.cognitive_router.sanitize_response,
+                remember_user_profile=self._remember_user_profile,
+                remember_assistant_identity=self._remember_assistant_identity,
+                vector_memory=getattr(self, "vector_memory", None),
+                try_goal_planning_response=self._try_goal_planning_response,
+                try_fast_path_response=self._try_fast_path_response,
+                finalize_user_response=self._finalize_user_response,
+                run_graph_loop=self._run_graph_loop,
+                is_error_response=self._is_error_response,
+                ledger_memory=self.ledger_memory,
+                persist_hitl_state_from_error=self._persist_hitl_state_from_error,
+                hitl_error_type=RequiresHITLError,
+                log=logger,
+            ),
         )
-        if state.get("final_response") and not state.get("current_plan"):
-            return self.cognitive_router.sanitize_response(state["final_response"])
-
-        if not has_audio_prompt:
-            profile_updated = await self._remember_user_profile(user_id, user_message)
-            await self._remember_assistant_identity(user_message)
-            lowered_message = user_message.lower()
-            explicit_memory_request = any(
-                marker in lowered_message
-                for marker in ("remember that", "please remember", "remember i ", "remember my ")
-            )
-            if explicit_memory_request and not profile_updated:
-                await self.vector_memory.add_memory_async(
-                    text=user_message,
-                    metadata={"type": "explicit_memory", "source": "user_request"},
-                )
-        else:
-            logger.info("Audio prompt detected for %s; bypassing text-only fast-path memory hooks.", user_id)
-
-        if not has_audio_prompt:
-            reply = await self._try_goal_planning_response(state)
-            if reply is not None:
-                return await self._finalize_user_response(user_id, user_message, reply)
-
-            reply = await self._try_fast_path_response(state)
-            if reply is not None:
-                return await self._finalize_user_response(user_id, user_message, reply)
-
-        try:
-            response = await self._run_graph_loop(state, user_id, user_message)
-            heartbeat_task_id = state.get("_heartbeat_origin_task_id")
-            if heartbeat_task_id is not None and not self._is_error_response(str(response)):
-                try:
-                    await self.ledger_memory.update_objective_status(int(heartbeat_task_id), "completed")
-                except Exception as e:
-                    logger.warning("Failed to mark heartbeat task %s completed: %s", heartbeat_task_id, e)
-            return response
-        except RequiresHITLError as hitl_err:
-            state["_hitl_question"] = str(hitl_err)
-            state["_hitl_created_at"] = time.time()
-            pending_owner_id = str(getattr(self, "_admin_user_id", "") or user_id)
-            if user_id == "heartbeat" and pending_owner_id == "heartbeat":
-                pending_owner_id = str(os.getenv("ADMIN_USER_ID", "heartbeat"))
-            heartbeat_task_id = self._extract_heartbeat_task_id(str(state.get("user_input") or ""))
-            if heartbeat_task_id is not None:
-                state["_heartbeat_origin_task_id"] = heartbeat_task_id
-            pending_state = self._strip_audio_bytes_for_persistence(state)
-            self.pending_hitl_state[pending_owner_id] = pending_state
-            self._fire_and_forget(self.ledger_memory.save_hitl_state(pending_owner_id, pending_state))
-            if user_id == "heartbeat" and self.outbound_queue is not None:
-                await self.outbound_queue.put(str(hitl_err))
-            return str(hitl_err)
-        except Exception as e:
-            logger.error(f"Graph execution failed: {e}", exc_info=True)
-            return "An internal error occurred."
 
     async def process_message(
         self,
@@ -5993,13 +4854,10 @@ class Orchestrator:
                 if str(user_id or "").strip() != "heartbeat":
                     async with self._predictive_energy_budget_lock:
                         self._replenish_predictive_energy_budget_wallclock_locked()
-                        self._apply_predictive_energy_tick_locked(
-                            self._resolve_energy_replenish_per_heartbeat()
-                        )
 
                 reply = await self._try_resume_mfa(user_id, normalized_user_message)
                 if reply is not None:
-                    return reply
+                    return self._ensure_non_empty_response_text(reply)
 
                 reply = await self._try_resume_tool_approval_compat(user_id, normalized_user_message)
                 if reply is not None:
@@ -6009,21 +4867,23 @@ class Orchestrator:
                             "follow_up_input": str(reply.get("_deferred_follow_up_input") or ""),
                         }
                     else:
-                        return reply
+                        return self._ensure_non_empty_response_text(reply)
 
                 if deferred_follow_up is None:
-                    return await self._run_user_turn_locked(
+                    response = await self._run_user_turn_locked(
                         user_id=user_id,
                         user_message=normalized_user_message,
                         user_prompt=user_prompt,
                     )
+                    return self._ensure_non_empty_response_text(response)
 
             follow_up = deferred_follow_up
             follow_up_response = await self.process_message(
                 follow_up["follow_up_input"],
                 user_id,
             )
-            return f"{follow_up['reply_text']}\n\n{follow_up_response}".strip()
+            combined = f"{follow_up['reply_text']}\n\n{follow_up_response}".strip()
+            return self._ensure_non_empty_response_text(combined)
         finally:
             if emitter is not None:
                 await emitter.flush_pending()
@@ -6040,60 +4900,23 @@ class Orchestrator:
         Convert a non-ok RouterResult into the appropriate user-facing string,
         registering any pending MFA / HITL / tool-synthesis state as needed.
         """
-        if result.status == "mfa_required":
-            self.pending_mfa[user_id] = {
-                "name": result.mfa_tool_name,
-                "arguments": result.mfa_arguments,
-                "_created_at": time.time(),
-            }
-            self._fire_and_forget(
-                self.ledger_memory.save_mfa_state(user_id, result.mfa_tool_name, result.mfa_arguments)
-            )
-            return "SECURITY LOCK: Provide the authorization passphrase to continue."
-
-        if result.status == "hitl_required":
-            state["_hitl_question"] = result.hitl_message
-            state["_hitl_created_at"] = time.time()
-            pending_state = self._strip_audio_bytes_for_persistence(state)
-            self.pending_hitl_state[user_id] = pending_state
-            # Persist so the HITL state survives a bot restart (ISSUE-013)
-            self._fire_and_forget(self.ledger_memory.save_hitl_state(user_id, pending_state))
-            return result.hitl_message
-
-        if result.status == "capability_gap":
-            local_resolution = await self._try_resolve_capability_gap_locally(
-                user_id,
-                result,
-                state,
-            )
-            if local_resolution is not None:
-                return local_resolution
-
-            # Lockout check: prevent duplicate background synthesis for the same user.
-            if not hasattr(self, "_synthesis_in_progress"):
-                self._synthesis_in_progress = {}
-            ts = self._synthesis_in_progress.get(user_id)
-            if ts is not None:
-                age = time.time() - ts
-                if age < _SYNTHESIS_LOCKOUT_TTL_SECONDS:
-                    return (
-                        "Tool synthesis already in progress for this request. "
-                        "Please wait for the current synthesis to complete."
-                    )
-                # Stale entry — allow a new run.
-                del self._synthesis_in_progress[user_id]
-
-            self._synthesis_in_progress[user_id] = time.time()
-            # Run synthesis in the background via _fire_and_forget which holds
-            # a strong GC-safe reference (ISSUE-002).
-            self._fire_and_forget(self._async_tool_synthesis(user_id, result, state))
-            return (
-                f"I identified a capability gap: {result.gap_description}. "
-                f"Requesting tool synthesis from System 2..."
-            )
-
-        # Fallback
-        return f"An unexpected router status was received: {result.status}"
+        if not hasattr(self, "_synthesis_in_progress"):
+            self._synthesis_in_progress = {}
+        return await pending_state.handle_blocked_result(
+            result=result,
+            user_id=user_id,
+            state=state,
+            pending_mfa=self.pending_mfa,
+            pending_hitl_state=self.pending_hitl_state,
+            ledger_memory=self.ledger_memory,
+            strip_audio_bytes_for_persistence=self._strip_audio_bytes_for_persistence,
+            try_resolve_capability_gap_locally=self._try_resolve_capability_gap_locally,
+            async_tool_synthesis=self._async_tool_synthesis,
+            fire_and_forget=self._fire_and_forget,
+            synthesis_in_progress=self._synthesis_in_progress,
+            synthesis_lockout_ttl_seconds=_SYNTHESIS_LOCKOUT_TTL_SECONDS,
+            time_fn=time.time,
+        )
 
     async def _handle_cognitive_escalation(
         self,
@@ -6192,20 +5015,173 @@ class Orchestrator:
             if hasattr(self, "_synthesis_in_progress"):
                 self._synthesis_in_progress.pop(user_id, None)
 
+    @staticmethod
+    def _get_synthesis_self_test_timeout_seconds() -> float:
+        return SynthesisPipeline._get_synthesis_self_test_timeout_seconds()
+
+    @staticmethod
+    def _extract_pytest_counts(output_text: str) -> Dict[str, int]:
+        return SynthesisPipeline._extract_pytest_counts(output_text)
+
+    @staticmethod
+    def _write_text_file(path: str, content: str) -> None:
+        SynthesisPipeline._write_text_file(path, content)
+
+    @staticmethod
+    def _compute_synthesis_proof_sha256(tool_code: str, pytest_code: str) -> str:
+        return SynthesisPipeline._compute_synthesis_proof_sha256(tool_code, pytest_code)
+
+    @staticmethod
+    def _build_synthesis_test_summary(
+        attempt_number: int,
+        max_retries: int,
+        self_test_result: Dict[str, Any],
+    ) -> str:
+        return SynthesisPipeline._build_synthesis_test_summary(
+            attempt_number,
+            max_retries,
+            self_test_result,
+        )
+
+    @staticmethod
+    def _extract_synthesis_failure_trace(self_test_result: Dict[str, Any], max_chars: int = 3000) -> str:
+        return SynthesisPipeline._extract_synthesis_failure_trace(self_test_result, max_chars)
+
+    @staticmethod
+    def _build_synthesis_generation_failure_result(error_message: str) -> Dict[str, Any]:
+        return SynthesisPipeline._build_synthesis_generation_failure_result(error_message)
+
+    @staticmethod
+    def _build_synthesis_fallback_payload(
+        failed_candidate: Optional[Dict[str, Any]],
+        suggested_tool_name: str,
+    ) -> Dict[str, Any]:
+        return SynthesisPipeline._build_synthesis_fallback_payload(
+            failed_candidate,
+            suggested_tool_name,
+        )
+
+    async def _create_synthesis_run_if_supported(
+        self,
+        *,
+        user_id: str,
+        gap_description: str,
+        suggested_tool_name: str,
+        original_input: str,
+        max_retries: int,
+    ) -> Optional[int]:
+        return await self._get_synthesis_pipeline()._create_synthesis_run_if_supported(
+            user_id=user_id,
+            gap_description=gap_description,
+            suggested_tool_name=suggested_tool_name,
+            original_input=original_input,
+            max_retries=max_retries,
+        )
+
+    async def _append_synthesis_attempt_if_supported(
+        self,
+        *,
+        run_id: Optional[int],
+        attempt_number: int,
+        phase: str,
+        synthesis_payload: Dict[str, Any],
+        self_test_result: Dict[str, Any],
+        code_sha256: str,
+    ) -> None:
+        await self._get_synthesis_pipeline()._append_synthesis_attempt_if_supported(
+            run_id=run_id,
+            attempt_number=attempt_number,
+            phase=phase,
+            synthesis_payload=synthesis_payload,
+            self_test_result=self_test_result,
+            code_sha256=code_sha256,
+        )
+
+    async def _update_synthesis_run_status_if_supported(
+        self,
+        run_id: Optional[int],
+        **kwargs: Any,
+    ) -> None:
+        await self._get_synthesis_pipeline()._update_synthesis_run_status_if_supported(
+            run_id,
+            **kwargs,
+        )
+
+    async def _run_synthesis_self_test(self, synthesis: Dict[str, Any]) -> Dict[str, Any]:
+        return await self._get_synthesis_pipeline()._run_synthesis_self_test(synthesis)
+
+    async def _request_synthesis_candidate(self, **kwargs: Any) -> Dict[str, Any]:
+        return await self._get_synthesis_pipeline()._request_synthesis_candidate(**kwargs)
+
+    async def _run_single_synthesis_attempt(self, **kwargs: Any) -> Dict[str, Any]:
+        return await self._get_synthesis_pipeline()._run_single_synthesis_attempt(**kwargs)
+
+    async def _build_blocked_synthesis_result(self, **kwargs: Any) -> Dict[str, Any]:
+        return await self._get_synthesis_pipeline()._build_blocked_synthesis_result(**kwargs)
+
+    async def _execute_synthesis_repair_loop(self, **kwargs: Any) -> Dict[str, Any]:
+        return await self._get_synthesis_pipeline()._execute_synthesis_repair_loop(**kwargs)
+
+    async def tool_synthesis_node(
+        self,
+        state: Dict[str, Any],
+        router_result: RouterResult,
+    ) -> str:
+        return await self._get_synthesis_pipeline().tool_synthesis_node(state, router_result)
+
+    async def _pop_pending_tool_approval_payload(self, user_id: str) -> Optional[Dict[str, Any]]:
+        return await self._get_synthesis_pipeline()._pop_pending_tool_approval_payload(user_id)
+
+    async def _reject_synthesized_tool(self, **kwargs: Any) -> str:
+        return await self._get_synthesis_pipeline()._reject_synthesized_tool(**kwargs)
+
+    async def _verify_synthesis_payload_digest(self, **kwargs: Any) -> Optional[str]:
+        return await self._get_synthesis_pipeline()._verify_synthesis_payload_digest(**kwargs)
+
+    async def _deploy_approved_synthesized_tool(self, **kwargs: Any) -> Any:
+        kwargs.pop("user_id", None)
+        return await self._get_synthesis_pipeline()._deploy_approved_synthesized_tool(**kwargs)
+
+    async def _handle_synthesized_tool_deploy_failure(self, **kwargs: Any) -> str:
+        return await self._get_synthesis_pipeline()._handle_synthesized_tool_deploy_failure(**kwargs)
+
+    async def _try_resume_tool_approval(self, user_id: str, user_message: str) -> Optional[Any]:
+        outcome = await self._get_synthesis_pipeline().try_resume_tool_approval(user_id, user_message)
+        if outcome is None:
+            return None
+        reply_text = str(getattr(outcome, "reply_text", outcome) or "")
+        follow_up_input = getattr(outcome, "follow_up_input", None)
+        if follow_up_input is None:
+            return reply_text
+        return {
+            "reply_text": reply_text,
+            "_deferred_follow_up_input": follow_up_input,
+        }
+
+    async def _async_tool_synthesis(
+        self,
+        user_id: str,
+        result: RouterResult,
+        state: Dict[str, Any],
+    ) -> None:
+        if not hasattr(self, "_synthesis_in_progress"):
+            self._synthesis_in_progress = {}
+        await schedulers.run_tool_synthesis_background(
+            user_id=user_id,
+            state=state,
+            result=result,
+            tool_synthesis_node=self.tool_synthesis_node,
+            notify_admin_fn=self._notify_admin,
+            synthesis_in_progress=self._synthesis_in_progress,
+            timeout_seconds=float(_SYNTHESIS_LOCKOUT_TTL_SECONDS),
+            log=logger,
+        )
+
     async def aclose(self) -> None:
         """Close async and sync resources owned by the orchestrator."""
         set_runtime_context(None, None, None, orchestrator=None)
 
-        tasks = [
-            task
-            for task in list(getattr(self, "_background_tasks", set()) or [])
-            if task is not asyncio.current_task()
-        ]
-        for task in tasks:
-            task.cancel()
-        if tasks:
-            await asyncio.gather(*tasks, return_exceptions=True)
-            self._background_tasks.difference_update(tasks)
+        await schedulers.drain_background_tasks(getattr(self, "_background_tasks", set()))
 
         if hasattr(self, "cognitive_router") and self.cognitive_router:
             await self.cognitive_router.close()

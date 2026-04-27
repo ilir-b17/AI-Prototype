@@ -116,7 +116,7 @@ def redact_text_for_cloud(
     text: str,
     *,
     allow_sensitive_context: bool = False,
-    max_chars: int = 4000,
+    max_chars: int = 12000,
 ) -> str:
     """Redact a single text string before it is sent to a cloud provider."""
     raw_text = str(text or "")
@@ -154,6 +154,7 @@ def redact_messages_for_cloud(
     messages: List[Dict[str, str]],
     *,
     allow_sensitive_context: bool = False,
+    max_chars: int = 12000,
 ) -> List[Dict[str, str]]:
     """Reduce a messages list to a safe subset for cloud transmission."""
     if not messages:
@@ -181,6 +182,7 @@ def redact_messages_for_cloud(
         content = redact_text_for_cloud(
             str(message.get("content") or ""),
             allow_sensitive_context=allow_sensitive_context,
+            max_chars=max_chars,
         )
         if not content:
             continue

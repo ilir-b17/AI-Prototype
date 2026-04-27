@@ -89,5 +89,5 @@ async def test_heartbeat_and_user_turn_replenishment_do_not_double_count(
     allow_select_to_finish.set()
     await heartbeat_cycle
 
-    # Unified energy account: +2 heartbeat replenish and +5 user-turn replenish.
-    assert orchestrator._predictive_energy_budget_remaining == 47
+    # Unified energy account: +2 heartbeat replenish and +3 mocked wall-clock user-turn replenish.
+    assert orchestrator._predictive_energy_budget_remaining == 45

@@ -1836,9 +1836,7 @@ class _GraphNodesMixin:
             async with lock:
                 if str(user_id or "").strip() != "heartbeat":
                     async with self._energy_budget_lock:
-                        replenishment = int(os.getenv("ENERGY_REPLENISH_PER_TURN", "5"))
-                        cap = int(os.getenv("INITIAL_ENERGY_BUDGET", "100"))
-                        self._energy_budget = min(self._energy_budget + replenishment, cap)
+                        self._replenish_predictive_energy_budget_wallclock_locked()
 
                 reply = await self._try_resume_mfa(user_id, normalized_user_message)
                 if reply is not None:

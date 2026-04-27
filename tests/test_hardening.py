@@ -75,7 +75,9 @@ def test_fix3_safe_subprocess_env_excludes_blocked_prefixes(monkeypatch):
 @pytest.mark.asyncio
 async def test_fix5_replenish_requires_elapsed_wall_clock_time(monkeypatch):
     monkeypatch.setenv("INITIAL_ENERGY_BUDGET", "200")
+    monkeypatch.setenv("ENERGY_REPLENISH_PER_HOUR", "120")
     monkeypatch.setenv("ENERGY_REPLENISH_PER_TURN", "5")
+    monkeypatch.setattr("src.core.orchestrator.time.time", lambda: 1_000.0)
 
     orchestrator = Orchestrator.__new__(Orchestrator)
     orchestrator._ready = asyncio.Event()
@@ -108,8 +110,8 @@ async def test_fix5_replenish_requires_elapsed_wall_clock_time(monkeypatch):
     assert resp1 == "ok"
     assert resp2 == "ok"
 
-    projected_with_turn_replenish = initial_budget + 2 * 5 - 2 * 3
-    assert orchestrator._energy_budget == projected_with_turn_replenish
+    expected_without_turn_replenish = initial_budget - 2 * 3
+    assert orchestrator._energy_budget == expected_without_turn_replenish
 
 
 @pytest.mark.asyncio

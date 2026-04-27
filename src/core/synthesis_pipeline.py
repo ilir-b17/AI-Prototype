@@ -712,6 +712,20 @@ class SynthesisPipeline:
                         window_hours=24,
                     )
                 )
+            except TypeError:
+                try:
+                    fuzzy_count = int(
+                        await fuzzy_counter(
+                            str(suggested_tool_name or ""),
+                            window_hours=24,
+                        )
+                    )
+                except Exception as exc:
+                    logger.warning(
+                        "Could not query fuzzy prior synthesis failures for %s: %s",
+                        suggested_tool_name,
+                        exc,
+                    )
             except Exception as exc:
                 logger.warning("Could not query fuzzy prior synthesis failures for %s: %s", suggested_tool_name, exc)
 
@@ -719,6 +733,9 @@ class SynthesisPipeline:
 
     async def _count_recent_synthesis_runs_for_user(self, user_id: str, *, window_hours: int = 1) -> int:
         counter = getattr(self.ledger_memory, "count_synthesis_runs_for_user_window", None)
+        legacy_counter = getattr(self.ledger_memory, "count_synthesis_runs_in_window", None)
+        if not callable(counter):
+            counter = legacy_counter
         if not callable(counter):
             return 0
         try:
@@ -728,6 +745,17 @@ class SynthesisPipeline:
                     window_hours=max(1, int(window_hours or 1)),
                 )
             )
+        except TypeError:
+            try:
+                return int(
+                    await counter(
+                        str(user_id or ""),
+                        hours=max(1, int(window_hours or 1)),
+                    )
+                )
+            except Exception as exc:
+                logger.warning("Could not query per-user synthesis budget usage for %s: %s", user_id, exc)
+                return 0
         except Exception as exc:
             logger.warning("Could not query per-user synthesis budget usage for %s: %s", user_id, exc)
             return 0
