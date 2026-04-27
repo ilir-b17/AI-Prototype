@@ -433,5 +433,20 @@ class SkillRegistry:
         """Return a sorted list of all registered skill names."""
         return sorted(self._skills.keys())
 
+    def restrict_to(self, allowed_names: List[str]) -> None:
+        """Restrict this registry instance to a specific set of tool names.
+
+        This mutates the current registry in place and is intended for one-time
+        initialization of scoped registries.
+
+        Args:
+            allowed_names: Tool names to retain in this registry instance.
+        """
+        allowed = {str(name).strip() for name in allowed_names if str(name).strip()}
+        self._skills = {name: data for name, data in self._skills.items() if name in allowed}
+        self._manifests = {
+            name: data for name, data in self._manifests.items() if name in allowed
+        }
+
     def __contains__(self, name: str) -> bool:
         return name in self._skills
