@@ -10,6 +10,7 @@ the ExecutiveAgent (Prefrontal Cortex) for intelligent message processing.
 import os
 import signal
 import logging
+import logging.handlers
 import asyncio
 import sys
 import socket
@@ -37,11 +38,19 @@ if hasattr(sys.stderr, "reconfigure"):
     sys.stderr.reconfigure(encoding="utf-8")
 
 # Configure logging
+_log_max_bytes = int(os.getenv("LOG_MAX_BYTES", str(10 * 1024 * 1024)))  # default 10 MB
+_log_backup_count = int(os.getenv("LOG_BACKUP_COUNT", "5"))
+_log_file_handler = logging.handlers.RotatingFileHandler(
+    'logs/telegram_bot.log',
+    maxBytes=_log_max_bytes,
+    backupCount=_log_backup_count,
+    encoding='utf-8',
+)
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     handlers=[
-        logging.FileHandler('logs/telegram_bot.log', encoding='utf-8'),
+        _log_file_handler,
         logging.StreamHandler()
     ]
 )
