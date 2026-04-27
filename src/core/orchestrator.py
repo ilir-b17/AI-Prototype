@@ -2998,6 +2998,9 @@ class Orchestrator:
                 blocked_result = result[_BLOCKED_KEY]
 
         if blocked_result is not None:
+            # The batch was already launched and charged as a unit before gather().
+            # Do not refund completed sibling agents: their work was consumed even
+            # though one sibling returned a blocked router result.
             state[_BLOCKED_KEY] = blocked_result
             return state
 
@@ -5531,7 +5534,7 @@ class Orchestrator:
                 )
                 return f"{deferred_follow_up['reply_text']}\n\n{follow_up_response}".strip()
 
-            return "No valid response could be generated."
+            raise RuntimeError("process_message exited without producing a response")
         finally:
             if emitter is not None:
                 await emitter.flush_pending()
