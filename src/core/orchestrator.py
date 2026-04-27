@@ -129,7 +129,13 @@ _SINGLE_TOOL_MIN_SCORE = 1.5
 _SINGLE_TOOL_MIN_MARGIN = 0.75
 _FAST_PATH_DIRECT_MAX_TOKENS = 12
 _FAST_PATH_SINGLE_TOOL_MAX_TOKENS = 14
-_FAST_PATH_SINGLE_TOOL_ALLOWLIST = frozenset({"get_system_info", "get_stock_price", "web_search"})
+_FAST_PATH_SINGLE_TOOL_ALLOWLIST = frozenset({
+    "get_system_info",
+    "get_stock_price",
+    "web_search",
+    "weather_current",
+    "unit_converter",
+})
 _MORAL_TRIVIALITY_READ_ONLY_HINTS = (
     "time",
     "date",
@@ -657,6 +663,17 @@ class Orchestrator:
         score += 0.75 * len(query_keywords & schema_keywords["parameters"])
         if not (schema.get("parameters", {}) or {}).get("required"):
             score += 0.25
+        # Tool-specific pattern bonuses to ensure clear intent outweighs broad-description tools.
+        tool_name = schema.get("name", "")
+        lowered = (user_message or "").lower()
+        if tool_name == "get_system_info" and re.search(
+            r"\b(time|date|timezone|cpu|memory|ram|disk|os|platform|system info)\b", lowered
+        ):
+            score += 2.0
+        elif tool_name == "web_search" and re.search(
+            r"\b(news|headline|headlines|breaking|trending)\b", lowered
+        ):
+            score += 2.5
         return score
 
     @staticmethod
@@ -671,9 +688,28 @@ class Orchestrator:
         ):
             return True
 
+        # Finance queries with no valid ticker should fall through to graph, not direct.
+        if re.search(r"\b(stock|ticker|share|equity|portfolio)\b", lowered) and re.search(
+            r"\b(price|quote|market|trading|value)\b", lowered
+        ):
+            return False
+
         token_count = len(re.findall(_ROUTING_TOKEN_RE, lowered))
         if token_count > _FAST_PATH_DIRECT_MAX_TOKENS:
             return False
+
+        # Bare action verbs after stripping polite openers are underspecified → direct.
+        _bare_verbs = frozenset({
+            "search", "find", "look", "do", "go", "try", "run", "help",
+            "continue", "start", "proceed", "check",
+        })
+        stripped = re.sub(
+            r"^(?:please|can you|could you|would you|hey|hi|okay|ok|so|well)\s*,?\s*",
+            "",
+            lowered,
+        ).strip(" ?!.,")
+        if stripped in _bare_verbs:
+            return True
 
         return bool(re.search(r"\b(what is|what's|who is|define|meaning of)\b", lowered))
 
@@ -689,15 +725,23 @@ class Orchestrator:
         if token_count > _FAST_PATH_SINGLE_TOOL_MAX_TOKENS:
             return False
 
-        if re.search(r"\b(and then|then|after|before|also|plus|compare|step|steps|plan)\b", lowered):
+        if re.search(
+            r"\b(and then|then|after|before|also|plus|compare|step|steps|plan"
+            r"|pipeline|screening|workflow|alert|alerts)\b",
+            lowered,
+        ):
             return False
 
         if tool_name == "get_system_info":
             return bool(re.search(r"\b(time|date|timezone|system info|system information|platform|cpu|memory|os)\b", lowered))
         if tool_name == "get_stock_price":
-            return bool(re.search(r"\b(stock|price|quote|ticker|market)\b", lowered))
+            return bool(re.search(r"\b(stock|price|quote|ticker|market|trading|trade)\b", lowered))
         if tool_name == "web_search":
-            return bool(re.search(r"\b(weather|news|latest|current|today|now|headline|score)\b", lowered))
+            return bool(re.search(r"\b(weather|news|latest|current|today|now|headline|headlines|score)\b", lowered))
+        if tool_name == "weather_current":
+            return bool(re.search(r"\b(weather|temperature|forecast|rain|raining|cold|hot|warm|sunny|cloudy|snow|snowing|wind|humid)\b", lowered))
+        if tool_name == "unit_converter":
+            return bool(re.search(r"\b(convert|km|miles|kg|pounds|fahrenheit|celsius|bytes|gb|mb|kb|ounce|ounces|litre|liter|gallon)\b", lowered))
 
         return False
 
@@ -758,7 +802,11 @@ class Orchestrator:
         if (
             trivial_direct
             and complexity <= _DIRECT_ROUTE_MAX_COMPLEXITY
-            and (not top or top["score"] < _SINGLE_TOOL_MIN_SCORE)
+            and (
+                not top
+                or top["score"] < _SINGLE_TOOL_MIN_SCORE
+                or not self._is_trivial_single_tool_intent(top["tool_name"], routing_message, complexity)
+            )
         ):
             return {"mode": "direct", "complexity": complexity}
 
@@ -3649,6 +3697,16 @@ class Orchestrator:
         logger.info("Heartbeat: Task #%s completed.", task_id)
 
     async def _run_heartbeat_cycle(self) -> None:
+        if not hasattr(self, "_predictive_energy_budget_lock"):
+            self._predictive_energy_budget_lock = asyncio.Lock()
+        if not hasattr(self, "_predictive_energy_budget_remaining"):
+            self._predictive_energy_budget_remaining = max(
+                0, int(os.getenv("INITIAL_ENERGY_BUDGET", "100"))
+            )
+        async with self._predictive_energy_budget_lock:
+            self._apply_predictive_energy_tick_locked(
+                self._resolve_energy_replenish_per_heartbeat()
+            )
         await self._notify_completed_domain_tasks()
         logger.info("Heartbeat: Querying objective backlog for executable Tasks...")
         candidate_contexts = await self._select_executable_heartbeat_tasks()
@@ -5935,6 +5993,9 @@ class Orchestrator:
                 if str(user_id or "").strip() != "heartbeat":
                     async with self._predictive_energy_budget_lock:
                         self._replenish_predictive_energy_budget_wallclock_locked()
+                        self._apply_predictive_energy_tick_locked(
+                            self._resolve_energy_replenish_per_heartbeat()
+                        )
 
                 reply = await self._try_resume_mfa(user_id, normalized_user_message)
                 if reply is not None:
