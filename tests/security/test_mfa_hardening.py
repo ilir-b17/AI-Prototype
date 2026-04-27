@@ -67,7 +67,8 @@ def test_verify_mfa_challenge_uses_env_passphrase(monkeypatch: pytest.MonkeyPatc
     monkeypatch.setenv("MFA_PASSPHRASE", "correct horse battery staple")
     monkeypatch.delenv("MFA_TOTP_SECRET", raising=False)
 
-    assert verify_mfa_challenge("please authorize with correct horse battery staple") is True
+    assert verify_mfa_challenge("correct horse battery staple") is True
+    assert verify_mfa_challenge("please authorize with correct horse battery staple") is False
     assert verify_mfa_challenge("correct horse") is False
 
 

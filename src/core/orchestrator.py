@@ -18,7 +18,8 @@ import sys
 import tempfile
 import time
 from datetime import datetime
-from typing import Dict, Any, List, Optional
+from typing import Dict, Any, List, Optional, Callable, Awaitable
+import xml.etree.ElementTree as ET
 
 try:
     import psutil
@@ -36,7 +37,9 @@ from src.core.prompt_config import load_prompt_config, build_supervisor_prompt
 from src.core.runtime_context import set_runtime_context
 from src.core.state_model import AgentState, normalize_state
 from src.core.workflow_graph import build_orchestrator_graph
-from src.core.security import verify_mfa_challenge
+from src.core.security import validate_mfa_configuration, verify_mfa_challenge
+from src.core import cloud_redaction
+from src.core.progress import ProgressEmitter, reset_emitter, set_current_emitter
 from src.core.nocturnal_consolidation import NocturnalConsolidationSlice1
 from src.core.goal_planner import GoalPlanner, PlanningResult
 from src.core.energy_judge import EnergyJudge, EnergyEvaluation
@@ -72,7 +75,18 @@ _PENDING_STATE_TTL_SECONDS = int(os.getenv("PENDING_STATE_TTL_SECONDS", "86400")
 _SYNTHESIS_SELF_TEST_TIMEOUT_DEFAULT_SECONDS = 12.0
 _MAX_SYNTHESIS_RETRIES = int(os.getenv("MAX_SYNTHESIS_RETRIES", "3"))
 _CONSOLIDATION_TRIGGER_TURNS = int(os.getenv("CONSOLIDATION_TRIGGER_TURNS", "10"))
-_SAFE_ENV_KEYS = {"PATH", "PYTHONPATH", "SYSTEMROOT", "TEMP", "TMP", "HOME", "USER", "LANG", "LC_ALL"}
+_SAFE_SUBPROCESS_ENV_KEYS = {
+    "PATH",
+    "SYSTEMROOT",
+    "WINDIR",
+    "TEMP",
+    "TMP",
+    "TMPDIR",
+    "LANG",
+    "LC_ALL",
+    "PYTHONIOENCODING",
+    "PYTHONUNBUFFERED",
+}
 _BLOCKED_ENV_PREFIXES = ("TELEGRAM_", "GROQ_", "GEMINI_", "ANTHROPIC_", "OPENAI_", "OLLAMA_CLOUD_", "ADMIN_")
 _SYSTEM_1_ERROR_PREFIX = "[System 1 - Error]"
 _ROUTING_STOPWORDS = {
@@ -178,11 +192,6 @@ _CLOUD_REDACTION_PII_PATTERNS = (
     (r"\b(?:user[_ ]?id|ssn|social security|passport|account number)\b[^\n]*", "[REDACTED_PII_FIELD]"),
     (r"[A-Za-z]:\\[^\n]*", "[REDACTED_PATH]"),
 )
-_SENSITIVE_CONTEXT_HINT_RE = re.compile(
-    r"\b(use|include|review|analy[sz]e|consider|reference)\b.{0,120}\b(chat[_\s-]*history|sensory[_\s-]*state|core[_\s-]*memory|user\s+profile|full\s+name|location|email|phone|pii)\b",
-    flags=re.IGNORECASE | re.DOTALL,
-)
-
 # Key used in the state dict to signal a blocked (non-ok) router result
 _BLOCKED_KEY = "_blocked_result"
 _CATALOG_MATCH_STOPWORDS = {
@@ -201,16 +210,14 @@ _CATALOG_META_TOOL_NAMES = {
 
 
 def _build_safe_subprocess_env() -> Dict[str, str]:
-    safe_env: Dict[str, str] = {}
-    for key, value in os.environ.items():
-        if key in _SAFE_ENV_KEYS:
-            safe_env[key] = value
-            continue
-        if any(key.startswith(prefix) for prefix in _BLOCKED_ENV_PREFIXES):
-            continue
-        safe_env[key] = value
-    # Ensure Python can find packages
-    safe_env.setdefault("PYTHONPATH", os.getcwd())
+    safe_env: Dict[str, str] = {
+        key: value
+        for key in _SAFE_SUBPROCESS_ENV_KEYS
+        if (value := os.environ.get(key))
+    }
+    safe_env["PYTHONPATH"] = os.getcwd()
+    safe_env.setdefault("PYTHONIOENCODING", "utf-8")
+    safe_env.setdefault("PYTHONUNBUFFERED", "1")
     return safe_env
 
 
@@ -228,6 +235,7 @@ class Orchestrator:
            (the Telegram bot's ``post_init`` hook) to open the aiosqlite
            connection and seed initial goals.
     """
+    _deprecated_energy_replenish_turn_warning_logged = False
 
     def __init__(
         self,
@@ -369,8 +377,9 @@ class Orchestrator:
             logger.warning("Invalid groq_cooldown_until value in DB: %s", e)
 
     def _enforce_charter_policy(self) -> None:
+        validate_mfa_configuration()
         allow_missing = os.getenv("ALLOW_MISSING_CHARTER", "false").strip().lower() in {"1", "true", "yes"}
-        if self.charter_text == self._CHARTER_FALLBACK:
+        if getattr(self, "charter_text", "") == self._CHARTER_FALLBACK:
             if not allow_missing:
                 raise RuntimeError(
                     "FATAL: charter.md not found or empty. The moral evaluation framework cannot operate. "
@@ -380,6 +389,14 @@ class Orchestrator:
             logger.warning(
                 "SECURITY: Running without a full charter. Charter enforcement will be minimal."
             )
+            return
+        try:
+            ET.fromstring(str(self.charter_text or ""))
+        except ET.ParseError as exc:
+            if not allow_missing:
+                raise RuntimeError(f"FATAL: malformed charter.md XML: {exc}") from exc
+            logger.warning("SECURITY: Malformed charter allowed by override; using fallback charter.")
+            self.charter_text = self._CHARTER_FALLBACK
 
     def _refresh_sensory_state(self) -> None:
         """Snapshot current machine state into self.sensory_state."""
@@ -1029,6 +1046,28 @@ class Orchestrator:
         )
 
     @staticmethod
+    def _is_introspection_query(user_message: str) -> bool:
+        lowered = (user_message or "").lower()
+        markers = (
+            "why did you", "why did that", "what happened", "last turn",
+            "deferred", "blocked task", "energy budget", "system error",
+            "recent errors", "moral audit", "task backlog", "objectives",
+            "system health", "synthesis history", "what went wrong",
+        )
+        return any(marker in lowered for marker in markers)
+
+    @staticmethod
+    def _classify_introspection_type(user_message: str) -> str:
+        lowered = (user_message or "").lower()
+        if any(term in lowered for term in ("why did", "what happened", "last turn")):
+            return "decision"
+        if any(term in lowered for term in ("backlog", "objective", "pending", "blocked task")):
+            return "backlog"
+        if any(term in lowered for term in ("deferred", "energy")):
+            return "energy"
+        return "health"
+
+    @staticmethod
     def _summarize_chat_history(chat_history: List[Dict[str, str]]) -> Optional[str]:
         user_turns = []
         for turn in chat_history:
@@ -1198,6 +1237,17 @@ class Orchestrator:
 
         capability_response = self._build_capability_response(user_message)
         if capability_response:
+            classifier = getattr(self, "_route_to_system_1", None)
+            if callable(classifier):
+                try:
+                    await classifier(
+                        [{"role": "user", "content": user_message}],
+                        allowed_tools=[],
+                        deadline_seconds=30.0,
+                        context="capability_query",
+                    )
+                except Exception:
+                    logger.debug("Capability-query local classification skipped.", exc_info=True)
             return capability_response
 
         profile_response = await self._build_profile_response(state)
@@ -1617,45 +1667,17 @@ class Orchestrator:
         )
 
     @staticmethod
-    def _requires_sensitive_cloud_context(*segments: str) -> bool:
-        combined = "\n".join(str(segment or "") for segment in segments)
-        if not combined.strip():
-            return False
-        return bool(_SENSITIVE_CONTEXT_HINT_RE.search(combined))
-
-    @staticmethod
     def _redact_text_for_cloud(
         text: str,
         *,
         allow_sensitive_context: bool = False,
-        max_chars: int = 3500,
+        max_chars: int = 12000,
     ) -> str:
-        raw_text = str(text or "")
-        if not raw_text:
-            return ""
-
-        if allow_sensitive_context:
-            compact = raw_text.strip()
-            if len(compact) > max_chars:
-                return compact[:max_chars].rstrip() + "\n[TRUNCATED_FOR_SIZE]"
-            return compact
-
-        redacted = raw_text
-        for pattern in _CLOUD_REDACTION_BLOCK_PATTERNS:
-            redacted = re.sub(pattern, "[REDACTED_CONTEXT_BLOCK]", redacted, flags=re.IGNORECASE | re.DOTALL)
-
-        for pattern, replacement in _CLOUD_REDACTION_LINE_PATTERNS:
-            redacted = re.sub(pattern, replacement, redacted, flags=re.IGNORECASE | re.DOTALL | re.MULTILINE)
-
-        for pattern, replacement in _CLOUD_REDACTION_PII_PATTERNS:
-            redacted = re.sub(pattern, replacement, redacted, flags=re.IGNORECASE)
-
-        redacted = re.sub(r"\n{3,}", "\n\n", redacted).strip()
-        if not redacted:
-            return "[REDACTED_EMPTY_PAYLOAD]"
-        if len(redacted) > max_chars:
-            return redacted[:max_chars].rstrip() + "\n[TRUNCATED_FOR_PRIVACY]"
-        return redacted
+        return cloud_redaction.redact_text_for_cloud(
+            text,
+            allow_sensitive_context=allow_sensitive_context,
+            max_chars=max_chars,
+        )
 
     def _redact_messages_for_cloud(
         self,
@@ -1663,43 +1685,41 @@ class Orchestrator:
         *,
         allow_sensitive_context: bool = False,
     ) -> List[Dict[str, str]]:
-        if not messages:
-            return [{"role": "user", "content": "[REDACTED_EMPTY_PAYLOAD]"}]
+        return cloud_redaction.redact_messages_for_cloud(
+            messages,
+            allow_sensitive_context=allow_sensitive_context,
+        )
 
-        source_messages: List[Dict[str, Any]]
-        if allow_sensitive_context:
-            source_messages = list(messages)
-        else:
-            system_messages = [msg for msg in messages if str(msg.get("role", "")).lower() == "system"]
-            user_messages = [msg for msg in messages if str(msg.get("role", "")).lower() == "user"]
+    @staticmethod
+    def _cloud_payload_audit_sha256(
+        messages: List[Dict[str, str]],
+        allowed_tools: Optional[List[str]],
+    ) -> str:
+        return cloud_redaction.compute_payload_sha256(messages, allowed_tools)
 
-            source_messages = []
-            if system_messages:
-                source_messages.append(system_messages[0])
-                if len(system_messages) > 1:
-                    source_messages.append(system_messages[-1])
-            if user_messages:
-                source_messages.append(user_messages[-1])
-            elif messages:
-                source_messages.append(messages[-1])
-
-        sanitized: List[Dict[str, str]] = []
-        seen: set[tuple[str, str]] = set()
-        for message in source_messages:
-            role = str(message.get("role") or "user")
-            content = self._redact_text_for_cloud(
-                str(message.get("content") or ""),
+    async def _append_cloud_payload_audit_if_supported(
+        self,
+        *,
+        purpose: str,
+        message_count_before: int,
+        message_count_after: int,
+        allow_sensitive_context: bool,
+        payload_sha256: str,
+    ) -> None:
+        ledger = getattr(self, "ledger_memory", None)
+        append_fn = getattr(ledger, "append_cloud_payload_audit", None)
+        if not callable(append_fn):
+            return
+        try:
+            await append_fn(
+                purpose=purpose,
+                message_count_before=message_count_before,
+                message_count_after=message_count_after,
                 allow_sensitive_context=allow_sensitive_context,
+                payload_sha256=payload_sha256,
             )
-            if not content:
-                continue
-            key = (role, content)
-            if key in seen:
-                continue
-            seen.add(key)
-            sanitized.append({"role": role, "content": content})
-
-        return sanitized or [{"role": "user", "content": "[REDACTED_EMPTY_PAYLOAD]"}]
+        except Exception as e:
+            logger.warning("Failed to append cloud payload audit entry for %s: %s", purpose, e)
 
     async def _route_to_system_2_redacted(
         self,
@@ -1718,6 +1738,13 @@ class Orchestrator:
             purpose,
             len(messages),
             len(minimized_messages),
+        )
+        await self._append_cloud_payload_audit_if_supported(
+            purpose=purpose,
+            message_count_before=len(messages),
+            message_count_after=len(minimized_messages),
+            allow_sensitive_context=allow_sensitive_context,
+            payload_sha256=self._cloud_payload_audit_sha256(minimized_messages, allowed_tools),
         )
         return await self.cognitive_router.route_to_system_2(
             minimized_messages,
@@ -1810,9 +1837,7 @@ class Orchestrator:
 
     def _energy_gate_available(self) -> bool:
         return (
-            getattr(self, "energy_judge", None) is not None
-            and getattr(self, "energy_roi_engine", None) is not None
-            and getattr(self, "_predictive_energy_budget_lock", None) is not None
+            getattr(self, "_predictive_energy_budget_lock", None) is not None
             and hasattr(self, "_predictive_energy_budget_remaining")
         )
 
@@ -1821,6 +1846,73 @@ class Orchestrator:
             return max(0, int(os.getenv("INITIAL_ENERGY_BUDGET", "100")))
         async with self._predictive_energy_budget_lock:
             return max(0, int(self._predictive_energy_budget_remaining))
+
+    @staticmethod
+    def _resolve_energy_replenish_per_hour() -> float:
+        raw_rate = str(os.getenv("ENERGY_REPLENISH_PER_HOUR", "30") or "").strip()
+        try:
+            rate = float(raw_rate)
+        except ValueError:
+            logger.warning("Invalid ENERGY_REPLENISH_PER_HOUR=%r. Falling back to 30.", raw_rate)
+            rate = 30.0
+        return max(0.0, rate)
+
+    @staticmethod
+    def _resolve_energy_replenish_per_heartbeat() -> int:
+        raw_value = str(os.getenv("ENERGY_REPLENISH_PER_HEARTBEAT", "5") or "").strip()
+        try:
+            amount = int(raw_value)
+        except ValueError:
+            logger.warning("Invalid ENERGY_REPLENISH_PER_HEARTBEAT=%r. Falling back to 5.", raw_value)
+            amount = 5
+        return max(0, amount)
+
+    @classmethod
+    def _warn_deprecated_energy_replenish_turn_env_once(cls) -> None:
+        if cls._deprecated_energy_replenish_turn_warning_logged:
+            return
+        raw_deprecated = str(os.getenv("ENERGY_REPLENISH_PER_TURN", "") or "").strip()
+        if not raw_deprecated:
+            return
+        logger.warning(
+            "ENERGY_REPLENISH_PER_TURN is deprecated and ignored. "
+            "Use ENERGY_REPLENISH_PER_HOUR for wall-clock replenishment instead."
+        )
+        cls._deprecated_energy_replenish_turn_warning_logged = True
+
+    def _compute_predictive_energy_replenishment_points_wallclock_locked(self, *, now: Optional[float] = None) -> int:
+        current_time = float(time.time() if now is None else now)
+        last_replenished_at = float(
+            getattr(self, "_predictive_energy_budget_last_replenished_at", current_time)
+        )
+        if current_time <= last_replenished_at:
+            return 0
+        replenish_per_hour = self._resolve_energy_replenish_per_hour()
+        if replenish_per_hour <= 0:
+            self._predictive_energy_budget_last_replenished_at = current_time
+            return 0
+        elapsed_seconds = current_time - last_replenished_at
+        points = int((elapsed_seconds / 3600.0) * replenish_per_hour)
+        if points <= 0:
+            return 0
+        consumed_seconds = (float(points) / replenish_per_hour) * 3600.0
+        self._predictive_energy_budget_last_replenished_at = last_replenished_at + consumed_seconds
+        return points
+
+    def _apply_predictive_energy_tick_locked(self, amount: int) -> int:
+        if amount <= 0:
+            return 0
+        cap = max(0, int(os.getenv("INITIAL_ENERGY_BUDGET", "100")))
+        before = max(0, int(getattr(self, "_predictive_energy_budget_remaining", 0)))
+        self._predictive_energy_budget_remaining = min(cap, before + int(amount))
+        if hasattr(self, "_energy_budget"):
+            self._energy_budget = self._predictive_energy_budget_remaining
+        return int(self._predictive_energy_budget_remaining) - before
+
+    def _replenish_predictive_energy_budget_wallclock_locked(self, *, now: Optional[float] = None) -> int:
+        self._warn_deprecated_energy_replenish_turn_env_once()
+        points = self._compute_predictive_energy_replenishment_points_wallclock_locked(now=now)
+        return self._apply_predictive_energy_tick_locked(points)
 
     async def _refund_predictive_energy_budget(self, amount: int, reason: str) -> None:
         amount = max(0, int(amount))
@@ -1833,6 +1925,8 @@ class Orchestrator:
             self._predictive_energy_budget_remaining = min(
                 cap, self._predictive_energy_budget_remaining + amount
             )
+            if hasattr(self, "_energy_budget"):
+                self._energy_budget = self._predictive_energy_budget_remaining
         logger.info(
             "Energy budget refunded: +%s (%s). Remaining=%s",
             amount,
@@ -1865,6 +1959,8 @@ class Orchestrator:
             if remaining - cost < reserve:
                 return False
             self._predictive_energy_budget_remaining = remaining - cost
+            if hasattr(self, "_energy_budget"):
+                self._energy_budget = self._predictive_energy_budget_remaining
             logger.info(
                 "Predictive energy budget reserved: -%s (%s). Remaining=%s",
                 cost,
@@ -2162,17 +2258,12 @@ class Orchestrator:
             return None
 
         planning_context = self._build_goal_planning_context(state)
-        allow_sensitive_context = self._requires_sensitive_cloud_context(
-            user_message,
-            planning_context,
-        )
-
         async def _route(messages: List[Dict[str, str]]) -> RouterResult:
             return await self._route_to_system_2_redacted(
                 messages,
                 allowed_tools=[],
                 purpose="goal_planner",
-                allow_sensitive_context=allow_sensitive_context,
+                allow_sensitive_context=False,
             )
 
         try:
@@ -2548,6 +2639,7 @@ class Orchestrator:
             logger.info("Routing Supervisor through System 1 (Local Model)")
             router_result = await self._route_to_system_1(
                 messages,
+                allowed_tools=[],
                 deadline_seconds=150.0,
                 context="supervisor",
             )
@@ -2567,14 +2659,12 @@ class Orchestrator:
 
         try:
             logger.info("Escalating Supervisor to System 2")
-            allow_sensitive_context = self._requires_sensitive_cloud_context(
-                messages[-1].get("content", "") if messages else "",
-            )
             router_result = await asyncio.wait_for(
                 self._route_to_system_2_redacted(
                     messages,
+                    allowed_tools=[],
                     purpose="supervisor_fallback",
-                    allow_sensitive_context=allow_sensitive_context,
+                    allow_sensitive_context=False,
                 ),
                 timeout=60.0,
             )
@@ -2891,6 +2981,25 @@ class Orchestrator:
 
         blocked_result = None
         for (agent_def, _task_packet), result in zip(batch, results):
+            if isinstance(result, RequiresHITLError):
+                logger.warning("Parallel agent %s requested HITL: %s", agent_def.name, result)
+                raise result
+            if not isinstance(result, Exception) and result.get(_BLOCKED_KEY) and blocked_result is None:
+                blocked_result = result[_BLOCKED_KEY]
+
+        if blocked_result is not None:
+            unused_energy = sum(
+                agent_def.energy_cost
+                for (agent_def, _task_packet), result in zip(batch, results)
+                if not isinstance(result, Exception) and not result.get(_BLOCKED_KEY)
+            )
+            if unused_energy > 0:
+                state = self._refund_energy(state, unused_energy, "parallel_agents_blocked_unused")
+                await self._refund_predictive_energy_budget(unused_energy, "parallel_agents_blocked_unused")
+            state[_BLOCKED_KEY] = blocked_result
+            return state
+
+        for (agent_def, _task_packet), result in zip(batch, results):
             if isinstance(result, Exception):
                 logger.error("Parallel agent %s failed with exception: %s", agent_def.name, result, exc_info=True)
                 state["worker_outputs"][agent_def.name] = f"Error: {agent_def.name} failed with exception: {result}"
@@ -2899,13 +3008,6 @@ class Orchestrator:
             agent_output = dict(result.get("worker_outputs", {}) or {}).get(agent_def.name)
             if agent_output is not None:
                 state["worker_outputs"][agent_def.name] = agent_output
-
-            if blocked_result is None and result.get(_BLOCKED_KEY):
-                blocked_result = result[_BLOCKED_KEY]
-
-        if blocked_result is not None:
-            state[_BLOCKED_KEY] = blocked_result
-
         return state
 
     async def _try_route_agent_system_1(
@@ -2939,17 +3041,12 @@ class Orchestrator:
             return None
 
         try:
-            allow_sensitive_context = self._requires_sensitive_cloud_context(
-                (task_packet or {}).get("task", ""),
-                (task_packet or {}).get("reason", ""),
-                (state or {}).get("user_input", ""),
-            )
             router_result = await asyncio.wait_for(
                 self._route_to_system_2_redacted(
                     messages,
                     allowed_tools=agent_def.allowed_tools,
                     purpose=f"{agent_def.name}_fallback",
-                    allow_sensitive_context=allow_sensitive_context,
+                    allow_sensitive_context=False,
                 ),
                 timeout=60.0,
             )
@@ -3399,16 +3496,13 @@ class Orchestrator:
                 logger.warning(f"Memory consolidation loop error: {e}", exc_info=True)
 
     async def _score_nocturnal_candidates(self, messages: List[Dict[str, str]]) -> RouterResult:
-        allow_sensitive_context = self._requires_sensitive_cloud_context(
-            *(message.get("content", "") for message in messages),
-        )
         if self.cognitive_router.get_system_2_available():
             return await asyncio.wait_for(
                 self._route_to_system_2_redacted(
                     messages,
                     allowed_tools=[],
                     purpose="nocturnal_scoring",
-                    allow_sensitive_context=allow_sensitive_context,
+                    allow_sensitive_context=False,
                 ),
                 timeout=45.0,
             )
@@ -3444,7 +3538,7 @@ class Orchestrator:
             approved = await self.ledger_memory.get_approved_tools()
             for tool in approved:
                 try:
-                    self.cognitive_router.register_dynamic_tool(
+                    await self.cognitive_router.register_dynamic_tool(
                         tool["name"], tool["code"], tool["schema_json"]
                     )
                     logger.info(f"Restored dynamic tool '{tool['name']}' from registry")
@@ -3452,6 +3546,13 @@ class Orchestrator:
                     logger.error(f"Failed to restore tool '{tool['name']}': {e}")
         except Exception as e:
             logger.warning(f"_load_approved_tools failed: {e}")
+
+    async def _reload_dynamic_tools_after_worker_restart(self) -> None:
+        """Reload approved dynamic tools after the isolated worker is respawned."""
+        await self._load_approved_tools()
+        invalidate = getattr(self, "_invalidate_capabilities_cache", None)
+        if callable(invalidate):
+            invalidate()
 
     async def _load_pending_approvals(self) -> None:
         """Reload any tool synthesis proposals that were pending when the bot last stopped."""
@@ -3577,7 +3678,7 @@ class Orchestrator:
 
     async def _get_user_lock(self, user_id: str) -> asyncio.Lock:
         """Return the per-user asyncio.Lock with LRU eviction to bound memory usage."""
-        _max = int(os.getenv("USER_LOCKS_MAX_SIZE", "500"))
+        _max = max(1, int(os.getenv("USER_LOCKS_MAX_SIZE", "500")))
         async with self._user_locks_lock:
             if user_id in self._user_locks:
                 # Move to end (most-recently-used)
@@ -3585,9 +3686,21 @@ class Orchestrator:
                 return self._user_locks[user_id]
             lock = asyncio.Lock()
             self._user_locks[user_id] = lock
-            # Evict oldest entries when over the cap
+            # Evict oldest idle entries when over the cap. Never evict a locked
+            # lock or a second concurrent message for the same user can acquire
+            # a new lock and race pending MFA/HITL/tool-approval state.
             while len(self._user_locks) > _max:
-                self._user_locks.pop(next(iter(self._user_locks)))
+                evict_key = next(
+                    (
+                        key
+                        for key, candidate_lock in self._user_locks.items()
+                        if key != user_id and not candidate_lock.locked()
+                    ),
+                    None,
+                )
+                if evict_key is None:
+                    break
+                self._user_locks.pop(evict_key, None)
             return lock
 
     @staticmethod
@@ -4204,6 +4317,28 @@ class Orchestrator:
             f"─────────────────────────────\n"
             f"Reply YES to approve and deploy, or NO to reject."
         )
+        if len(hitl_msg) > 3500:
+            attachment = tempfile.NamedTemporaryFile(
+                "w",
+                encoding="utf-8",
+                suffix=f"_{synthesis['tool_name']}.py",
+                delete=False,
+            )
+            with attachment:
+                attachment.write(str(synthesis["code"]))
+            compact_msg = (
+                f"🔧 TOOL SYNTHESIS REQUEST\n\n"
+                f"System 1 could not answer: \"{state['user_input']}\"\n"
+                f"Gap identified: {gap_description}\n\n"
+                f"Name: {synthesis['tool_name']}\n"
+                f"Description: {synthesis['description']}\n"
+                f"Sandboxed self-test: {test_summary}\n"
+                f"Cryptographic proof (SHA-256 tool+tests): {proof_sha256}\n"
+                f"Audit run id: {synthesis_run_id if synthesis_run_id is not None else 'n/a'}\n\n"
+                "Code attached as Telegram document.\n"
+                "Reply YES to approve and deploy, or NO to reject."
+            )
+            return {"text": compact_msg[:3500], "document_path": attachment.name}
         return hitl_msg
 
     def _extract_router_content(self, result: RouterResult) -> Optional[str]:
@@ -4360,8 +4495,22 @@ class Orchestrator:
             state["final_response"] = output_to_eval
         return state
 
+    def _extract_charter_tier_block(self, charter_text: str, tier_tag: Optional[str] = None) -> str:
+        if tier_tag is None:
+            tier_tag = str(charter_text)
+            charter_text = getattr(self, "charter_text", "")
+        pattern = rf"<{re.escape(tier_tag)}[^>]*>(.*?)</{re.escape(tier_tag)}>"
+        match = re.search(pattern, str(charter_text or ""), flags=re.IGNORECASE | re.DOTALL)
+        if not match:
+            return ""
+        return re.sub(r"\n{3,}", "\n\n", match.group(1).strip())
+
     @staticmethod
-    def _extract_charter_tier_block(charter_text: str, tier_tag: str) -> str:
+    def _extract_charter_tier_block_from_text(charter_text: str, tier_tag: str) -> str:
+        try:
+            ET.fromstring(str(charter_text or ""))
+        except ET.ParseError as exc:
+            return f"[MALFORMED_CHARTER_XML: {exc}]"
         pattern = rf"<{re.escape(tier_tag)}[^>]*>(.*?)</{re.escape(tier_tag)}>"
         match = re.search(pattern, str(charter_text or ""), flags=re.IGNORECASE | re.DOTALL)
         if not match:
@@ -4648,6 +4797,13 @@ class Orchestrator:
         state = normalize_state(state)
         output_to_eval = self._get_output_to_evaluate(state)
 
+        if getattr(self, "charter_text", "") == self._CHARTER_FALLBACK:
+            logger.warning("Critic disabled because fallback charter is active.")
+            self._store_moral_decision_trace(state, build_local_skip_decision("fallback_charter"))
+            state["moral_audit_mode"] = "disabled_fallback_charter"
+            state = self._finalize_critic_pass(state, output_to_eval)
+            return state
+
         if not output_to_eval:
             self._store_moral_decision_trace(
                 state,
@@ -4884,7 +5040,7 @@ class Orchestrator:
         attempts_used: int,
         original_state: Dict[str, Any],
     ) -> str:
-        self.cognitive_router.register_dynamic_tool(tool_name, synthesis["code"], synthesis["schema_json"])
+        await self.cognitive_router.register_dynamic_tool(tool_name, synthesis["code"], synthesis["schema_json"])
         await self.ledger_memory.register_tool(
             name=tool_name,
             description=synthesis["description"],
@@ -4999,6 +5155,8 @@ class Orchestrator:
                 # Fall through to fresh state below
             else:
                 state = normalize_state(self.pending_hitl_state.pop(user_id))
+                previous_iteration_count = int(state.get("iteration_count", 0) or 0)
+                previous_critic_feedback = state.get("critic_feedback")
                 # Clear the persisted DB record now that we've resumed (ISSUE-013)
                 try:
                     await self.ledger_memory.clear_hitl_state(user_id)
@@ -5016,8 +5174,12 @@ class Orchestrator:
                 # ensures a perpetually failing task eventually becomes unrecoverable
                 # rather than cycling indefinitely at full energy (ISSUE-005).
                 state["energy_remaining"] = min(state.get("energy_remaining", 0) + 50, 75)
-                # If the admin has guided this task 3+ times without success, abandon it
-                if state["hitl_count"] >= 3:
+                # If the admin has guided this task 3+ times or the critic
+                # already exhausted its retry budget, abandon it.
+                if state["hitl_count"] >= 3 or (
+                    previous_iteration_count >= 3
+                    and previous_critic_feedback != "PASS"
+                ):
                     logger.warning(
                         f"HITL cycle limit (3) reached for user {user_id}. "
                         f"Abandoning task: {state.get('user_input', '')[:80]}"
@@ -5106,8 +5268,15 @@ class Orchestrator:
     def _is_error_response(response: str) -> bool:
         return any(response.startswith(prefix) for prefix in _ERROR_RESPONSE_PREFIXES)
 
-    async def _persist_chat_turns(self, user_id: str, user_message: str, final_resp: str) -> None:
-        if user_id == "heartbeat" or self._is_error_response(final_resp):
+    async def _persist_chat_turns(
+        self,
+        user_id: str,
+        user_message: str,
+        final_resp: str,
+        *,
+        turn_failed: bool = False,
+    ) -> None:
+        if user_id == "heartbeat" or turn_failed:
             return
         try:
             await self.ledger_memory.save_chat_turn(user_id, "user", user_message)
@@ -5166,7 +5335,98 @@ class Orchestrator:
         self._ensure_final_response(state, max_iterations)
         return await self._finalize_user_response(user_id, user_message, state["final_response"])
 
-    async def process_message(self, user_message: Any, user_id: str) -> str:
+    async def _try_resume_tool_approval_compat(self, user_id: str, user_message: str) -> Optional[str]:
+        pipeline = getattr(self, "synthesis_pipeline", None)
+        resume_fn = getattr(pipeline, "try_resume_tool_approval", None)
+        if callable(resume_fn):
+            outcome = await resume_fn(user_id, user_message)
+            if outcome is None:
+                return None
+            reply_text = str(getattr(outcome, "reply_text", outcome) or "")
+            follow_up_input = getattr(outcome, "follow_up_input", None)
+            if follow_up_input is None:
+                return reply_text
+            follow_up_response = await self.process_message(follow_up_input, user_id)
+            return f"{reply_text}\n\n{follow_up_response}".strip()
+        return await self._try_resume_tool_approval(user_id, user_message)
+
+    async def _run_user_turn_locked(
+        self,
+        *,
+        user_id: str,
+        user_message: str,
+        user_prompt: Dict[str, Any],
+    ) -> str:
+        has_audio_prompt = bool(self._extract_audio_bytes(user_prompt))
+
+        state = await self._load_state(
+            user_id,
+            user_message,
+            user_prompt=user_prompt,
+        )
+        if state.get("final_response") and not state.get("current_plan"):
+            return self.cognitive_router.sanitize_response(state["final_response"])
+
+        if not has_audio_prompt:
+            profile_updated = await self._remember_user_profile(user_id, user_message)
+            await self._remember_assistant_identity(user_message)
+            lowered_message = user_message.lower()
+            explicit_memory_request = any(
+                marker in lowered_message
+                for marker in ("remember that", "please remember", "remember i ", "remember my ")
+            )
+            if explicit_memory_request and not profile_updated:
+                await self.vector_memory.add_memory_async(
+                    text=user_message,
+                    metadata={"type": "explicit_memory", "source": "user_request"},
+                )
+        else:
+            logger.info("Audio prompt detected for %s; bypassing text-only fast-path memory hooks.", user_id)
+
+        if not has_audio_prompt:
+            reply = await self._try_goal_planning_response(state)
+            if reply is not None:
+                return await self._finalize_user_response(user_id, user_message, reply)
+
+            reply = await self._try_fast_path_response(state)
+            if reply is not None:
+                return await self._finalize_user_response(user_id, user_message, reply)
+
+        try:
+            response = await self._run_graph_loop(state, user_id, user_message)
+            heartbeat_task_id = state.get("_heartbeat_origin_task_id")
+            if heartbeat_task_id is not None and not self._is_error_response(str(response)):
+                try:
+                    await self.ledger_memory.update_objective_status(int(heartbeat_task_id), "completed")
+                except Exception as e:
+                    logger.warning("Failed to mark heartbeat task %s completed: %s", heartbeat_task_id, e)
+            return response
+        except RequiresHITLError as hitl_err:
+            state["_hitl_question"] = str(hitl_err)
+            state["_hitl_created_at"] = time.time()
+            pending_owner_id = str(getattr(self, "_admin_user_id", "") or user_id)
+            if user_id == "heartbeat" and pending_owner_id == "heartbeat":
+                pending_owner_id = str(os.getenv("ADMIN_USER_ID", "heartbeat"))
+            heartbeat_task_id = self._extract_heartbeat_task_id(str(state.get("user_input") or ""))
+            if heartbeat_task_id is not None:
+                state["_heartbeat_origin_task_id"] = heartbeat_task_id
+            pending_state = self._strip_audio_bytes_for_persistence(state)
+            self.pending_hitl_state[pending_owner_id] = pending_state
+            self._fire_and_forget(self.ledger_memory.save_hitl_state(pending_owner_id, pending_state))
+            if user_id == "heartbeat" and self.outbound_queue is not None:
+                await self.outbound_queue.put(str(hitl_err))
+            return str(hitl_err)
+        except Exception as e:
+            logger.error(f"Graph execution failed: {e}", exc_info=True)
+            return "An internal error occurred."
+
+    async def process_message(
+        self,
+        user_message: Any,
+        user_id: str,
+        *,
+        progress_callback: Optional[Callable[[Any], Awaitable[None]]] = None,
+    ) -> str:
         """Main entry point: State Graph execution with Energy Budget."""
         user_prompt = self._coerce_user_prompt_payload(user_message)
         normalized_user_message = str(user_prompt.get("text") or "").strip()
@@ -5179,80 +5439,60 @@ class Orchestrator:
         if not normalized_user_message and not has_audio_prompt:
             return "Error: Invalid message"
 
-        if not hasattr(self, "_ready"):
-            self._ready = asyncio.Event()
-            self._ready.set()
+        emitter_token: Optional[object] = None
+        emitter: Optional[ProgressEmitter] = None
+        if progress_callback is not None and str(user_id or "").strip() != "heartbeat":
+            emitter = ProgressEmitter(progress_callback)
+            emitter_token = set_current_emitter(emitter)
 
-        if not self._ready.is_set():
-            try:
-                await asyncio.wait_for(self._ready.wait(), timeout=30.0)
-            except asyncio.TimeoutError:
-                return "System is still initializing. Please try again in a moment."
+        try:
+            if not hasattr(self, "_ready"):
+                self._ready = asyncio.Event()
+                self._ready.set()
 
-        # Serialise concurrent messages for the same user_id to prevent
-        # race conditions on pending_mfa / pending_hitl_state / pending_tool_approval
-        # dicts (ISSUE-012).  Different users are still processed concurrently.
-        lock = await self._get_user_lock(user_id)
-        async with lock:
-            if not hasattr(self, "_predictive_energy_budget_lock"):
-                self._predictive_energy_budget_lock = asyncio.Lock()
-            if not hasattr(self, "_predictive_energy_budget_remaining"):
-                self._predictive_energy_budget_remaining = max(
-                    0,
-                    int(os.getenv("INITIAL_ENERGY_BUDGET", "100")),
-                )
+            if not self._ready.is_set():
+                try:
+                    await asyncio.wait_for(self._ready.wait(), timeout=30.0)
+                except asyncio.TimeoutError:
+                    return "System is still initializing. Please try again in a moment."
 
-            async with self._predictive_energy_budget_lock:
-                replenishment = int(os.getenv("ENERGY_REPLENISH_PER_TURN", "5"))
-                cap = int(os.getenv("INITIAL_ENERGY_BUDGET", "100"))
-                self._predictive_energy_budget_remaining = min(
-                    self._predictive_energy_budget_remaining + replenishment, cap
-                )
+            lock = await self._get_user_lock(user_id)
+            async with lock:
+                if not hasattr(self, "_predictive_energy_budget_lock"):
+                    self._predictive_energy_budget_lock = asyncio.Lock()
+                if not hasattr(self, "_predictive_energy_budget_remaining"):
+                    self._predictive_energy_budget_remaining = max(
+                        0,
+                        int(os.getenv("INITIAL_ENERGY_BUDGET", "100")),
+                    )
 
-            reply = await self._try_resume_mfa(user_id, normalized_user_message)
-            if reply is not None:
-                return reply
+                async with self._predictive_energy_budget_lock:
+                    replenishment = int(os.getenv("ENERGY_REPLENISH_PER_TURN", "5"))
+                    cap = int(os.getenv("INITIAL_ENERGY_BUDGET", "100"))
+                    self._predictive_energy_budget_remaining = min(
+                        self._predictive_energy_budget_remaining + replenishment, cap
+                    )
+                    if hasattr(self, "_energy_budget"):
+                        self._energy_budget = self._predictive_energy_budget_remaining
 
-            reply = await self._try_resume_tool_approval(user_id, normalized_user_message)
-            if reply is not None:
-                return reply
-
-            state = await self._load_state(
-                user_id,
-                normalized_user_message,
-                user_prompt=user_prompt,
-            )
-            if state.get("final_response") and not state.get("current_plan"):
-                return self.cognitive_router.sanitize_response(state["final_response"])
-
-            if not has_audio_prompt:
-                await self._remember_user_profile(user_id, normalized_user_message)
-                await self._remember_assistant_identity(normalized_user_message)
-            else:
-                logger.info("Audio prompt detected for %s; bypassing text-only fast-path memory hooks.", user_id)
-
-            if not has_audio_prompt:
-                reply = await self._try_goal_planning_response(state)
+                reply = await self._try_resume_mfa(user_id, normalized_user_message)
                 if reply is not None:
-                    return await self._finalize_user_response(user_id, normalized_user_message, reply)
+                    return reply
 
-                reply = await self._try_fast_path_response(state)
+                reply = await self._try_resume_tool_approval_compat(user_id, normalized_user_message)
                 if reply is not None:
-                    return await self._finalize_user_response(user_id, normalized_user_message, reply)
+                    return reply
 
-            try:
-                return await self._run_graph_loop(state, user_id, normalized_user_message)
-            except RequiresHITLError as hitl_err:
-                state["_hitl_question"] = str(hitl_err)
-                state["_hitl_created_at"] = time.time()
-                pending_state = self._strip_audio_bytes_for_persistence(state)
-                self.pending_hitl_state[user_id] = pending_state
-                # Persist so the state survives a bot restart (ISSUE-013)
-                self._fire_and_forget(self.ledger_memory.save_hitl_state(user_id, pending_state))
-                return str(hitl_err)
-            except Exception as e:
-                logger.error(f"Graph execution failed: {e}", exc_info=True)
-                return "An internal error occurred."
+                return await self._run_user_turn_locked(
+                    user_id=user_id,
+                    user_message=normalized_user_message,
+                    user_prompt=user_prompt,
+                )
+        finally:
+            if emitter is not None:
+                await emitter.flush_pending()
+            if emitter_token is not None:
+                reset_emitter(emitter_token)
 
     async def _handle_blocked_result(
         self,
@@ -5273,7 +5513,7 @@ class Orchestrator:
             self._fire_and_forget(
                 self.ledger_memory.save_mfa_state(user_id, result.mfa_tool_name, result.mfa_arguments)
             )
-            return "SECURITY LOCK: To authorize this core change, complete the phrase: 'The sky is...'"
+            return "SECURITY LOCK: Provide the authorization passphrase to continue."
 
         if result.status == "hitl_required":
             state["_hitl_question"] = result.hitl_message
@@ -5314,18 +5554,13 @@ class Orchestrator:
         Extracts the solution and blueprint, saves blueprint to memory async,
         and returns the solution string.
         """
-        allow_sensitive_context = self._requires_sensitive_cloud_context(
-            router_result.escalation_problem,
-            router_result.escalation_context,
-            state.get("user_input", ""),
-        )
         escalation_problem = self._redact_text_for_cloud(
             router_result.escalation_problem,
-            allow_sensitive_context=allow_sensitive_context,
+            allow_sensitive_context=False,
         )
         escalation_context = self._redact_text_for_cloud(
             router_result.escalation_context,
-            allow_sensitive_context=allow_sensitive_context,
+            allow_sensitive_context=False,
         )
 
         prompt = (
@@ -5343,7 +5578,7 @@ class Orchestrator:
         sys2_result = await self._route_to_system_2_redacted(
             messages,
             purpose="cognitive_escalation",
-            allow_sensitive_context=allow_sensitive_context,
+            allow_sensitive_context=False,
         )
 
         content = sys2_result.content if sys2_result.status == "ok" else "[System 2 - Error]: Escalation failed."
