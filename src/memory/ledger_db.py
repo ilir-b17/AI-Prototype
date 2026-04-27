@@ -725,6 +725,8 @@ class LedgerMemory:
     async def purge_expired_pending(self, ttl_seconds: Optional[int] = None) -> Dict[str, int]:
         """Delete expired pending MFA/HITL/tool-approval rows and return per-table counts."""
         ttl = self._pending_ttl_seconds() if ttl_seconds is None else max(0, int(ttl_seconds))
+        # Cap persisted pending-state TTLs at one year to avoid pathological
+        # SQLite datetime intervals while still allowing long local outages.
         ttl = min(ttl, 31_536_000)
         modifier = f"-{ttl} seconds"
         deleted: Dict[str, int] = {}

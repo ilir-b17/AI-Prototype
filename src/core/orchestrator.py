@@ -2999,8 +2999,8 @@ class Orchestrator:
 
         if blocked_result is not None:
             # The batch was already launched and charged as a unit before gather().
-            # Do not refund completed sibling agents: their work was consumed even
-            # though one sibling returned a blocked router result.
+            # The old refund path incorrectly refunded completed sibling agents:
+            # their work was consumed even though one sibling returned a block.
             state[_BLOCKED_KEY] = blocked_result
             return state
 
@@ -5536,7 +5536,10 @@ class Orchestrator:
                 )
                 return f"{deferred_follow_up['reply_text']}\n\n{follow_up_response}".strip()
 
-            raise RuntimeError("Unreachable: process_message must produce a response or raise an exception")
+            raise RuntimeError(
+                "Internal error: process_message reached an unreachable state "
+                "without returning a response or deferred follow-up"
+            )
         finally:
             if emitter is not None:
                 await emitter.flush_pending()
