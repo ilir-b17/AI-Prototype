@@ -26,6 +26,7 @@ os.environ['ADMIN_USER_ID'] = '12345'
 
 from src.interfaces import telegram_bot
 from src.interfaces.telegram_bot import (
+    emailstatus,
     handle_document_message,
     handle_message,
     handle_voice_message,
@@ -141,6 +142,34 @@ async def test_status_command_reports_operational_counts():
     assert "Pending MFA: 1" in sent_text
     assert "Pending HITL: 2" in sent_text
     assert "Predictive energy budget: 81" in sent_text
+
+
+@pytest.mark.asyncio
+async def test_emailstatus_reports_polling_metrics():
+    mock_update = MagicMock(spec=Update)
+    mock_message = AsyncMock(spec=Message)
+    mock_update.message = mock_message
+    mock_update.effective_user = MagicMock(spec=User)
+    mock_update.effective_user.id = 12345
+
+    mock_orchestrator = MagicMock()
+    mock_orchestrator.get_email_poll_status = AsyncMock(
+        return_value={
+            "last_poll_time": "2026-04-27 14:00:00",
+            "emails_processed_last_24h": 4,
+            "pending_google_tasks": 9,
+        }
+    )
+
+    mock_context = MagicMock()
+    mock_context.bot_data = {"orchestrator": mock_orchestrator}
+
+    await emailstatus(mock_update, mock_context)
+
+    sent_text = mock_update.message.reply_text.await_args.args[0]
+    assert "Last poll time: 2026-04-27 14:00:00" in sent_text
+    assert "Emails processed (last 24h): 4" in sent_text
+    assert "Pending google-domain tasks: 9" in sent_text
 
 
 @pytest.mark.asyncio
