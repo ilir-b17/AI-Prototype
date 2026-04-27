@@ -68,7 +68,7 @@ async def manage_file_system(action: str, file_path: str, content: str = None) -
                 })
 
             if resolved_path.lower().endswith('.pdf'):
-                loop = asyncio.get_event_loop()
+                loop = asyncio.get_running_loop()
                 data = await loop.run_in_executor(None, _read_pdf, resolved_path)
                 return data
 

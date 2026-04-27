@@ -71,6 +71,9 @@ ENERGY_COST_TOOL = 5
 HEARTBEAT_INTERVAL = int(os.getenv("HEARTBEAT_INTERVAL_SECONDS", "1800"))  # default 30 minutes
 MEMORY_SAVE_THRESHOLD = int(os.getenv("MEMORY_SAVE_THRESHOLD", "120"))
 MEMORY_CONSOLIDATION_INTERVAL = int(os.getenv("MEMORY_CONSOLIDATION_INTERVAL", "21600"))  # 6 hours
+# UTC timestamp format shared with VectorMemory.add_memory / prune_old_memories so that
+# lexical comparisons inside ChromaDB remain consistent across all write paths.
+_UTC_TIMESTAMP_FMT = "%Y-%m-%dT%H:%M:%S"
 # How long an unanswered MFA/HITL/tool-approval entry stays alive before auto-expiry
 _PENDING_STATE_TTL_SECONDS = int(os.getenv("PENDING_STATE_TTL_SECONDS", "86400"))  # 24 hours
 _SYNTHESIS_SELF_TEST_TIMEOUT_DEFAULT_SECONDS = 12.0
@@ -283,7 +286,7 @@ class Orchestrator:
             self.pending_mfa: Dict[str, dict] = {}
             self.pending_hitl_state: Dict[str, dict] = {}
             self.pending_tool_approval: Dict[str, dict] = {}
-            self._consolidation_turn_counts: Dict[str, int] = {}
+            self._consolidation_turn_counts: OrderedDict = OrderedDict()
             self.outbound_queue: Optional[asyncio.Queue] = None
             self.sensory_state: Dict[str, str] = {}
             # Background task registry — holds strong references to prevent GC (ISSUE-002)
@@ -1460,7 +1463,8 @@ class Orchestrator:
         resolved = os.getenv("CHARTER_PATH", filepath)
         try:
             if os.path.exists(resolved):
-                text = open(resolved, "r", encoding="utf-8").read().strip()
+                with open(resolved, "r", encoding="utf-8") as fh:
+                    text = fh.read().strip()
                 if text:
                     return text
                 logger.warning("Charter file at '%s' is empty — using minimal fallback.", resolved)
@@ -3528,12 +3532,16 @@ class Orchestrator:
         Uses asyncio.to_thread() so the blocking ChromaDB call does not
         stall the event loop.
         """
+        from datetime import timezone as _tz
         try:
             if len(text) < MEMORY_SAVE_THRESHOLD:
                 return
             await self.vector_memory.add_memory_async(
                 text=text,
-                metadata={"type": "conversation", "timestamp": datetime.now().isoformat()}
+                metadata={
+                    "type": "conversation",
+                    "timestamp": datetime.now(_tz.utc).strftime(_UTC_TIMESTAMP_FMT),
+                },
             )
         except Exception as e:
             logger.warning(f"Async memory save failed: {e}")
@@ -5704,10 +5712,18 @@ class Orchestrator:
 
     def close(self) -> None:
         try:
-            loop = asyncio.get_event_loop()
-            if loop.is_running():
-                loop.create_task(self.aclose())
-            else:
-                loop.run_until_complete(self.aclose())
-        except Exception as e:
-            logger.error(f"Error closing Orchestrator: {e}", exc_info=True)
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            loop = None
+
+        if loop is not None and loop.is_running():
+            # Schedule cleanup and keep a strong reference so the GC cannot
+            # destroy the task before it completes (same pattern as _fire_and_forget).
+            task = loop.create_task(self.aclose())
+            self._background_tasks.add(task)
+            task.add_done_callback(self._background_tasks.discard)
+        else:
+            try:
+                asyncio.run(self.aclose())
+            except Exception as e:
+                logger.error(f"Error closing Orchestrator: {e}", exc_info=True)
