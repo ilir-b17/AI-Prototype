@@ -98,3 +98,34 @@ async def test_get_email_poll_status_reports_24h_and_pending_counts() -> None:
     assert stats["last_poll_time"] == "2026-04-27 12:30:00"
     assert stats["emails_processed_last_24h"] == 1
     assert stats["pending_google_tasks"] == 3
+
+
+@pytest.mark.asyncio
+async def test_notify_completed_domain_tasks_reports_google_terminal_results() -> None:
+    orchestrator = Orchestrator.__new__(Orchestrator)
+    orchestrator.ledger_memory = MagicMock()
+    orchestrator.ledger_memory.get_completed_tasks_pending_notification = AsyncMock(
+        return_value=[
+            {"id": 11, "title": "Email follow-up", "status": "completed", "agent_domain": "google"},
+            {"id": 12, "title": "Draft blocked", "status": "failed", "agent_domain": "google"},
+            {"id": 13, "title": "Internal task", "status": "completed", "agent_domain": "aiden"},
+        ]
+    )
+    orchestrator.ledger_memory.get_task_result = AsyncMock(
+        side_effect=[
+            {"summary": "reply sent"},
+            {"error": "OAuth token expired"},
+        ]
+    )
+    orchestrator.ledger_memory.mark_tasks_admin_notified = AsyncMock()
+    orchestrator._notify_admin = AsyncMock()
+
+    await Orchestrator._notify_completed_domain_tasks(orchestrator)
+
+    assert orchestrator._notify_admin.await_count == 2
+    assert "Google Agent completed: Email follow-up — reply sent" in orchestrator._notify_admin.await_args_list[0].args[0]
+    assert (
+        "Google Agent blocked: Draft blocked — OAuth token expired. Reply to investigate."
+        in orchestrator._notify_admin.await_args_list[1].args[0]
+    )
+    orchestrator.ledger_memory.mark_tasks_admin_notified.assert_awaited_once_with([11, 12])

@@ -186,6 +186,10 @@ class LedgerMemory:
                 "result_written_at",
                 "TIMESTAMP",
             )
+            await self._ensure_objective_backlog_column(
+                "admin_notified",
+                "INTEGER NOT NULL DEFAULT 0",
+            )
             await self._db.execute("""
                 CREATE INDEX IF NOT EXISTS idx_objective_status ON objective_backlog(status)
             """)
@@ -561,6 +565,8 @@ class LedgerMemory:
         result["last_energy_eval_at"] = result.get("last_energy_eval_at")
         result["next_eligible_at"] = result.get("next_eligible_at")
         result["last_energy_eval_json"] = str(result.get("last_energy_eval_json") or "")
+        if "admin_notified" in result:
+            result["admin_notified"] = bool(int(result.get("admin_notified") or 0))
         return result
 
     @classmethod
@@ -580,6 +586,7 @@ class LedgerMemory:
             "last_energy_eval_at": row["task_last_energy_eval_at"],
             "next_eligible_at": row["task_next_eligible_at"],
             "last_energy_eval_json": row["task_last_energy_eval_json"],
+            "agent_domain": row["task_agent_domain"],
             "created_at": row["task_created_at"],
             "updated_at": row["task_updated_at"],
         }
@@ -625,6 +632,7 @@ class LedgerMemory:
             "task.last_energy_eval_at AS task_last_energy_eval_at, "
             "task.next_eligible_at AS task_next_eligible_at, "
             "task.last_energy_eval_json AS task_last_energy_eval_json, "
+            "task.agent_domain AS task_agent_domain, "
             "task.created_at AS task_created_at, task.updated_at AS task_updated_at, "
             "story.id AS story_id, story.title AS story_title, story.status AS story_status, "
             "story.acceptance_criteria AS story_acceptance_criteria, "
@@ -1158,17 +1166,19 @@ class LedgerMemory:
         parent_id: Optional[int] = None,
         depends_on_ids: Optional[List[int]] = None,
         acceptance_criteria: str = "",
+        agent_domain: Optional[str] = None,
     ) -> int:
         """Insert a new Epic/Story/Task into the objective_backlog."""
         if tier not in ("Epic", "Story", "Task"):
             raise ValueError("tier must be Epic, Story, or Task")
         depends_blob = self._serialize_depends_on_ids(depends_on_ids)
         acceptance_text = str(acceptance_criteria or "").strip()
+        domain_value = str(agent_domain or "").strip() or None
         async with self._lock:
             cursor = await self._db.execute(
                 "INSERT INTO objective_backlog "
-                "(tier, title, status, priority, estimated_energy, origin, parent_id, depends_on_ids, acceptance_criteria) "
-                "VALUES (?, ?, 'pending', ?, ?, ?, ?, ?, ?)",
+                "(tier, title, status, priority, estimated_energy, origin, parent_id, depends_on_ids, acceptance_criteria, agent_domain) "
+                "VALUES (?, ?, 'pending', ?, ?, ?, ?, ?, ?, ?)",
                 (
                     tier,
                     title,
@@ -1178,6 +1188,7 @@ class LedgerMemory:
                     parent_id,
                     depends_blob,
                     acceptance_text,
+                    domain_value,
                 ),
             )
             await self._db.commit()
@@ -1347,6 +1358,51 @@ class LedgerMemory:
             )
             rows = await cursor.fetchall()
         return [self._normalize_objective_row(row) for row in rows]
+
+    async def get_completed_tasks_pending_notification(self, limit: int = 50) -> List[Dict[str, Any]]:
+        """Return terminal non-AIDEN domain tasks not yet reported to admin."""
+        async with self._lock:
+            cursor = await self._db.execute(
+                "SELECT id, tier, title, status, priority, estimated_energy, "
+                "origin, parent_id, depends_on_ids, acceptance_criteria, "
+                "defer_count, last_energy_eval_at, next_eligible_at, last_energy_eval_json, "
+                "agent_domain, claimed_by, claimed_at, result_json, result_written_at, "
+                "admin_notified, created_at, updated_at "
+                "FROM objective_backlog "
+                "WHERE tier = 'Task' "
+                "AND agent_domain IS NOT NULL AND TRIM(agent_domain) != '' "
+                "AND LOWER(TRIM(agent_domain)) != 'aiden' "
+                "AND LOWER(status) IN ('completed', 'failed', 'blocked') "
+                "AND COALESCE(admin_notified, 0) = 0 "
+                "ORDER BY COALESCE(result_written_at, updated_at, created_at) DESC, id DESC "
+                "LIMIT ?",
+                (max(1, int(limit)),),
+            )
+            rows = await cursor.fetchall()
+        return [self._normalize_objective_row(row) for row in rows]
+
+    async def mark_tasks_admin_notified(self, task_ids: List[int]) -> None:
+        """Mark a set of Task rows as already notified to admin."""
+        normalized_ids: List[int] = []
+        for task_id in task_ids or []:
+            try:
+                normalized = int(task_id)
+            except (TypeError, ValueError):
+                continue
+            if normalized > 0 and normalized not in normalized_ids:
+                normalized_ids.append(normalized)
+        if not normalized_ids:
+            return
+
+        placeholders = ",".join("?" for _ in normalized_ids)
+        async with self._lock:
+            await self._db.execute(
+                "UPDATE objective_backlog "
+                "SET admin_notified = 1, updated_at = CURRENT_TIMESTAMP "
+                f"WHERE tier = 'Task' AND id IN ({placeholders})",
+                tuple(normalized_ids),
+            )
+            await self._db.commit()
 
     async def get_task_result(self, task_id: int) -> Optional[Dict[str, Any]]:
         """Return parsed task result payload, or None when absent/invalid."""
