@@ -21,22 +21,30 @@ from src.core.llm_router import RouterResult
 
 logger = logging.getLogger(__name__)
 
-_SAFE_ENV_KEYS = {"PATH", "PYTHONPATH", "SYSTEMROOT", "TEMP", "TMP", "HOME", "USER", "LANG", "LC_ALL"}
+_SAFE_SUBPROCESS_ENV_KEYS = {
+    "PATH",
+    "SYSTEMROOT",
+    "WINDIR",
+    "TEMP",
+    "TMP",
+    "TMPDIR",
+    "LANG",
+    "LC_ALL",
+    "PYTHONIOENCODING",
+    "PYTHONUNBUFFERED",
+}
 _BLOCKED_ENV_PREFIXES = ("TELEGRAM_", "GROQ_", "GEMINI_", "ANTHROPIC_", "OPENAI_", "OLLAMA_CLOUD_", "ADMIN_")
 
 
-# Move this helper verbatim from orchestrator.py:
 def _build_safe_subprocess_env() -> Dict[str, str]:
-    safe_env: Dict[str, str] = {}
-    for key, value in os.environ.items():
-        if key in _SAFE_ENV_KEYS:
-            safe_env[key] = value
-            continue
-        if any(key.startswith(prefix) for prefix in _BLOCKED_ENV_PREFIXES):
-            continue
-        safe_env[key] = value
-    # Ensure Python can find packages
-    safe_env.setdefault("PYTHONPATH", os.getcwd())
+    safe_env: Dict[str, str] = {
+        key: value
+        for key in _SAFE_SUBPROCESS_ENV_KEYS
+        if (value := os.environ.get(key))
+    }
+    safe_env["PYTHONPATH"] = os.getcwd()
+    safe_env.setdefault("PYTHONIOENCODING", "utf-8")
+    safe_env.setdefault("PYTHONUNBUFFERED", "1")
     return safe_env
 
 

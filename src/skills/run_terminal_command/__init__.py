@@ -3,7 +3,7 @@ import json
 import logging
 import os
 import shlex
-from typing import List, Set
+from typing import List
 
 logger = logging.getLogger(__name__)
 
@@ -56,9 +56,9 @@ def _split_command(command: str) -> List[str]:
     return shlex.split(command, posix=(os.name != "nt"))
 
 
-def _allowlisted_first_tokens() -> Set[str]:
+def _allowlisted_prefixes() -> List[List[str]]:
     raw_allowlist = os.getenv("AIDEN_TERMINAL_ALLOWLIST", DEFAULT_ALLOWLIST)
-    allowed_tokens: Set[str] = set()
+    allowed_prefixes: List[List[str]] = []
     for entry in str(raw_allowlist).split(","):
         normalized = entry.strip()
         if not normalized:
@@ -67,10 +67,15 @@ def _allowlisted_first_tokens() -> Set[str]:
             tokens = _split_command(normalized)
         except ValueError:
             tokens = normalized.split()
-        first_token = (tokens[0] if tokens else normalized).strip().lower()
-        if first_token:
-            allowed_tokens.add(first_token)
-    return allowed_tokens
+        prefix = [token.strip().lower() for token in tokens if token.strip()]
+        if prefix:
+            allowed_prefixes.append(prefix)
+    return allowed_prefixes
+
+
+def _is_allowlisted_command(argv: List[str]) -> bool:
+    lowered = [str(token).strip().lower() for token in argv]
+    return any(lowered[:len(prefix)] == prefix for prefix in _allowlisted_prefixes())
 
 async def run_terminal_command(command: str) -> str:
     """
@@ -103,11 +108,9 @@ async def run_terminal_command(command: str) -> str:
     if not argv:
         return _security_error("Command is empty after parsing.")
 
-    first_token = str(argv[0]).strip().lower()
-    allowlist = _allowlisted_first_tokens()
-    if first_token not in allowlist:
+    if not _is_allowlisted_command(argv):
         return _security_error(
-            f"Command '{first_token}' is not in the allowlist."
+            f"Command '{' '.join(argv[:2])}' is not in the allowlist."
         )
 
     timeout_seconds = _get_timeout_seconds()

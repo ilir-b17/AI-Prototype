@@ -8,6 +8,7 @@ contextual awareness in agent decision-making.
 
 import os
 import logging
+import threading
 import uuid
 from datetime import datetime, timedelta
 from datetime import timezone
@@ -42,6 +43,9 @@ class VectorMemory:
         """
         self.persist_dir = persist_dir
         self.collection = None
+        self.client = None
+        self._lock = threading.RLock()
+        self._closed = False
 
         # Ensure the persistence directory exists
         os.makedirs(self.persist_dir, exist_ok=True)
@@ -84,6 +88,11 @@ class VectorMemory:
             logger.error(f"Failed to initialize VectorMemory: {e}")
             raise
 
+    def _require_open_collection(self) -> Any:
+        if self._closed or self.collection is None:
+            raise RuntimeError("VectorMemory is closed")
+        return self.collection
+
     def add_memory(
         self,
         text: str,
@@ -108,60 +117,63 @@ class VectorMemory:
             ValueError: If text is empty or None.
             Exception: If insertion into ChromaDB fails after retries.
         """
-        if not text or not isinstance(text, str):
-            raise ValueError("Text must be a non-empty string")
+        with self._lock:
+            collection = self._require_open_collection()
 
-        if metadata is None:
-            metadata = {}
+            if not text or not isinstance(text, str):
+                raise ValueError("Text must be a non-empty string")
 
-        # Near-duplicate guard: skip insert if a very similar entry already exists
-        try:
-            existing = self.collection.query(query_texts=[text], n_results=1)
-            if existing.get("distances") and existing["distances"][0]:
-                similarity = 1.0 - existing["distances"][0][0]  # cosine: distance = 1 − sim
-                if similarity >= dedup_threshold:
-                    existing_id = existing["ids"][0][0]
-                    logger.debug(
-                        "Dedup: skipping insert, near-identical memory exists (sim=%.4f, id=%s)",
-                        similarity, existing_id,
-                    )
-                    return existing_id
-        except Exception as _dedup_err:
-            logger.warning("Dedup check failed, proceeding with insert: %s", _dedup_err)
+            if metadata is None:
+                metadata = {}
 
-        # Stamp metadata with current time if not already present
-        if "timestamp" not in metadata:
-            metadata = dict(metadata)
-            # Use a consistent UTC-naive format so lexical comparison remains stable.
-            # Existing records with legacy timestamp formats are not rewritten here.
-            metadata["timestamp"] = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S")
-
-        # Generate ID if not provided
-        if not memory_id:
-            memory_id = str(uuid.uuid4())
-
-        # Retry logic for transient failures
-        max_retries = 3
-        for attempt in range(max_retries):
+            # Near-duplicate guard: skip insert if a very similar entry already exists
             try:
-                # Add memory to the collection with explicit ID
-                self.collection.add(
-                    ids=[memory_id],
-                    documents=[text],
-                    metadatas=[metadata]
-                )
+                existing = collection.query(query_texts=[text], n_results=1)
+                if existing.get("distances") and existing["distances"][0]:
+                    similarity = 1.0 - existing["distances"][0][0]  # cosine: distance = 1 − sim
+                    if similarity >= dedup_threshold:
+                        existing_id = existing["ids"][0][0]
+                        logger.debug(
+                            "Dedup: skipping insert, near-identical memory exists (sim=%.4f, id=%s)",
+                            similarity, existing_id,
+                        )
+                        return existing_id
+            except Exception as _dedup_err:
+                logger.warning("Dedup check failed, proceeding with insert: %s", _dedup_err)
 
-                logger.info(f"Memory added with ID: {memory_id}")
-                return memory_id
-            except Exception as e:
-                if attempt < max_retries - 1:
-                    logger.warning(f"Failed to add memory (attempt {attempt + 1}/{max_retries}): {e}")
-                    # Wait briefly before retry
-                    import time
-                    time.sleep(0.5)
-                else:
-                    logger.error(f"Failed to add memory after {max_retries} attempts: {e}")
-                    raise
+            # Stamp metadata with current time if not already present
+            if "timestamp" not in metadata:
+                metadata = dict(metadata)
+                # Use a consistent UTC-naive format so lexical comparison remains stable.
+                # Existing records with legacy timestamp formats are not rewritten here.
+                metadata["timestamp"] = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S")
+
+            # Generate ID if not provided
+            if not memory_id:
+                memory_id = str(uuid.uuid4())
+
+            # Retry logic for transient failures
+            max_retries = 3
+            for attempt in range(max_retries):
+                try:
+                    # Add memory to the collection with explicit ID
+                    collection.add(
+                        ids=[memory_id],
+                        documents=[text],
+                        metadatas=[metadata]
+                    )
+
+                    logger.info(f"Memory added with ID: {memory_id}")
+                    return memory_id
+                except Exception as e:
+                    if attempt < max_retries - 1:
+                        logger.warning(f"Failed to add memory (attempt {attempt + 1}/{max_retries}): {e}")
+                        # Wait briefly before retry
+                        import time
+                        time.sleep(0.5)
+                    else:
+                        logger.error(f"Failed to add memory after {max_retries} attempts: {e}")
+                        raise
 
     def query_memory(
         self,
@@ -186,35 +198,38 @@ class VectorMemory:
             ValueError: If query_text is empty or n_results is less than 1.
             Exception: If the query fails.
         """
-        if not query_text or not isinstance(query_text, str):
-            raise ValueError("Query text must be a non-empty string")
+        with self._lock:
+            collection = self._require_open_collection()
 
-        if n_results < 1:
-            raise ValueError("n_results must be at least 1")
+            if not query_text or not isinstance(query_text, str):
+                raise ValueError("Query text must be a non-empty string")
 
-        try:
-            # Query the collection
-            results = self.collection.query(
-                query_texts=[query_text],
-                n_results=n_results
-            )
+            if n_results < 1:
+                raise ValueError("n_results must be at least 1")
 
-            # Format results into a more readable structure
-            formatted_results = []
-            if results["ids"] and len(results["ids"]) > 0:
-                for i, memory_id in enumerate(results["ids"][0]):
-                    formatted_results.append({
-                        "id": memory_id,
-                        "document": results["documents"][0][i],
-                        "metadata": results["metadatas"][0][i],
-                        "distance": results["distances"][0][i]
-                    })
+            try:
+                # Query the collection
+                results = collection.query(
+                    query_texts=[query_text],
+                    n_results=n_results
+                )
 
-            logger.info(f"Query returned {len(formatted_results)} results")
-            return formatted_results
-        except Exception as e:
-            logger.error(f"Failed to query memory: {e}")
-            raise
+                # Format results into a more readable structure
+                formatted_results = []
+                if results["ids"] and len(results["ids"]) > 0:
+                    for i, memory_id in enumerate(results["ids"][0]):
+                        formatted_results.append({
+                            "id": memory_id,
+                            "document": results["documents"][0][i],
+                            "metadata": results["metadatas"][0][i],
+                            "distance": results["distances"][0][i]
+                        })
+
+                logger.info(f"Query returned {len(formatted_results)} results")
+                return formatted_results
+            except Exception as e:
+                logger.error(f"Failed to query memory: {e}")
+                raise
 
     def delete_memory(self, memory_id: str) -> None:
         """
@@ -226,12 +241,13 @@ class VectorMemory:
         Raises:
             Exception: If deletion fails.
         """
-        try:
-            self.collection.delete(ids=[memory_id])
-            logger.info(f"Memory {memory_id} deleted")
-        except Exception as e:
-            logger.error(f"Failed to delete memory {memory_id}: {e}")
-            raise
+        with self._lock:
+            try:
+                self._require_open_collection().delete(ids=[memory_id])
+                logger.info(f"Memory {memory_id} deleted")
+            except Exception as e:
+                logger.error(f"Failed to delete memory {memory_id}: {e}")
+                raise
 
     def get_memory_count(self) -> int:
         """
@@ -240,13 +256,14 @@ class VectorMemory:
         Returns:
             int: The total count of memories.
         """
-        try:
-            count = self.collection.count()
-            logger.info(f"Total memories in database: {count}")
-            return count
-        except Exception as e:
-            logger.error(f"Failed to retrieve memory count: {e}")
-            return 0
+        with self._lock:
+            try:
+                count = self._require_open_collection().count()
+                logger.info(f"Total memories in database: {count}")
+                return count
+            except Exception as e:
+                logger.error(f"Failed to retrieve memory count: {e}")
+                return 0
 
     def clear_all_memories(self) -> None:
         """
@@ -257,17 +274,20 @@ class VectorMemory:
         Raises:
             Exception: If clearing fails.
         """
-        try:
-            # Delete the collection and recreate it
-            self.client.delete_collection(name="agent_memory")
-            self.collection = self.client.get_or_create_collection(
-                name="agent_memory",
-                metadata=_COLLECTION_METADATA
-            )
-            logger.warning("All memories cleared from the database")
-        except Exception as e:
-            logger.error(f"Failed to clear all memories: {e}")
-            raise
+        with self._lock:
+            if self._closed or self.client is None:
+                raise RuntimeError("VectorMemory is closed")
+            try:
+                # Delete the collection and recreate it
+                self.client.delete_collection(name="agent_memory")
+                self.collection = self.client.get_or_create_collection(
+                    name="agent_memory",
+                    metadata=_COLLECTION_METADATA
+                )
+                logger.warning("All memories cleared from the database")
+            except Exception as e:
+                logger.error(f"Failed to clear all memories: {e}")
+                raise
 
     def close(self) -> None:
         """
@@ -279,22 +299,22 @@ class VectorMemory:
         nulling the client reference.
         """
         try:
-            # Drop the collection reference before touching the client so that
-            # any concurrent asyncio.to_thread() calls see None and raise an
-            # AttributeError rather than accessing a half-torn-down client.
-            if hasattr(self, 'collection') and self.collection is not None:
+            with self._lock:
+                if self._closed:
+                    return
+                self._closed = True
                 self.collection = None
-
-            if hasattr(self, 'client') and self.client is not None:
-                # Attempt to stop ChromaDB's internal background system
-                # (persist thread, HNSW index, etc.) gracefully.
-                try:
-                    if hasattr(self.client, '_system') and hasattr(self.client._system, 'stop'):
-                        self.client._system.stop()
-                except Exception:
-                    pass  # Best-effort — client may not expose _system
-                logger.info("Closing VectorMemory connections")
+                client = self.client
                 self.client = None
+
+            if client is not None:
+                try:
+                    system = getattr(client, '_system', None)
+                    if system is not None and hasattr(system, 'stop'):
+                        system.stop()
+                except Exception:
+                    logger.debug("ChromaDB system stop failed during close", exc_info=True)
+                logger.info("Closing VectorMemory connections")
         except Exception as e:
             logger.warning(f"Error closing VectorMemory: {e}")
 
@@ -303,19 +323,21 @@ class VectorMemory:
         # Keep cutoff format aligned with newly-stamped UTC timestamps.
         # Existing DB rows with legacy/mixed timestamp formats are not retroactively fixed.
         cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).strftime("%Y-%m-%dT%H:%M:%S")
-        try:
-            results = self.collection.get(
-                where={"timestamp": {"$lt": cutoff}},
-                include=["metadatas"],
-            )
-            ids = results.get("ids", [])
-            if ids:
-                self.collection.delete(ids=ids)
-                logger.info("Pruned %d old vector memories (older than %d days).", len(ids), days)
-            return len(ids)
-        except Exception as e:
-            logger.warning("Vector memory pruning failed: %s", e)
-            return 0
+        with self._lock:
+            try:
+                collection = self._require_open_collection()
+                results = collection.get(
+                    where={"timestamp": {"$lt": cutoff}},
+                    include=["metadatas"],
+                )
+                ids = results.get("ids", [])
+                if ids:
+                    collection.delete(ids=ids)
+                    logger.info("Pruned %d old vector memories (older than %d days).", len(ids), days)
+                return len(ids)
+            except Exception as e:
+                logger.warning("Vector memory pruning failed: %s", e)
+                return 0
 
     # â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     # Async wrappers â€” non-blocking via asyncio.to_thread()
@@ -339,4 +361,3 @@ class VectorMemory:
         """Non-blocking wrapper for :meth:`query_memory`."""
         import asyncio
         return await asyncio.to_thread(self.query_memory, query_text, n_results)
-

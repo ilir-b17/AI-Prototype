@@ -67,6 +67,15 @@ class AgentState:
                 result[str(key)] = None
         return result
 
+    @staticmethod
+    def _coerce_energy_remaining(raw: Any) -> int:
+        if raw is None:
+            return 100
+        try:
+            return max(0, int(raw))
+        except (TypeError, ValueError):
+            return 100
+
     @classmethod
     def from_dict(cls, raw: Dict[str, Any]) -> "AgentState":
         return cls(
@@ -82,7 +91,7 @@ class AgentState:
             final_response=str(raw.get("final_response", "") or ""),
             iteration_count=int(raw.get("iteration_count", 0) or 0),
             admin_guidance=str(raw.get("admin_guidance", "") or ""),
-            energy_remaining=int(raw.get("energy_remaining", 100) or 100),
+            energy_remaining=cls._coerce_energy_remaining(raw.get("energy_remaining")),
             hitl_count=int(raw.get("hitl_count", 0) or 0),
             critic_feedback=str(raw.get("critic_feedback", "") or ""),
             critic_instructions=str(raw.get("critic_instructions", "") or ""),

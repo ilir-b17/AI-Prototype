@@ -8,6 +8,7 @@ the charter or altering core memory.
 
 import os
 import re
+import hmac
 from typing import Optional
 
 try:
@@ -101,6 +102,4 @@ def verify_mfa_challenge(user_response: str, expected_answer: Optional[str] = No
     if not cleaned_expected:
         return False
 
-    # Require whole-word match, not substring-in-word.
-    pattern = r"\b" + re.escape(cleaned_expected) + r"\b"
-    return bool(re.search(pattern, cleaned_response))
+    return hmac.compare_digest(cleaned_response, cleaned_expected)

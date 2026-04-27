@@ -663,6 +663,7 @@ class DynamicToolWorkerClient:
         reload_on_failure: bool = True,
     ) -> Dict[str, Any]:
         failure: Optional[str] = None
+        cancelled = False
         async with self._request_lock:
             try:
                 return await asyncio.wait_for(self._request_once(message), timeout=timeout_seconds)
@@ -670,8 +671,16 @@ class DynamicToolWorkerClient:
                 failure = f"worker request timed out after {timeout_seconds:.1f}s"
             except DynamicToolWorkerProcessError as exc:
                 failure = str(exc)
+            except asyncio.CancelledError:
+                failure = "worker request was cancelled"
+                cancelled = True
 
-        await self._restart_after_failure(failure or "unknown worker failure", reload_on_failure=reload_on_failure)
+        await self._restart_after_failure(
+            failure or "unknown worker failure",
+            reload_on_failure=reload_on_failure and not cancelled,
+        )
+        if cancelled:
+            raise asyncio.CancelledError
         return _response_error(f"Dynamic tool worker unavailable: {failure}")
 
     async def _restart_after_failure(self, reason: str, *, reload_on_failure: bool) -> None:

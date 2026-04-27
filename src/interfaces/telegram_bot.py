@@ -13,6 +13,7 @@ import logging
 import asyncio
 import sys
 import socket
+import time
 from io import BytesIO
 from typing import Any
 from dotenv import load_dotenv
@@ -74,12 +75,6 @@ def _env_bool(name: str, default: bool = False) -> bool:
 
 
 ENABLE_NATIVE_AUDIO = _env_bool('ENABLE_NATIVE_AUDIO', default=False)
-
-if not TELEGRAM_BOT_TOKEN:
-    raise ValueError("TELEGRAM_BOT_TOKEN environment variable not set")
-
-if ADMIN_USER_ID == 0:
-    raise ValueError("ADMIN_USER_ID environment variable not set")
 
 # Initialize the Orchestrator (will be instantiated in main())
 orchestrator: Orchestrator = None
@@ -410,6 +405,61 @@ async def handle_voice_message(update: Update, context: ContextTypes.DEFAULT_TYP
         await update.message.reply_text("An error occurred while processing your voice note. Please try again.")
 
 
+async def handle_document_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle Telegram documents without persisting file contents locally."""
+    global orchestrator
+
+    user_id = update.effective_user.id
+    if not is_authorized(user_id):
+        logger.warning("Unauthorized document message from user %s", user_id)
+        await update.message.reply_text(_UNAUTHORIZED_MSG)
+        return
+
+    document = getattr(update.message, "document", None)
+    if document is None:
+        await update.message.reply_text("Unsupported document payload.")
+        return
+
+    if orchestrator is None:
+        logger.error(_ORCHESTRATOR_NOT_INITIALIZED)
+        await update.message.reply_text(_SERVICE_UNAVAILABLE_MSG)
+        return
+
+    file_name = sanitize_for_logging(str(getattr(document, "file_name", "document") or "document"), max_length=128)
+    file_size = getattr(document, "file_size", None)
+    caption = str(getattr(update.message, "caption", "") or "").strip()
+    prompt = (
+        f"{caption}\n\n"
+        f"[Document received: {file_name}"
+        f"{f' · {file_size} bytes' if file_size is not None else ''}]"
+    ).strip()
+
+    stop_typing = asyncio.Event()
+    typing_task = asyncio.create_task(
+        _keep_typing_alive(context.bot, update.effective_chat.id, stop_typing)
+    )
+    try:
+        ai_response = await asyncio.wait_for(
+            orchestrator.process_message(prompt, str(user_id)),
+            timeout=AGENT_TIMEOUT_SECONDS,
+        )
+    except (TimeoutError, asyncio.TimeoutError):
+        await update.message.reply_text(_TIMEOUT_MSG)
+        return
+    except Exception as e:
+        logger.error("Error processing document message: %s", e, exc_info=True)
+        await update.message.reply_text("An error occurred while processing your document. Please try again.")
+        return
+    finally:
+        stop_typing.set()
+        try:
+            await asyncio.wait_for(typing_task, timeout=1.0)
+        except (asyncio.TimeoutError, asyncio.CancelledError):
+            pass
+
+    await update.message.reply_text(_coerce_outbound_text(ai_response)[:4096])
+
+
 async def goals(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """/goals — list all active objectives grouped by tier."""
     if not is_authorized(update.effective_user.id):
@@ -524,6 +574,95 @@ async def addgoal(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     except Exception as e:
         logger.error(f"/addgoal error: {e}", exc_info=True)
         await update.message.reply_text(f"Error adding goal: {e}")
+
+
+async def status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/status — report basic operational counters."""
+    if not is_authorized(update.effective_user.id):
+        await update.message.reply_text(_UNAUTHORIZED_MSG)
+        return
+
+    orchestrator_inst = context.bot_data.get("orchestrator") if context is not None else orchestrator
+    if orchestrator_inst is None:
+        await update.message.reply_text(_SERVICE_UNAVAILABLE_MSG)
+        return
+
+    registry = getattr(getattr(orchestrator_inst, "cognitive_router", None), "registry", None)
+    try:
+        loaded_skills = len(registry) if registry is not None else 0
+    except Exception:
+        loaded_skills = 0
+
+    load_errors = []
+    get_load_errors = getattr(registry, "get_load_errors", None)
+    if callable(get_load_errors):
+        try:
+            load_errors = list(get_load_errors())
+        except Exception:
+            load_errors = []
+    failed_names = [str(item[0]) for item in load_errors if item]
+
+    energy = "unknown"
+    energy_fn = getattr(orchestrator_inst, "_get_predictive_energy_budget_remaining", None)
+    if callable(energy_fn):
+        try:
+            energy = str(await energy_fn())
+        except Exception:
+            energy = "unknown"
+
+    text = (
+        "AIDEN status\n"
+        f"Loaded skills: {loaded_skills}\n"
+        f"Failed skills: {len(failed_names)}"
+        f"{f' ({', '.join(failed_names[:5])})' if failed_names else ''}\n"
+        f"Pending MFA: {len(getattr(orchestrator_inst, 'pending_mfa', {}) or {})}\n"
+        f"Pending HITL: {len(getattr(orchestrator_inst, 'pending_hitl_state', {}) or {})}\n"
+        f"Predictive energy budget: {energy}"
+    )
+    await update.message.reply_text(text)
+
+
+async def retire_unused_tools(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/retire_unused_tools [confirm] — retire approved tools that have never been used recently."""
+    if not is_authorized(update.effective_user.id):
+        await update.message.reply_text(_UNAUTHORIZED_MSG)
+        return
+
+    ledger = context.bot_data.get("ledger")
+    if ledger is None:
+        await update.message.reply_text("System error: Ledger not available.")
+        return
+
+    user_key = str(update.effective_user.id)
+    pending = context.bot_data.setdefault("pending_retire_unused_tools", {})
+    args = [str(arg).lower() for arg in (getattr(context, "args", None) or [])]
+
+    if args and args[0] == "confirm":
+        pending_entry = pending.pop(user_key, None)
+        tool_names = list((pending_entry or {}).get("tool_names") or [])
+        if not tool_names:
+            await update.message.reply_text("No unused tools are pending retirement.")
+            return
+        retired_count = await ledger.retire_tools(tool_names)
+        await update.message.reply_text(f"Retired {retired_count} tool(s): {', '.join(tool_names)}")
+        return
+
+    items = await ledger.get_unused_approved_tools()
+    tool_names = [str(item.get("name") or "").strip() for item in items if str(item.get("name") or "").strip()]
+    if not tool_names:
+        await update.message.reply_text("No unused approved tools found.")
+        return
+
+    pending[user_key] = {"tool_names": tool_names, "created_at": time.time()}
+    lines = ["Unused approved tools:"]
+    for item in items:
+        name = str(item.get("name") or "").strip()
+        if not name:
+            continue
+        last_used = item.get("last_used_at") or "never"
+        lines.append(f"- {name} (last used: {last_used})")
+    lines.append("\nReply with /retire_unused_tools confirm to retire these tools.")
+    await update.message.reply_text("\n".join(lines))
 
 
 async def _drain_background_tasks(orchestrator: Any, *, timeout: float = 10.0) -> None:
@@ -753,6 +892,11 @@ def main() -> None:
     global orchestrator, _application, _restart_requested
     lock_sock = None
 
+    if not TELEGRAM_BOT_TOKEN:
+        raise ValueError("TELEGRAM_BOT_TOKEN environment variable not set")
+    if ADMIN_USER_ID == 0:
+        raise ValueError("ADMIN_USER_ID environment variable not set")
+
     try:
         # Initialize the Orchestrator (State Graph)
         logger.info("Initializing Orchestrator...")
@@ -797,9 +941,12 @@ def main() -> None:
         application.add_handler(CommandHandler("start", start))
         application.add_handler(CommandHandler("goals", goals))
         application.add_handler(CommandHandler("addgoal", addgoal))
+        application.add_handler(CommandHandler("status", status))
+        application.add_handler(CommandHandler("retire_unused_tools", retire_unused_tools))
         application.add_handler(CommandHandler("shutdown", shutdown))
         application.add_handler(CommandHandler("restart", restart))
         application.add_handler(MessageHandler(filters.VOICE, handle_voice_message))
+        application.add_handler(MessageHandler(filters.Document.ALL, handle_document_message))
         application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
         application.add_error_handler(error_handler)
 
@@ -841,4 +988,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
