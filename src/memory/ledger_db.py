@@ -18,6 +18,9 @@ import aiosqlite
 
 logger = logging.getLogger(__name__)
 
+# Minimum token length for fuzzy tool-name matching (tokens shorter than this are noise).
+_MIN_FUZZY_TOKEN_LENGTH = 3
+
 
 class LogLevel(Enum):
     """Enumeration of system log levels."""
@@ -2523,7 +2526,7 @@ class LedgerMemory:
         """Count synthesis runs in terminal failure states whose tool name fuzzy-matches
         *tool_name* (token overlap on underscore-split tokens ≥ 3 chars) within the given
         time window."""
-        query_tokens = {t.lower() for t in tool_name.split("_") if len(t) >= 3}
+        query_tokens = {t.lower() for t in tool_name.split("_") if len(t) >= _MIN_FUZZY_TOKEN_LENGTH}
         if not query_tokens:
             return 0
         async with self._lock:
@@ -2536,7 +2539,7 @@ class LedgerMemory:
             rows = await cursor.fetchall()
         count = 0
         for row in rows:
-            run_tokens = {t.lower() for t in str(row["suggested_tool_name"] or "").split("_") if len(t) >= 3}
+            run_tokens = {t.lower() for t in str(row["suggested_tool_name"] or "").split("_") if len(t) >= _MIN_FUZZY_TOKEN_LENGTH}
             if query_tokens & run_tokens:
                 count += 1
         return count

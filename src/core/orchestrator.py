@@ -83,6 +83,9 @@ _MAX_SYNTHESIS_RETRIES = int(os.getenv("MAX_SYNTHESIS_RETRIES", "3"))
 _CONSOLIDATION_TRIGGER_TURNS = int(os.getenv("CONSOLIDATION_TRIGGER_TURNS", "10"))
 _CONSOLIDATION_TURN_COUNTS_MAX_SIZE_DEFAULT = 100
 _SYNTHESIS_LOCKOUT_TTL_SECONDS = int(os.getenv("SYNTHESIS_LOCKOUT_TTL_SECONDS", "600"))
+_MAX_SYNTHESIS_FAILURES_BEFORE_MANUAL_INTERVENTION = 2
+_MAX_SKILL_DESCRIPTION_LENGTH = 70
+_INTENT_CLASSIFICATION_MAX_TOKENS = 60
 _SAFE_SUBPROCESS_ENV_KEYS = {
     "PATH",
     "SYSTEMROOT",
@@ -1160,7 +1163,7 @@ class Orchestrator:
                         catalog = [{"name": n, "description": ""} for n in (names_fn() or [])]
         if not catalog:
             return "I don't have any registered skills at the moment."
-        _MAX_DESC = 70
+        _MAX_DESC = _MAX_SKILL_DESCRIPTION_LENGTH
         lines = [f"I have {len(catalog)} registered skill{'s' if len(catalog) != 1 else ''}:\n"]
         for entry in catalog:
             name = str(entry.get("name") or "")
@@ -1404,7 +1407,7 @@ class Orchestrator:
                 [{"role": "user", "content": prompt}],
                 allowed_tools=[],
                 deadline_seconds=10.0,
-                max_output_tokens=60,
+                max_output_tokens=_INTENT_CLASSIFICATION_MAX_TOKENS,
             )
             if result and result.status == "ok":
                 import json as _json
@@ -4561,7 +4564,7 @@ class Orchestrator:
                 failure_count = await self.ledger_memory.count_synthesis_failures_fuzzy(
                     suggested_tool_name, window_hours=24
                 )
-                if failure_count >= 2:
+                if failure_count >= _MAX_SYNTHESIS_FAILURES_BEFORE_MANUAL_INTERVENTION:
                     return (
                         f"This capability has been attempted {failure_count} times without success. "
                         "Manual intervention needed."
