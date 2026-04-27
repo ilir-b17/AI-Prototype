@@ -21,6 +21,7 @@ from src.core.orchestrator_constants import (
     _HEARTBEAT_REPLENISH_ENV_DEFAULT,
 )
 from src.core.energy_roi_engine import EnergyDecision
+from src.core.outcome_judge import OutcomeJudge
 
 logger = logging.getLogger(__name__)
 
@@ -220,6 +221,12 @@ class _HeartbeatManagerMixin:
 
         await self.ledger_memory.update_objective_status(task_id, "completed")
         await self._clear_heartbeat_failure_count(task_id)
+
+        # Fire-and-forget: score the completed task asynchronously so the
+        # heartbeat cycle is not delayed by outcome judgment.
+        self._fire_and_forget(
+            OutcomeJudge.record_outcome(self.ledger_memory, task_id)
+        )
 
         summary = (
             f"Heartbeat completed task #{task_id}:\n"

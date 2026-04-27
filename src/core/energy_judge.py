@@ -200,3 +200,46 @@ class EnergyJudge:
             response_content = route_result
 
         return self.parse_system1_response(response_content)
+
+    @staticmethod
+    def blend_with_historical_scores(
+        evaluation: "EnergyEvaluation",
+        historical_scores: List[int],
+    ) -> "EnergyEvaluation":
+        """Blend the LLM-derived evaluation with historical outcome scores.
+
+        Blending rule:
+        - N ≥ 5 outcomes: 70% historical, 30% heuristic (LLM).
+        - N < 5 outcomes: 100% heuristic (unchanged).
+
+        Historical outcome_scores are on a 1–5 scale; they are scaled to
+        the 1–10 expected_value range before blending.
+
+        Args:
+            evaluation: The base EnergyEvaluation from the LLM (or fallback).
+            historical_scores: List of 1–5 outcome scores for similar tasks.
+
+        Returns:
+            A new EnergyEvaluation with a potentially adjusted expected_value.
+            estimated_effort is never modified by historical data.
+        """
+        if len(historical_scores) < 5:
+            return evaluation
+
+        # Scale 1-5 → 1-10 (preserve range boundaries)
+        scaled = [max(1, min(10, round((s - 1) / 4 * 9 + 1))) for s in historical_scores]
+        historical_avg = sum(scaled) / len(scaled)
+
+        heuristic_value = evaluation.expected_value
+        blended = round(0.7 * historical_avg + 0.3 * heuristic_value)
+        blended_clamped = max(1, min(10, blended))
+
+        if blended_clamped == heuristic_value:
+            return evaluation
+
+        return EnergyEvaluation(
+            estimated_effort=evaluation.estimated_effort,
+            expected_value=blended_clamped,
+            used_fallback=evaluation.used_fallback,
+            fallback_reason=evaluation.fallback_reason,
+        )

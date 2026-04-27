@@ -720,6 +720,62 @@ async def retire_unused_tools(update: Update, context: ContextTypes.DEFAULT_TYPE
     await update.message.reply_text("\n".join(lines))
 
 
+async def learnings(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/learnings — show outcome score rankings and energy estimation accuracy."""
+    if not is_authorized(update.effective_user.id):
+        await update.message.reply_text(_UNAUTHORIZED_MSG)
+        return
+
+    ledger = context.bot_data.get("ledger")
+    if ledger is None:
+        await update.message.reply_text("System error: Ledger not available.")
+        return
+
+    try:
+        summary = await ledger.get_outcome_learnings(days=30)
+    except Exception as e:
+        logger.error("/learnings error: %s", e, exc_info=True)
+        await update.message.reply_text(f"Error fetching learnings: {e}")
+        return
+
+    top = summary.get("top_classes") or []
+    bottom = summary.get("bottom_classes") or []
+    accuracy = summary.get("energy_accuracy_pct")
+    sample = summary.get("energy_accuracy_sample", 0)
+    days = summary.get("days_window", 30)
+
+    lines = [f"--- Outcome Learnings (last {days} days) ---"]
+
+    if top:
+        lines.append("\n\U0001f3c6 Top 5 task classes (by outcome score):")
+        for i, item in enumerate(top, 1):
+            lines.append(
+                f"  {i}. {item['title'][:60]}  "
+                f"avg={item['avg_score']:.1f}/5 (n={item['count']})"
+            )
+    else:
+        lines.append("\nNo scored tasks in this window.")
+
+    if bottom:
+        lines.append("\n\U0001f53b Bottom 5 task classes (by outcome score):")
+        for i, item in enumerate(bottom, 1):
+            lines.append(
+                f"  {i}. {item['title'][:60]}  "
+                f"avg={item['avg_score']:.1f}/5 (n={item['count']})"
+            )
+
+    lines.append("\n\u26a1 Energy estimation accuracy (last 30 days):")
+    if accuracy is not None:
+        lines.append(
+            f"  {accuracy}% of tasks estimated within ±50% of actual "
+            f"(sample n={sample})"
+        )
+    else:
+        lines.append("  Not enough data yet (need tasks with actual_energy_used recorded).")
+
+    await update.message.reply_text("\n".join(lines))
+
+
 async def _drain_background_tasks(orchestrator: Any, *, timeout: float = 10.0) -> None:
     """Wait for all orchestrator background tasks to finish, up to *timeout* seconds.
 
@@ -1002,6 +1058,7 @@ def main() -> None:
         application.add_handler(CommandHandler("status", status))
         application.add_handler(CommandHandler("emailstatus", emailstatus))
         application.add_handler(CommandHandler("retire_unused_tools", retire_unused_tools))
+        application.add_handler(CommandHandler("learnings", learnings))
         application.add_handler(CommandHandler("shutdown", shutdown))
         application.add_handler(CommandHandler("restart", restart))
         application.add_handler(MessageHandler(filters.VOICE, handle_voice_message))
