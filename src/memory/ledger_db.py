@@ -166,6 +166,26 @@ class LedgerMemory:
                 "last_energy_eval_json",
                 _SQL_TEXT_DEFAULT_EMPTY,
             )
+            await self._ensure_objective_backlog_column(
+                "agent_domain",
+                "TEXT",
+            )
+            await self._ensure_objective_backlog_column(
+                "claimed_by",
+                "TEXT",
+            )
+            await self._ensure_objective_backlog_column(
+                "claimed_at",
+                "TIMESTAMP",
+            )
+            await self._ensure_objective_backlog_column(
+                "result_json",
+                "TEXT",
+            )
+            await self._ensure_objective_backlog_column(
+                "result_written_at",
+                "TIMESTAMP",
+            )
             await self._db.execute("""
                 CREATE INDEX IF NOT EXISTS idx_objective_status ON objective_backlog(status)
             """)
@@ -177,6 +197,10 @@ class LedgerMemory:
             """)
             await self._db.execute("""
                 CREATE INDEX IF NOT EXISTS idx_objective_next_eligible ON objective_backlog(next_eligible_at)
+            """)
+            await self._db.execute("""
+                CREATE INDEX IF NOT EXISTS idx_objective_blackboard_pending
+                ON objective_backlog(agent_domain, status, claimed_by, next_eligible_at)
             """)
             await self._db.execute("""
                 CREATE TABLE IF NOT EXISTS chat_history (
@@ -1176,6 +1200,111 @@ class LedgerMemory:
             )
             row = await cursor.fetchone()
         return self._normalize_objective_row(row) if row else None
+
+    async def claim_task(self, task_id: int, agent_name: str) -> bool:
+        """Atomically claim a pending Task; returns False if already claimed by another agent."""
+        owner = str(agent_name or "").strip()
+        if not owner:
+            raise ValueError("agent_name must be a non-empty string")
+        row = None
+
+        async with self._lock:
+            tx_started = False
+            try:
+                await self._db.execute("BEGIN IMMEDIATE")
+                tx_started = True
+                cursor = await self._db.execute(
+                    "UPDATE objective_backlog "
+                    "SET claimed_by = ?, claimed_at = CURRENT_TIMESTAMP, status = 'active', "
+                    "updated_at = CURRENT_TIMESTAMP "
+                    "WHERE id = ? AND tier = 'Task' AND status = 'pending' AND claimed_by IS NULL "
+                    "AND (next_eligible_at IS NULL OR datetime(next_eligible_at) <= CURRENT_TIMESTAMP)",
+                    (owner, task_id),
+                )
+                if bool(cursor.rowcount and cursor.rowcount > 0):
+                    await self._db.commit()
+                    return True
+
+                row_cursor = await self._db.execute(
+                    "SELECT claimed_by FROM objective_backlog WHERE id = ? AND tier = 'Task'",
+                    (task_id,),
+                )
+                row = await row_cursor.fetchone()
+                await self._db.commit()
+            except Exception:
+                if tx_started:
+                    await self._db.rollback()
+                raise
+
+        if row is None:
+            return False
+        claimed_by = row["claimed_by"]
+        if claimed_by is None:
+            return False
+        return str(claimed_by) == owner
+
+    async def write_task_result(self, task_id: int, result: dict) -> None:
+        """Persist task result payload and mark the Task as completed."""
+        if not isinstance(result, dict):
+            raise ValueError("result must be a dict")
+        result_payload = dict(result)
+        result_json = json.dumps(result_payload, sort_keys=True)
+        updated = False
+        async with self._lock:
+            cursor = await self._db.execute(
+                "UPDATE objective_backlog "
+                "SET result_json = ?, result_written_at = CURRENT_TIMESTAMP, "
+                "status = 'completed', updated_at = CURRENT_TIMESTAMP "
+                "WHERE id = ? AND tier = 'Task'",
+                (result_json, task_id),
+            )
+            updated = bool(cursor.rowcount and cursor.rowcount > 0)
+            await self._db.commit()
+
+        if updated:
+            await self.reduce_goal_state_from_task_completion(task_id)
+
+    async def get_pending_tasks_for_domain(self, agent_domain: str, limit: int = 50) -> List[Dict[str, Any]]:
+        """Return unclaimed pending Tasks for a domain, respecting next_eligible_at."""
+        domain = str(agent_domain or "").strip()
+        if not domain:
+            return []
+        async with self._lock:
+            cursor = await self._db.execute(
+                "SELECT id, tier, title, status, priority, estimated_energy, "
+                "origin, parent_id, depends_on_ids, acceptance_criteria, "
+                "defer_count, last_energy_eval_at, next_eligible_at, last_energy_eval_json, "
+                "agent_domain, claimed_by, claimed_at, result_json, result_written_at, "
+                "created_at, updated_at "
+                "FROM objective_backlog "
+                "WHERE tier = 'Task' AND status = 'pending' AND claimed_by IS NULL "
+                "AND agent_domain = ? "
+                "AND (next_eligible_at IS NULL OR datetime(next_eligible_at) <= CURRENT_TIMESTAMP) "
+                "ORDER BY priority ASC, estimated_energy ASC, id ASC "
+                "LIMIT ?",
+                (domain, max(1, int(limit))),
+            )
+            rows = await cursor.fetchall()
+        return [self._normalize_objective_row(row) for row in rows]
+
+    async def get_task_result(self, task_id: int) -> Optional[Dict[str, Any]]:
+        """Return parsed task result payload, or None when absent/invalid."""
+        async with self._lock:
+            cursor = await self._db.execute(
+                "SELECT result_json FROM objective_backlog WHERE id = ? AND tier = 'Task'",
+                (task_id,),
+            )
+            row = await cursor.fetchone()
+        if row is None:
+            return None
+        raw_result = row["result_json"]
+        if raw_result is None or str(raw_result).strip() == "":
+            return None
+        try:
+            parsed = json.loads(str(raw_result))
+        except (TypeError, ValueError):
+            return None
+        return parsed if isinstance(parsed, dict) else None
 
     async def update_objective_status(self, obj_id: int, new_status: str) -> None:
         """Update status of an objective.
