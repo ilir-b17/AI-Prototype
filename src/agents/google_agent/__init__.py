@@ -144,7 +144,7 @@ class GoogleAgent(BaseAgent):
                 "recipient": recipient,
                 "subject": subject,
                 "body": body,
-                "attachment_path": attachment_path or None,
+                "attachment_path": attachment_path,
             },
         )
         if str(send_result.get("status") or "").lower() != "success":
@@ -211,7 +211,7 @@ class GoogleAgent(BaseAgent):
             "recipient": "",
             "subject": "",
             "attachment_paths": [],
-            "error": "" if created >= 0 else "no_emails_processed",
+            "error": "" if created > 0 else "no_qualifying_emails_found",
             "objectives_created": created,
         }
 
