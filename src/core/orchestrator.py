@@ -3277,8 +3277,11 @@ class Orchestrator:
         return compact[:220] if compact else "Unknown error"
 
     async def _notify_completed_domain_tasks(self) -> None:
+        query_pending = getattr(self.ledger_memory, "get_completed_tasks_pending_notification", None)
+        if not callable(query_pending):
+            return
         try:
-            pending = await self.ledger_memory.get_completed_tasks_pending_notification(limit=25)
+            pending = await query_pending(limit=25)
         except Exception as exc:
             logger.warning("Domain result monitor: query failed: %s", exc, exc_info=True)
             return
@@ -3297,7 +3300,11 @@ class Orchestrator:
 
             title = str(task.get("title") or "").strip() or f"Task #{task_id}"
             status = str(task.get("status") or "").strip().lower()
-            result_payload = await self.ledger_memory.get_task_result(task_id) or {}
+            get_task_result = getattr(self.ledger_memory, "get_task_result", None)
+            if callable(get_task_result):
+                result_payload = await get_task_result(task_id) or {}
+            else:
+                result_payload = {}
 
             try:
                 if status == "completed":
@@ -3319,8 +3326,11 @@ class Orchestrator:
                 )
 
         if notified_ids:
+            mark_notified = getattr(self.ledger_memory, "mark_tasks_admin_notified", None)
+            if not callable(mark_notified):
+                return
             try:
-                await self.ledger_memory.mark_tasks_admin_notified(notified_ids)
+                await mark_notified(notified_ids)
             except Exception as exc:
                 logger.warning("Domain result monitor: failed to mark notified tasks: %s", exc, exc_info=True)
 
