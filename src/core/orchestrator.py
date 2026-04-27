@@ -3414,7 +3414,7 @@ class Orchestrator:
             approved = await self.ledger_memory.get_approved_tools()
             for tool in approved:
                 try:
-                    self.cognitive_router.register_dynamic_tool(
+                    await self.cognitive_router.register_dynamic_tool(
                         tool["name"], tool["code"], tool["schema_json"]
                     )
                     logger.info(f"Restored dynamic tool '{tool['name']}' from registry")
@@ -3422,6 +3422,13 @@ class Orchestrator:
                     logger.error(f"Failed to restore tool '{tool['name']}': {e}")
         except Exception as e:
             logger.warning(f"_load_approved_tools failed: {e}")
+
+    async def _reload_dynamic_tools_after_worker_restart(self) -> None:
+        """Reload approved dynamic tools after the isolated worker is respawned."""
+        await self._load_approved_tools()
+        invalidate = getattr(self, "_invalidate_capabilities_cache", None)
+        if callable(invalidate):
+            invalidate()
 
     async def _load_pending_approvals(self) -> None:
         """Reload any tool synthesis proposals that were pending when the bot last stopped."""
@@ -4866,7 +4873,7 @@ class Orchestrator:
         attempts_used: int,
         original_state: Dict[str, Any],
     ) -> str:
-        self.cognitive_router.register_dynamic_tool(tool_name, synthesis["code"], synthesis["schema_json"])
+        await self.cognitive_router.register_dynamic_tool(tool_name, synthesis["code"], synthesis["schema_json"])
         await self.ledger_memory.register_tool(
             name=tool_name,
             description=synthesis["description"],

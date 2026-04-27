@@ -15,9 +15,11 @@ import os
 import logging
 import json
 import asyncio
+import io
 import math
 import re
 import time
+import tokenize
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from typing import Optional, Dict, Any, List, AsyncIterator
@@ -40,6 +42,7 @@ except ImportError:
     GROQ_AVAILABLE = False
 
 from src.core.skill_manager import SkillRegistry
+from src.core.dynamic_tool_worker import DynamicToolWorkerClient
 
 # ── Structured result returned by all router methods ─────────────────────────
 
@@ -131,8 +134,22 @@ _BLOCKED_DUNDER_ATTRIBUTES = {
 }
 
 _BLOCKED_TOOL_BUILTINS = {
-    "eval", "exec", "compile", "open", "__import__", "globals", "locals",
+    "eval", "exec", "compile", "__import__", "globals", "locals",
+    "getattr", "setattr", "delattr", "vars",
 }
+_BLOCKED_DYNAMIC_TOOL_TOKENS = {
+    "__subclasses__", "__mro__", "__globals__", "__builtins__", "__import__",
+}
+_BLOCKED_DYNAMIC_TOOL_DOTTED_TOKENS = {"sys.modules"}
+_DYNAMIC_TOOL_IGNORED_TOKEN_TYPES = frozenset({
+    tokenize.COMMENT,
+    tokenize.ENCODING,
+    tokenize.ENDMARKER,
+    tokenize.INDENT,
+    tokenize.DEDENT,
+    tokenize.NL,
+    tokenize.NEWLINE,
+})
 
 _BLOCKED_ASYNCIO_CALLS = {
     "create_subprocess_exec",
@@ -634,6 +651,10 @@ class CognitiveRouter:
 
         # SkillRegistry — single source of truth for all tool schemas and callables
         self.registry = SkillRegistry()
+        self._dynamic_tool_worker = DynamicToolWorkerClient(
+            call_timeout_seconds=TOOL_EXEC_TIMEOUT_SECONDS,
+        )
+        self.registry.set_dynamic_tool_worker(self._dynamic_tool_worker)
 
         # System 1: cached Ollama client — created once, reused across all calls
         self._ollama_client: Optional[ollama.AsyncClient] = None
@@ -816,13 +837,25 @@ class CognitiveRouter:
         }
 
     async def close(self) -> None:
-        """Release the cached Ollama client connection."""
-        if self._ollama_client is not None:
+        """Release cached client and dynamic worker resources."""
+        dynamic_worker = getattr(self, "_dynamic_tool_worker", None)
+        if dynamic_worker is not None:
+            try:
+                await dynamic_worker.shutdown()
+            except Exception as e:
+                logger.debug(f"Error shutting down dynamic tool worker: {e}")
+            self._dynamic_tool_worker = None
+        if getattr(self, "_ollama_client", None) is not None:
             try:
                 await self._ollama_client.close()
             except Exception as e:
                 logger.debug(f"Error closing Ollama client: {e}")
             self._ollama_client = None
+
+    def set_dynamic_tool_restart_callback(self, callback) -> None:
+        worker = getattr(self, "_dynamic_tool_worker", None)
+        if worker is not None:
+            worker.set_restart_callback(callback)
 
     @staticmethod
     def _find_json_blobs(text: str) -> List[str]:
@@ -2282,6 +2315,16 @@ Rules:
         return True
 
     @staticmethod
+    def _validate_ast_string_constant_node(node: ast.AST, tool_name: str) -> bool:
+        if not isinstance(node, ast.Constant) or not isinstance(node.value, str):
+            return False
+        if node.value in _BLOCKED_TOP_LEVEL_MODULES:
+            raise ValueError(
+                f"Synthesised tool '{tool_name}' references blocked module string literal '{node.value}'."
+            )
+        return True
+
+    @staticmethod
     def _validate_tool_code_ast(code: str, tool_name: str) -> None:
         """
         Parse the synthesised code as an AST and reject any import that
@@ -2301,6 +2344,8 @@ Rules:
             CognitiveRouter._validate_ast_asyncio_call(node, tool_name)
             if CognitiveRouter._validate_ast_attribute_node(node, tool_name):
                 continue
+            if CognitiveRouter._validate_ast_string_constant_node(node, tool_name):
+                continue
             CognitiveRouter._validate_ast_call_node(node, tool_name)
 
     @staticmethod
@@ -2317,53 +2362,86 @@ Rules:
             CognitiveRouter._validate_ast_asyncio_call(node, tool_name)
             if CognitiveRouter._validate_ast_attribute_node(node, tool_name):
                 continue
+            if CognitiveRouter._validate_ast_string_constant_node(node, tool_name):
+                continue
             CognitiveRouter._validate_ast_call_node(node, tool_name)
 
-    def register_dynamic_tool(self, tool_name: str, code: str, schema_json: str) -> None:
+    @staticmethod
+    def _dynamic_tool_significant_tokens(code: str, tool_name: str) -> List[tokenize.TokenInfo]:
+        try:
+            tokens = list(tokenize.tokenize(io.BytesIO(code.encode("utf-8")).readline))
+        except tokenize.TokenError as exc:
+            raise ValueError(f"Synthesised code for '{tool_name}' could not be tokenized: {exc}") from exc
+        return [token for token in tokens if token.type not in _DYNAMIC_TOOL_IGNORED_TOKEN_TYPES]
+
+    @staticmethod
+    def _string_token_literal_value(token: tokenize.TokenInfo) -> Optional[str]:
+        if token.type != tokenize.STRING:
+            return None
+        try:
+            literal_value = ast.literal_eval(token.string)
+        except (SyntaxError, ValueError):
+            return None
+        return literal_value if isinstance(literal_value, str) else None
+
+    @staticmethod
+    def _validate_dynamic_tool_bare_token(token: tokenize.TokenInfo, tool_name: str) -> None:
+        token_value = token.string
+        literal_value = CognitiveRouter._string_token_literal_value(token)
+        blocked_value = token_value if token_value in _BLOCKED_DYNAMIC_TOOL_TOKENS else literal_value
+        if blocked_value in _BLOCKED_DYNAMIC_TOOL_TOKENS:
+            raise ValueError(
+                f"Synthesised tool '{tool_name}' contains blocked runtime token '{blocked_value}'."
+            )
+
+    @staticmethod
+    def _validate_dynamic_tool_dotted_token(
+        tokens: List[tokenize.TokenInfo],
+        index: int,
+        tool_name: str,
+    ) -> None:
+        if tokens[index].string != "sys" or index + 2 >= len(tokens):
+            return
+        dotted = "".join(next_token.string for next_token in tokens[index:index + 3])
+        if dotted in _BLOCKED_DYNAMIC_TOOL_DOTTED_TOKENS:
+            raise ValueError(
+                f"Synthesised tool '{tool_name}' contains blocked runtime token '{dotted}'."
+            )
+
+    @staticmethod
+    def _validate_dynamic_tool_token_scan(code: str, tool_name: str) -> None:
+        significant_tokens = CognitiveRouter._dynamic_tool_significant_tokens(code, tool_name)
+        for index, token in enumerate(significant_tokens):
+            CognitiveRouter._validate_dynamic_tool_bare_token(token, tool_name)
+            CognitiveRouter._validate_dynamic_tool_dotted_token(significant_tokens, index, tool_name)
+
+    async def register_dynamic_tool(self, tool_name: str, code: str, schema_json: str) -> None:
         """Load synthesised Python code into the runtime via the SkillRegistry.
 
         The code is first validated through an AST sandbox that blocks imports
         of dangerous modules (os, sys, subprocess, etc.) before execution.
         """
-        import types
         import json as _json
 
         # ── AST sandbox check ──────────────────────────────────────────────
         self._validate_tool_code_ast(code, tool_name)
-
-        module = types.ModuleType(f"dynamic_tool_{tool_name}")
-        # Restrict built-ins to a safe subset so that exec() cannot reach
-        # open(), eval(), __import__(), exec(), compile(), etc. even if the
-        # AST check is somehow bypassed.
-        _safe_builtins = {
-            "None": None, "True": True, "False": False,
-            "abs": abs, "all": all, "any": any, "bool": bool,
-            "bytes": bytes, "chr": chr, "dict": dict, "dir": dir,
-            "divmod": divmod, "enumerate": enumerate, "filter": filter,
-            "float": float, "format": format, "frozenset": frozenset,
-            "getattr": getattr, "hasattr": hasattr, "hash": hash,
-            "int": int, "isinstance": isinstance, "issubclass": issubclass,
-            "iter": iter, "len": len, "list": list, "map": map,
-            "max": max, "min": min, "next": next, "object": object,
-            "ord": ord, "pow": pow, "print": print, "range": range,
-            "repr": repr, "reversed": reversed, "round": round,
-            "set": set, "slice": slice, "sorted": sorted, "str": str,
-            "sum": sum, "tuple": tuple, "type": type, "vars": vars,
-            "zip": zip,
-        }
-        module.__dict__["__builtins__"] = _safe_builtins
-        exec(compile(code, f"<dynamic:{tool_name}>", "exec"), module.__dict__)
-
-        fn = getattr(module, tool_name, None)
-        if fn is None:
-            raise RuntimeError(f"Synthesised code does not define function '{tool_name}'")
+        self._validate_dynamic_tool_token_scan(code, tool_name)
 
         try:
             schema = _json.loads(schema_json)
         except Exception as exc:
             raise RuntimeError(f"Invalid schema JSON for '{tool_name}': {exc}")
 
-        self.registry.register_dynamic(tool_name, fn, schema)
+        worker = getattr(self, "_dynamic_tool_worker", None)
+        if worker is None:
+            worker = DynamicToolWorkerClient(call_timeout_seconds=TOOL_EXEC_TIMEOUT_SECONDS)
+            self._dynamic_tool_worker = worker
+            self.registry.set_dynamic_tool_worker(worker)
+        response = await worker.register_tool(tool_name, code, schema)
+        if not response.get("ok"):
+            raise RuntimeError(str(response.get("error") or f"Failed to register dynamic tool '{tool_name}'"))
+
+        self.registry.register_dynamic(tool_name, schema)
         logger.info(f"Dynamic tool '{tool_name}' registered via SkillRegistry")
 
     def get_system_1_available(self) -> bool:

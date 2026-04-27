@@ -235,6 +235,8 @@ def _map_worker_temp_path(file: Any) -> str:
     normalized = raw.replace("\\", "/")
     if normalized == "/tmp" or normalized.startswith("/tmp/"):
         relative = normalized[5:].lstrip("/")
+        if "/" in relative:
+            raise PermissionError("Dynamic tool file access is limited to the worker temp directory.")
         candidate = os.path.join(_WORKER_TEMP_ROOT, relative)
     elif os.path.isabs(raw):
         candidate = raw
