@@ -160,6 +160,24 @@ class _EnergyManagerMixin:
             route_to_system_1=self._route_energy_judge_messages,
             additional_context=additional_context,
         )
+
+        # Blend with historical outcome scores when available (same tier + title overlap)
+        ledger = getattr(self, "ledger_memory", None)
+        if ledger is not None and str(task.get("tier") or "Task") == "Task":
+            try:
+                title_tokens = str(task.get("title") or "").split()
+                historical_scores = await ledger.get_historical_outcome_scores(
+                    "Task",
+                    title_tokens,
+                    limit=100,
+                )
+                evaluation = self.energy_judge.blend_with_historical_scores(
+                    evaluation,
+                    historical_scores,
+                )
+            except Exception as _blend_exc:
+                logger.warning("EnergyJudge: historical blend failed: %s", _blend_exc)
+
         decision = self.energy_roi_engine.evaluate(
             estimated_effort=evaluation.estimated_effort,
             expected_value=evaluation.expected_value,

@@ -46,6 +46,9 @@ VALID_TASK_STATUSES_LIST = [s.value for s in TaskStatus]
 _SQL_TEXT_DEFAULT_EMPTY = "TEXT NOT NULL DEFAULT ''"
 _SQL_INT_DEFAULT_ZERO = "INTEGER NOT NULL DEFAULT 0"
 _MAX_PENDING_TTL_SECONDS = 31_536_000
+# Energy estimation accuracy threshold: tasks estimated within this fraction
+# of actual energy are counted as "accurate" in /learnings output.
+_ENERGY_ACCURACY_THRESHOLD = 0.5
 
 
 class LedgerMemory:
@@ -193,6 +196,26 @@ class LedgerMemory:
                 "admin_notified",
                 "INTEGER NOT NULL DEFAULT 0",
             )
+            await self._ensure_objective_backlog_column(
+                "outcome_score",
+                "INTEGER",
+            )
+            await self._ensure_objective_backlog_column(
+                "actual_energy_used",
+                "INTEGER",
+            )
+            await self._ensure_objective_backlog_column(
+                "actual_duration_seconds",
+                "INTEGER",
+            )
+            await self._ensure_objective_backlog_column(
+                "outcome_recorded_at",
+                "TIMESTAMP",
+            )
+            await self._ensure_objective_backlog_column(
+                "outcome_notes",
+                "TEXT",
+            )
             await self._db.execute("""
                 CREATE INDEX IF NOT EXISTS idx_objective_status ON objective_backlog(status)
             """)
@@ -208,6 +231,10 @@ class LedgerMemory:
             await self._db.execute("""
                 CREATE INDEX IF NOT EXISTS idx_objective_blackboard_pending
                 ON objective_backlog(agent_domain, status, claimed_by, next_eligible_at)
+            """)
+            await self._db.execute("""
+                CREATE INDEX IF NOT EXISTS idx_objective_outcome_score
+                ON objective_backlog(tier, outcome_score, outcome_recorded_at)
             """)
             await self._db.execute("""
                 CREATE TABLE IF NOT EXISTS sessions (
@@ -590,6 +617,15 @@ class LedgerMemory:
         result["last_energy_eval_json"] = str(result.get("last_energy_eval_json") or "")
         if "admin_notified" in result:
             result["admin_notified"] = bool(int(result.get("admin_notified") or 0))
+        # Outcome fields (nullable integers/text/timestamp)
+        raw_outcome = result.get("outcome_score")
+        result["outcome_score"] = int(raw_outcome) if raw_outcome is not None else None
+        raw_actual_energy = result.get("actual_energy_used")
+        result["actual_energy_used"] = int(raw_actual_energy) if raw_actual_energy is not None else None
+        raw_duration = result.get("actual_duration_seconds")
+        result["actual_duration_seconds"] = int(raw_duration) if raw_duration is not None else None
+        result["outcome_recorded_at"] = result.get("outcome_recorded_at")
+        result["outcome_notes"] = result.get("outcome_notes")
         return result
 
     @classmethod
@@ -1350,6 +1386,8 @@ class LedgerMemory:
                 "origin, parent_id, depends_on_ids, acceptance_criteria, "
                 "defer_count, last_energy_eval_at, next_eligible_at, last_energy_eval_json, "
                 "agent_domain, claimed_by, claimed_at, result_json, result_written_at, "
+                "outcome_score, actual_energy_used, actual_duration_seconds, "
+                "outcome_recorded_at, outcome_notes, "
                 "created_at, updated_at "
                 "FROM objective_backlog "
                 "WHERE id = ? AND tier = 'Task' "
@@ -1431,6 +1469,157 @@ class LedgerMemory:
                 tuple(normalized_ids),
             )
             await self._db.commit()
+
+    async def write_task_outcome(
+        self,
+        task_id: int,
+        *,
+        score: int,
+        actual_energy_used: Optional[int] = None,
+        actual_duration_seconds: Optional[int] = None,
+        outcome_notes: Optional[str] = None,
+    ) -> None:
+        """Persist outcome fields for a completed Task.
+
+        Args:
+            task_id: Objective backlog Task id.
+            score: Outcome quality score 1–5 (1=poor, 5=excellent).
+            actual_energy_used: Actual energy consumed (optional).
+            actual_duration_seconds: Wall-clock duration in seconds (optional).
+            outcome_notes: Free-text explanation of the outcome score (optional).
+        """
+        clamped_score = max(1, min(5, int(score)))
+        safe_energy = int(actual_energy_used) if actual_energy_used is not None else None
+        safe_duration = int(actual_duration_seconds) if actual_duration_seconds is not None else None
+        safe_notes = str(outcome_notes).strip() if outcome_notes is not None else None
+
+        async with self._lock:
+            await self._db.execute(
+                "UPDATE objective_backlog "
+                "SET outcome_score = ?, actual_energy_used = ?, actual_duration_seconds = ?, "
+                "outcome_notes = ?, outcome_recorded_at = CURRENT_TIMESTAMP, "
+                "updated_at = CURRENT_TIMESTAMP "
+                "WHERE id = ? AND tier = 'Task'",
+                (clamped_score, safe_energy, safe_duration, safe_notes, task_id),
+            )
+            await self._db.commit()
+        logger.info("Outcome recorded for Task #%s: score=%s", task_id, clamped_score)
+
+    async def get_historical_outcome_scores(
+        self,
+        tier: str,
+        title_tokens: List[str],
+        *,
+        limit: int = 100,
+    ) -> List[int]:
+        """Return recent outcome_scores for same-tier tasks with overlapping title tokens.
+
+        Tokens are matched against completed task titles using simple substring
+        search (no vector embedding required).  Rows are ordered by recency so
+        recent feedback weighs more naturally when the caller computes averages.
+
+        Args:
+            tier: Task tier (e.g. ``'Task'``).
+            title_tokens: Non-trivial words from the current task title used to
+                filter for similar tasks.
+            limit: Maximum number of raw rows to consider before Python-side
+                token overlap filtering.
+
+        Returns:
+            List of integer outcome scores (1–5) for matching tasks, most
+            recent first.
+        """
+        async with self._lock:
+            cursor = await self._db.execute(
+                "SELECT title, outcome_score FROM objective_backlog "
+                "WHERE tier = ? AND outcome_score IS NOT NULL "
+                "AND outcome_recorded_at IS NOT NULL "
+                "ORDER BY outcome_recorded_at DESC LIMIT ?",
+                (str(tier), max(1, int(limit))),
+            )
+            rows = await cursor.fetchall()
+
+        if not rows:
+            return []
+
+        query_tokens = {t.lower() for t in title_tokens if len(t) >= 3}
+        if not query_tokens:
+            # No useful tokens — return all recent scores for the tier
+            return [int(row["outcome_score"]) for row in rows]
+
+        scores: List[int] = []
+        for row in rows:
+            row_tokens = {w.lower() for w in str(row["title"] or "").split() if len(w) >= 3}
+            if query_tokens & row_tokens:
+                scores.append(int(row["outcome_score"]))
+
+        return scores
+
+    async def get_outcome_learnings(self, *, days: int = 30) -> Dict[str, Any]:
+        """Return a learnings summary for the ``/learnings`` Telegram command.
+
+        Returns a dict with:
+        - ``top_classes``: list of (title, avg_score, count) for top 5 by avg outcome
+        - ``bottom_classes``: list of (title, avg_score, count) for bottom 5
+        - ``energy_accuracy_pct``: % of tasks where estimated was within 50% of actual
+        - ``energy_accuracy_sample``: number of tasks used for accuracy calculation
+        - ``days_window``: the ``days`` parameter used
+        """
+        async with self._lock:
+            cursor = await self._db.execute(
+                "SELECT title, AVG(outcome_score) AS avg_score, COUNT(*) AS cnt "
+                "FROM objective_backlog "
+                "WHERE tier = 'Task' AND outcome_score IS NOT NULL "
+                "AND outcome_recorded_at >= datetime('now', ?) "
+                "GROUP BY title "
+                "ORDER BY avg_score DESC, cnt DESC",
+                (f"-{max(1, int(days))} days",),
+            )
+            scored_rows = await cursor.fetchall()
+
+            cursor2 = await self._db.execute(
+                "SELECT estimated_energy, actual_energy_used "
+                "FROM objective_backlog "
+                "WHERE tier = 'Task' "
+                "AND actual_energy_used IS NOT NULL AND estimated_energy IS NOT NULL "
+                "AND actual_energy_used > 0 "
+                "AND outcome_recorded_at >= datetime('now', ?)",
+                (f"-{max(1, int(days))} days",),
+            )
+            energy_rows = await cursor2.fetchall()
+
+        # Top / bottom 5 by avg outcome score
+        class_list = [
+            {
+                "title": str(row["title"]),
+                "avg_score": round(float(row["avg_score"]), 2),
+                "count": int(row["cnt"]),
+            }
+            for row in scored_rows
+        ]
+        top_classes = class_list[:5]
+        bottom_classes = sorted(class_list, key=lambda x: x["avg_score"])[:5]
+
+        # Energy estimation accuracy: within 50% of actual
+        accurate = 0
+        total_energy = len(energy_rows)
+        for row in energy_rows:
+            estimated = float(row["estimated_energy"])
+            actual = float(row["actual_energy_used"])
+            if actual > 0 and abs(estimated - actual) / actual <= _ENERGY_ACCURACY_THRESHOLD:
+                accurate += 1
+
+        energy_accuracy_pct = (
+            round(100.0 * accurate / total_energy, 1) if total_energy > 0 else None
+        )
+
+        return {
+            "top_classes": top_classes,
+            "bottom_classes": bottom_classes,
+            "energy_accuracy_pct": energy_accuracy_pct,
+            "energy_accuracy_sample": total_energy,
+            "days_window": int(days),
+        }
 
     async def get_task_result(self, task_id: int) -> Optional[Dict[str, Any]]:
         """Return parsed task result payload, or None when absent/invalid."""
