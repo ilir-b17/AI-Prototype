@@ -729,12 +729,21 @@ class LedgerMemory:
         deleted: Dict[str, int] = {}
 
         async with self._lock:
-            for table_name in ("pending_tool_approvals", "pending_hitl_states", "pending_mfa_states"):
-                cursor = await self._db.execute(
-                    f"DELETE FROM {table_name} WHERE datetime(created_at) < datetime('now', ?)",
-                    (modifier,),
-                )
-                deleted[table_name] = int(cursor.rowcount or 0)
+            cursor = await self._db.execute(
+                "DELETE FROM pending_tool_approvals WHERE datetime(created_at) < datetime('now', ?)",
+                (modifier,),
+            )
+            deleted["pending_tool_approvals"] = int(cursor.rowcount or 0)
+            cursor = await self._db.execute(
+                "DELETE FROM pending_hitl_states WHERE datetime(created_at) < datetime('now', ?)",
+                (modifier,),
+            )
+            deleted["pending_hitl_states"] = int(cursor.rowcount or 0)
+            cursor = await self._db.execute(
+                "DELETE FROM pending_mfa_states WHERE datetime(created_at) < datetime('now', ?)",
+                (modifier,),
+            )
+            deleted["pending_mfa_states"] = int(cursor.rowcount or 0)
             await self._db.commit()
 
         return deleted

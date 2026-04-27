@@ -17,6 +17,7 @@ import re
 import sys
 import tempfile
 import time
+from collections import OrderedDict
 from datetime import datetime
 from typing import Dict, Any, List, Optional, Callable, Awaitable
 import xml.etree.ElementTree as ET
@@ -5041,7 +5042,7 @@ class Orchestrator:
         synthesis_run_id: Optional[int],
         attempts_used: int,
         original_state: Dict[str, Any],
-    ) -> str:
+    ) -> Any:
         await self.cognitive_router.register_dynamic_tool(tool_name, synthesis["code"], synthesis["schema_json"])
         await self.ledger_memory.register_tool(
             name=tool_name,
@@ -5065,13 +5066,10 @@ class Orchestrator:
         await self.core_memory.update("known_capabilities", f"{caps}, {tool_name}".lstrip(", "))
         logger.info("Tool '%s' approved, registered, and logged to core memory", tool_name)
         retry_input = str(original_state["user_input"])
-        await self._get_user_lock(user_id)
-        retry = await self._run_user_turn_locked(
-            user_id=user_id,
-            user_message=retry_input,
-            user_prompt=self._coerce_user_prompt_payload(retry_input),
-        )
-        return f"✅ Tool '{tool_name}' deployed.\n\n{retry}"
+        return {
+            "reply_text": f"✅ Tool '{tool_name}' deployed.",
+            "_deferred_follow_up_input": retry_input,
+        }
 
     async def _handle_synthesized_tool_deploy_failure(
         self,
@@ -5095,7 +5093,7 @@ class Orchestrator:
         logger.error("Tool registration failed: %s", error, exc_info=True)
         return f"Error deploying tool '{tool_name}': {error}"
 
-    async def _try_resume_tool_approval(self, user_id: str, user_message: str) -> Optional[str]:
+    async def _try_resume_tool_approval(self, user_id: str, user_message: str) -> Optional[Any]:
         """Handle YES/NO tool synthesis approval. Returns a reply string, or None if not pending."""
         payload = await self._pop_pending_tool_approval_payload(user_id)
         if payload is None:
@@ -5297,18 +5295,23 @@ class Orchestrator:
 
     def _increment_consolidation_turn_count(self, user_id: str) -> bool:
         if not hasattr(self, "_consolidation_turn_counts"):
-            self._consolidation_turn_counts = {}
+            self._consolidation_turn_counts = OrderedDict()
 
         max_size = max(1, int(os.getenv("CONSOLIDATION_TURN_COUNTS_MAX_SIZE", "100")))
         counts = self._consolidation_turn_counts
+        if not isinstance(counts, OrderedDict):
+            counts = OrderedDict(counts)
+            self._consolidation_turn_counts = counts
+
+        current_count = int(counts.get(user_id, 0) or 0)
         if user_id in counts:
-            current_count = int(counts.pop(user_id) or 0)
+            counts.move_to_end(user_id)
         else:
-            current_count = 0
+            counts[user_id] = current_count
 
         counts[user_id] = current_count + 1
         while len(counts) > max_size:
-            counts.pop(next(iter(counts)), None)
+            counts.popitem(last=False)
 
         trigger_turns = max(1, _CONSOLIDATION_TRIGGER_TURNS)
         if counts.get(user_id, 0) >= trigger_turns:
@@ -5358,7 +5361,7 @@ class Orchestrator:
         self._ensure_final_response(state, max_iterations)
         return await self._finalize_user_response(user_id, user_message, state["final_response"])
 
-    async def _try_resume_tool_approval_compat(self, user_id: str, user_message: str) -> Optional[str]:
+    async def _try_resume_tool_approval_compat(self, user_id: str, user_message: str) -> Optional[Any]:
         pipeline = getattr(self, "synthesis_pipeline", None)
         resume_fn = getattr(pipeline, "try_resume_tool_approval", None)
         if callable(resume_fn):
@@ -5370,13 +5373,10 @@ class Orchestrator:
             if follow_up_input is None:
                 return reply_text
             follow_up_text = str(follow_up_input or "").strip()
-            await self._get_user_lock(user_id)
-            follow_up_response = await self._run_user_turn_locked(
-                user_id=user_id,
-                user_message=follow_up_text,
-                user_prompt=self._coerce_user_prompt_payload(follow_up_text),
-            )
-            return f"{reply_text}\n\n{follow_up_response}".strip()
+            return {
+                "reply_text": reply_text,
+                "_deferred_follow_up_input": follow_up_text,
+            }
         return await self._try_resume_tool_approval(user_id, user_message)
 
     async def _run_user_turn_locked(
@@ -5475,6 +5475,7 @@ class Orchestrator:
             emitter_token = set_current_emitter(emitter)
 
         try:
+            deferred_follow_up: Optional[Dict[str, str]] = None
             if not hasattr(self, "_ready"):
                 self._ready = asyncio.Event()
                 self._ready.set()
@@ -5508,13 +5509,29 @@ class Orchestrator:
 
                 reply = await self._try_resume_tool_approval_compat(user_id, normalized_user_message)
                 if reply is not None:
-                    return reply
+                    if isinstance(reply, dict) and reply.get("_deferred_follow_up_input") is not None:
+                        deferred_follow_up = {
+                            "reply_text": str(reply.get("reply_text") or ""),
+                            "follow_up_input": str(reply.get("_deferred_follow_up_input") or ""),
+                        }
+                    else:
+                        return reply
 
-                return await self._run_user_turn_locked(
-                    user_id=user_id,
-                    user_message=normalized_user_message,
-                    user_prompt=user_prompt,
+                if deferred_follow_up is None:
+                    return await self._run_user_turn_locked(
+                        user_id=user_id,
+                        user_message=normalized_user_message,
+                        user_prompt=user_prompt,
+                    )
+
+            if deferred_follow_up is not None:
+                follow_up_response = await self.process_message(
+                    deferred_follow_up["follow_up_input"],
+                    user_id,
                 )
+                return f"{deferred_follow_up['reply_text']}\n\n{follow_up_response}".strip()
+
+            return "No valid response could be generated."
         finally:
             if emitter is not None:
                 await emitter.flush_pending()
