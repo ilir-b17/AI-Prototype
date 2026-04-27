@@ -38,6 +38,11 @@ async def test_objective_backlog_schema_migrates_legacy_tables(tmp_path: Path):
 
         assert "depends_on_ids" in columns
         assert "acceptance_criteria" in columns
+        assert "agent_domain" in columns
+        assert "claimed_by" in columns
+        assert "claimed_at" in columns
+        assert "result_json" in columns
+        assert "result_written_at" in columns
 
         epic_id = await ledger.add_objective(tier="Epic", title="Migration test epic")
         story_id = await ledger.add_objective(
@@ -59,6 +64,82 @@ async def test_objective_backlog_schema_migrates_legacy_tables(tmp_path: Path):
 
         assert task_row["depends_on_ids"] == [story_id]
         assert "dependency aware" in task_row["acceptance_criteria"]
+    finally:
+        await ledger.close()
+
+
+@pytest.mark.asyncio
+async def test_blackboard_claim_and_result_flow(tmp_path: Path):
+    ledger = LedgerMemory(db_path=str(tmp_path / "blackboard_ledger.db"))
+    await ledger.initialize()
+    try:
+        epic_id = await ledger.add_objective(tier="Epic", title="Blackboard Epic")
+        story_id = await ledger.add_objective(tier="Story", title="Blackboard Story", parent_id=epic_id)
+        task_id = await ledger.add_objective(tier="Task", title="Domain task", parent_id=story_id)
+        next_task_id = await ledger.add_objective(tier="Task", title="Deferred domain task", parent_id=story_id)
+
+        await ledger._db.execute(
+            "UPDATE objective_backlog SET agent_domain = ? WHERE id IN (?, ?)",
+            ("google", task_id, next_task_id),
+        )
+        await ledger._db.execute(
+            "UPDATE objective_backlog SET next_eligible_at = datetime(CURRENT_TIMESTAMP, '+1 day') WHERE id = ?",
+            (next_task_id,),
+        )
+        await ledger._db.commit()
+
+        pending = await ledger.get_pending_tasks_for_domain("google", limit=10)
+        pending_ids = {row["id"] for row in pending}
+        assert task_id in pending_ids
+        assert next_task_id not in pending_ids
+
+        assert await ledger.claim_task(task_id, "google-agent-1") is True
+        assert await ledger.claim_task(task_id, "google-agent-2") is False
+
+        row_cursor = await ledger._db.execute(
+            "SELECT status, claimed_by, claimed_at FROM objective_backlog WHERE id = ?",
+            (task_id,),
+        )
+        claimed_row = await row_cursor.fetchone()
+        assert claimed_row["status"] == "active"
+        assert claimed_row["claimed_by"] == "google-agent-1"
+        assert claimed_row["claimed_at"] is not None
+
+        result_payload = {"summary": "ok", "score": 0.99}
+        await ledger.write_task_result(task_id, result_payload)
+
+        result = await ledger.get_task_result(task_id)
+        assert result == result_payload
+
+        result_row_cursor = await ledger._db.execute(
+            "SELECT status, result_json, result_written_at FROM objective_backlog WHERE id = ?",
+            (task_id,),
+        )
+        result_row = await result_row_cursor.fetchone()
+        assert result_row["status"] == "completed"
+        assert result_row["result_json"] is not None
+        assert result_row["result_written_at"] is not None
+    finally:
+        await ledger.close()
+
+
+@pytest.mark.asyncio
+async def test_claim_task_same_agent_is_idempotent(tmp_path: Path):
+    ledger = LedgerMemory(db_path=str(tmp_path / "blackboard_idempotent_ledger.db"))
+    await ledger.initialize()
+    try:
+        epic_id = await ledger.add_objective(tier="Epic", title="Blackboard Epic")
+        story_id = await ledger.add_objective(tier="Story", title="Blackboard Story", parent_id=epic_id)
+        task_id = await ledger.add_objective(tier="Task", title="Domain task", parent_id=story_id)
+
+        await ledger._db.execute(
+            "UPDATE objective_backlog SET agent_domain = ? WHERE id = ?",
+            ("finance", task_id),
+        )
+        await ledger._db.commit()
+
+        assert await ledger.claim_task(task_id, "finance-agent-1") is True
+        assert await ledger.claim_task(task_id, "finance-agent-1") is True
     finally:
         await ledger.close()
 
