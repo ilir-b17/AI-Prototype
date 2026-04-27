@@ -82,6 +82,7 @@ _SYNTHESIS_SELF_TEST_TIMEOUT_DEFAULT_SECONDS = 12.0
 _MAX_SYNTHESIS_RETRIES = int(os.getenv("MAX_SYNTHESIS_RETRIES", "3"))
 _CONSOLIDATION_TRIGGER_TURNS = int(os.getenv("CONSOLIDATION_TRIGGER_TURNS", "10"))
 _CONSOLIDATION_TURN_COUNTS_MAX_SIZE_DEFAULT = 100
+_SYNTHESIS_LOCKOUT_TTL_SECONDS = int(os.getenv("SYNTHESIS_LOCKOUT_TTL_SECONDS", "600"))
 _SAFE_SUBPROCESS_ENV_KEYS = {
     "PATH",
     "SYSTEMROOT",
@@ -289,6 +290,7 @@ class Orchestrator:
             self.pending_hitl_state: Dict[str, dict] = {}
             self.pending_tool_approval: Dict[str, dict] = {}
             self._consolidation_turn_counts: OrderedDict = OrderedDict()
+            self._synthesis_in_progress: Dict[str, float] = {}
             self.outbound_queue: Optional[asyncio.Queue] = None
             self.sensory_state: Dict[str, str] = {}
             # Background task registry — holds strong references to prevent GC (ISSUE-002)
@@ -355,6 +357,18 @@ class Orchestrator:
                 logger.info("Startup pruning: removed %d stale chat_history rows.", deleted)
         except Exception as _prune_err:
             logger.warning("Startup chat history pruning failed: %s", _prune_err)
+
+        # Restore per-user consolidation counters persisted by _persist_chat_turns.
+        try:
+            stored = await self.ledger_memory.get_system_states_by_prefix("consolidation_turns:")
+            if not hasattr(self, "_consolidation_turn_counts") or self._consolidation_turn_counts is None:
+                self._consolidation_turn_counts = OrderedDict()
+            for key, val in stored.items():
+                uid = key[len("consolidation_turns:"):]
+                if uid:
+                    self._consolidation_turn_counts[uid] = int(val or 0)
+        except Exception as _ce:
+            logger.warning("Consolidation turn count restore failed: %s", _ce)
 
         self._enforce_charter_policy()
         self._ready.set()
@@ -531,11 +545,22 @@ class Orchestrator:
 
     @staticmethod
     def _extract_multiple_tickers(user_message: str) -> List[str]:
-        """Return all valid uppercase ticker symbols found in the message (2+ expected for multi-ticker path)."""
-        return [
+        """Return valid uppercase ticker symbols only when 2+ are found with finance context,
+        or when 3+ are found regardless of context (strong multi-ticker signal)."""
+        _FINANCE_KEYWORDS = {
+            "price", "prices", "stock", "stocks", "shares", "ticker",
+            "market", "quote", "trading", "trade", "invest",
+        }
+        tickers = [
             tok for tok in re.findall(r'\b([A-Z]{1,5})\b', user_message)
             if tok not in Orchestrator._TICKER_STOPWORDS
         ]
+        if len(tickers) >= 3:
+            return tickers
+        lowered = (user_message or "").lower()
+        if len(tickers) >= 2 and any(kw in lowered for kw in _FINANCE_KEYWORDS):
+            return tickers
+        return []
 
     @staticmethod
     def _strip_optional_tool_fallback_clause(user_message: str) -> str:
@@ -774,7 +799,8 @@ class Orchestrator:
             ).strip()
             audio_bytes = cls._extract_audio_bytes(payload)
             if not text and audio_bytes:
-                text = _VOICE_INPUT_PLACEHOLDER
+                mime = str(payload.get("audio_mime_type") or "audio/ogg")
+                text = f"[Voice note · {len(audio_bytes)} bytes · {mime}]"
 
             normalized: Dict[str, Any] = {
                 "text": text,
@@ -860,7 +886,10 @@ class Orchestrator:
             if raw_name:
                 updates["name"] = raw_name
 
-        age_match = re.search(r"\b(\d{1,3})\s*years?\s*old\b", lowered)
+        age_match = re.search(
+            r"\b(?:i(?:'m|\s+am)(?:\s+also)?)\s+(\d{1,3})\s*years?\s*old\b",
+            lowered,
+        )
         if age_match:
             updates["age"] = int(age_match.group(1))
 
@@ -1074,6 +1103,73 @@ class Orchestrator:
         )
         return any(marker in lowered for marker in markers)
 
+    # Inventory-query patterns: user wants to know what skills/tools the bot has.
+    _SKILL_LIST_INVENTORY_VERBS: frozenset = frozenset({
+        "list", "show", "display", "enumerate", "give me a list of", "what", "all your",
+    })
+    _SKILL_LIST_SUBJECT_TOKENS: frozenset = frozenset({
+        "skill", "skills", "tool", "tools", "capabilit",
+    })
+
+    @staticmethod
+    def _is_skill_list_request(user_message: str) -> bool:
+        """Return True when the user is asking for an inventory of the bot's skills/tools."""
+        lowered = (user_message or "").lower()
+        # Must mention skills/tools/capabilities
+        if not any(tok in lowered for tok in Orchestrator._SKILL_LIST_SUBJECT_TOKENS):
+            return False
+        # Must have an inventory intent verb or phrasing
+        inventory_phrases = (
+            "list", "show me", "display", "enumerate", "give me a list",
+            "what tools", "what skills", "what are your", "all your",
+            "can you tell me the list",
+        )
+        if not any(phrase in lowered for phrase in inventory_phrases):
+            return False
+        # Exclude action requests: "search for a list of tools for X" is a task
+        if re.search(r"\b(?:search|find|browse|look\s+up)\b.*\blist\b", lowered):
+            return False
+        # Exclude possession questions about external tools: "list the files…"
+        if re.search(r"\blist\s+the\s+(?:files|folders|documents)\b", lowered):
+            return False
+        return True
+
+    def _build_compact_skill_list_response(self) -> str:
+        """Return a short, bullet-formatted list of registered skills."""
+        catalog: List[Dict[str, str]] = []
+        registry = getattr(self, "cognitive_router", None)
+        if registry is not None:
+            reg = getattr(registry, "registry", None)
+            if reg is not None:
+                # Prefer full catalog (name + description)
+                skill_catalog_fn = getattr(reg, "get_skill_catalog", None)
+                if callable(skill_catalog_fn):
+                    catalog = list(skill_catalog_fn() or [])
+                if not catalog:
+                    # Fall back to schemas
+                    schema_fn = getattr(reg, "get_schemas", None)
+                    if callable(schema_fn):
+                        catalog = [
+                            {"name": s.get("name", ""), "description": s.get("description", "")}
+                            for s in (schema_fn() or [])
+                        ]
+                if not catalog:
+                    # Final fallback: just names
+                    names_fn = getattr(reg, "get_skill_names", None)
+                    if callable(names_fn):
+                        catalog = [{"name": n, "description": ""} for n in (names_fn() or [])]
+        if not catalog:
+            return "I don't have any registered skills at the moment."
+        _MAX_DESC = 70
+        lines = [f"I have {len(catalog)} registered skill{'s' if len(catalog) != 1 else ''}:\n"]
+        for entry in catalog:
+            name = str(entry.get("name") or "")
+            desc = str(entry.get("description") or "").strip()
+            if len(desc) > _MAX_DESC:
+                desc = desc[:_MAX_DESC] + "…"
+            lines.append(f"• {name} — {desc}" if desc else f"• {name}")
+        return "\n".join(lines)
+
     @staticmethod
     def _classify_introspection_type(user_message: str) -> str:
         lowered = (user_message or "").lower()
@@ -1093,6 +1189,9 @@ class Orchestrator:
                 continue
             content = re.sub(r"\s+", " ", (turn.get("content") or "").strip())
             if not content:
+                continue
+            # Skip voice-note placeholders — they carry no textual meaning to summarize.
+            if re.match(r"^\[Voice note", content):
                 continue
             if len(content) > 90:
                 content = f"{content[:87]}..."
@@ -1249,24 +1348,106 @@ class Orchestrator:
         profile = await self._get_user_profile(state.get("user_id", ""))
         return self._format_user_profile_response(lowered, profile)
 
+    # ─────────────────────────────────────────────────────────────
+    # Intent Classification Cache  (LRU, configurable max size)
+    # ─────────────────────────────────────────────────────────────
+
+    _INTENT_CLASSIFIER_CACHE_MAX_SIZE_DEFAULT = 200
+
+    def _cache_user_intent(self, message: str, intent: str) -> None:
+        """Store an intent classification result in the LRU cache."""
+        if not hasattr(self, "_intent_classification_cache"):
+            self._intent_classification_cache: "OrderedDict[str, str]" = OrderedDict()
+        max_size = max(
+            1,
+            int(os.getenv(
+                "INTENT_CLASSIFIER_CACHE_MAX_SIZE",
+                str(self._INTENT_CLASSIFIER_CACHE_MAX_SIZE_DEFAULT),
+            )),
+        )
+        cache = self._intent_classification_cache
+        if message in cache:
+            cache.move_to_end(message)
+        cache[message] = intent
+        while len(cache) > max_size:
+            cache.popitem(last=False)
+
+    def _get_cached_user_intent(self, message: str) -> Optional[str]:
+        """Return a cached intent label or None on cache miss, moving the entry to MRU position."""
+        cache = getattr(self, "_intent_classification_cache", None)
+        if not cache:
+            return None
+        if message not in cache:
+            return None
+        cache.move_to_end(message)
+        return cache[message]
+
+    async def _classify_user_intent(self, user_message: str) -> str:
+        """Classify a user message into a high-level intent string via System 1, with caching.
+
+        Possible intents: 'capability_query', 'task', 'chitchat', etc.
+        Cache keyed on the exact message string; miss → single LLM call.
+        """
+        cached = self._get_cached_user_intent(user_message)
+        if cached is not None:
+            return cached
+
+        prompt = (
+            "Classify the following user message into exactly one intent label. "
+            "Return JSON: {\"intent\": \"<label>\"}\n"
+            "Labels: capability_query, task, chitchat, profile_update, clarification\n\n"
+            f"Message: {user_message}"
+        )
+        intent = "task"
+        try:
+            result = await self._route_to_system_1(
+                [{"role": "user", "content": prompt}],
+                allowed_tools=[],
+                deadline_seconds=10.0,
+                max_output_tokens=60,
+            )
+            if result and result.status == "ok":
+                import json as _json
+                raw = (result.content or "").strip()
+                parsed = _json.loads(raw)
+                intent = str(parsed.get("intent") or "task")
+        except Exception:
+            logger.debug("Intent classification failed; defaulting to 'task'.", exc_info=True)
+
+        self._cache_user_intent(user_message, intent)
+        return intent
+
     async def _try_meta_fast_path_response(self, state: Dict[str, Any]) -> Optional[str]:
         user_message = state.get("user_input", "")
         chat_history = list(state.get("chat_history", []) or [])
 
+        # Skill / tool inventory query: return compact list without hitting the LLM.
+        if self._is_skill_list_request(user_message):
+            return self._build_compact_skill_list_response()
+
         capability_response = self._build_capability_response(user_message)
         if capability_response:
-            classifier = getattr(self, "_route_to_system_1", None)
-            if callable(classifier):
+            # Invoke the intent classifier to learn from heuristically-detected capability
+            # queries and keep the cache warm; ignore errors (purely additive).
+            if hasattr(self, "_route_to_system_1"):
                 try:
-                    await classifier(
-                        [{"role": "user", "content": user_message}],
-                        allowed_tools=[],
-                        deadline_seconds=30.0,
-                        context="capability_query",
-                    )
+                    await self._classify_user_intent(user_message)
                 except Exception:
-                    logger.debug("Capability-query local classification skipped.", exc_info=True)
+                    logger.debug("Capability-query intent classification skipped.", exc_info=True)
             return capability_response
+
+        # For messages with capability-related keywords that the heuristic didn't catch,
+        # use the intent classifier as a fallback.
+        _CAPABILITY_HINTS = ("capabil", "tool", "skill", "internet", "browse", "web")
+        lowered_msg = (user_message or "").lower()
+        if hasattr(self, "_route_to_system_1") and any(h in lowered_msg for h in _CAPABILITY_HINTS):
+            try:
+                intent = await self._classify_user_intent(user_message)
+                if intent == "capability_query":
+                    cap_response = self._build_capability_response(user_message)
+                    return cap_response if cap_response else self._build_compact_skill_list_response()
+            except Exception:
+                logger.debug("Intent classification failed in meta fast path.", exc_info=True)
 
         profile_response = await self._build_profile_response(state)
         if profile_response:
@@ -4374,6 +4555,34 @@ class Orchestrator:
                 "cannot synthesise a new tool right now. Please configure GROQ_API_KEY."
             )
 
+        # Gate 1: repeated failures for the same capability require manual intervention.
+        if hasattr(self, "ledger_memory"):
+            try:
+                failure_count = await self.ledger_memory.count_synthesis_failures_fuzzy(
+                    suggested_tool_name, window_hours=24
+                )
+                if failure_count >= 2:
+                    return (
+                        f"This capability has been attempted {failure_count} times without success. "
+                        "Manual intervention needed."
+                    )
+            except Exception as _e:
+                logger.warning("Synthesis failure count check failed: %s", _e)
+
+            # Gate 2: per-user hourly synthesis budget.
+            try:
+                max_per_hour = int(os.getenv("MAX_SYNTHESES_PER_USER_PER_HOUR", "10"))
+                runs_this_hour = await self.ledger_memory.count_synthesis_runs_in_window(
+                    user_id, hours=1
+                )
+                if runs_this_hour >= max_per_hour:
+                    return (
+                        f"⚠️ HITL REQUIRED: Synthesis budget of {max_per_hour} per hour reached for user "
+                        f"'{user_id}'. Please wait before requesting more tool synthesis."
+                    )
+            except Exception as _e:
+                logger.warning("Synthesis budget check failed: %s", _e)
+
         loop_result = await self._execute_synthesis_repair_loop(
             user_id=user_id,
             gap_description=gap_description,
@@ -5407,6 +5616,18 @@ class Orchestrator:
         if self._increment_consolidation_turn_count(user_id):
             self._fire_and_forget(self._consolidate_memory(user_id))
 
+        # Persist the current counter so it survives restarts.
+        # Only fire-and-forget when the ledger returns a real coroutine (not a test mock).
+        try:
+            current = int(self._consolidation_turn_counts.get(user_id, 0) or 0)
+            coro = self.ledger_memory.set_system_state(
+                f"consolidation_turns:{user_id}", str(current)
+            )
+            if asyncio.iscoroutine(coro):
+                self._fire_and_forget(coro)
+        except Exception as _e:
+            logger.debug("Consolidation counter persistence skipped: %s", _e)
+
     def _increment_consolidation_turn_count(self, user_id: str) -> bool:
         if not hasattr(self, "_consolidation_turn_counts"):
             self._consolidation_turn_counts = OrderedDict()
@@ -5697,6 +5918,21 @@ class Orchestrator:
             if local_resolution is not None:
                 return local_resolution
 
+            # Lockout check: prevent duplicate background synthesis for the same user.
+            if not hasattr(self, "_synthesis_in_progress"):
+                self._synthesis_in_progress = {}
+            ts = self._synthesis_in_progress.get(user_id)
+            if ts is not None:
+                age = time.time() - ts
+                if age < _SYNTHESIS_LOCKOUT_TTL_SECONDS:
+                    return (
+                        "Tool synthesis already in progress for this request. "
+                        "Please wait for the current synthesis to complete."
+                    )
+                # Stale entry — allow a new run.
+                del self._synthesis_in_progress[user_id]
+
+            self._synthesis_in_progress[user_id] = time.time()
             # Run synthesis in the background via _fire_and_forget which holds
             # a strong GC-safe reference (ISSUE-002).
             self._fire_and_forget(self._async_tool_synthesis(user_id, result, state))
@@ -5776,17 +6012,34 @@ class Orchestrator:
 
     async def _async_tool_synthesis(
         self,
-        _user_id: str,
+        user_id: str,
         result: RouterResult,
         state: Dict[str, Any],
     ) -> None:
-        """Background task: run tool synthesis and send the HITL prompt to admin."""
+        """Background task: run tool synthesis with a timeout and send the HITL prompt to admin."""
         try:
-            hitl_prompt = await self.tool_synthesis_node(state, result)
+            hitl_prompt = await asyncio.wait_for(
+                self.tool_synthesis_node(state, result),
+                timeout=float(_SYNTHESIS_LOCKOUT_TTL_SECONDS),
+            )
             if self.outbound_queue is not None:
                 await self.outbound_queue.put(hitl_prompt)
+        except asyncio.TimeoutError:
+            logger.critical(
+                "Tool synthesis timed out after %ss for user '%s'.",
+                _SYNTHESIS_LOCKOUT_TTL_SECONDS,
+                user_id,
+            )
+            if self.outbound_queue is not None:
+                await self.outbound_queue.put(
+                    f"[CRITICAL] Tool synthesis timed out after {_SYNTHESIS_LOCKOUT_TTL_SECONDS}s "
+                    f"for user '{user_id}'."
+                )
         except Exception as e:
             logger.error(f"Background tool synthesis failed: {e}", exc_info=True)
+        finally:
+            if hasattr(self, "_synthesis_in_progress"):
+                self._synthesis_in_progress.pop(user_id, None)
 
     async def aclose(self) -> None:
         """Close async and sync resources owned by the orchestrator."""
