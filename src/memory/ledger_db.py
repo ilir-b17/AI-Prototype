@@ -18,6 +18,9 @@ import aiosqlite
 
 logger = logging.getLogger(__name__)
 
+# Minimum token length for fuzzy tool-name matching (tokens shorter than this are noise).
+_MIN_FUZZY_TOKEN_LENGTH = 3
+
 
 class LogLevel(Enum):
     """Enumeration of system log levels."""
@@ -207,14 +210,34 @@ class LedgerMemory:
                 ON objective_backlog(agent_domain, status, claimed_by, next_eligible_at)
             """)
             await self._db.execute("""
+                CREATE TABLE IF NOT EXISTS sessions (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    name TEXT NOT NULL,
+                    description TEXT NOT NULL DEFAULT '',
+                    is_active INTEGER NOT NULL DEFAULT 0,
+                    turn_count INTEGER NOT NULL DEFAULT 0,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            """)
+            await self._db.execute("""
+                CREATE INDEX IF NOT EXISTS idx_sessions_is_active ON sessions(is_active DESC, id DESC)
+            """)
+            await self._db.execute("""
                 CREATE TABLE IF NOT EXISTS chat_history (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     user_id TEXT NOT NULL,
                     role TEXT NOT NULL,
                     content TEXT NOT NULL,
+                    session_id INTEGER REFERENCES sessions(id),
                     timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 )
             """)
+            await self._ensure_table_column(
+                "chat_history",
+                "session_id",
+                "INTEGER REFERENCES sessions(id)",
+            )
             await self._db.execute("""
                 CREATE INDEX IF NOT EXISTS idx_chat_user_id ON chat_history(user_id, timestamp)
             """)
@@ -2410,3 +2433,215 @@ class LedgerMemory:
                 "DELETE FROM pending_mfa_states WHERE user_id=?", (user_id,)
             )
             await self._db.commit()
+
+    # ─────────────────────────────────────────────────────────────
+    # Session Management
+    # ─────────────────────────────────────────────────────────────
+
+    async def create_session(self, name: str, description: str = "") -> int:
+        """Create a new session and return its id."""
+        async with self._lock:
+            cursor = await self._db.execute(
+                "INSERT INTO sessions (name, description) VALUES (?, ?)",
+                (name, description or ""),
+            )
+            await self._db.commit()
+            return cursor.lastrowid
+
+    async def activate_session(self, session_id: int) -> Optional[Dict[str, Any]]:
+        """Deactivate all sessions, activate the given one, and return its row."""
+        async with self._lock:
+            await self._db.execute("UPDATE sessions SET is_active=0")
+            await self._db.execute(
+                "UPDATE sessions SET is_active=1, updated_at=CURRENT_TIMESTAMP WHERE id=?",
+                (int(session_id),),
+            )
+            await self._db.commit()
+            cursor = await self._db.execute(
+                "SELECT id, name, description, is_active, turn_count, created_at FROM sessions WHERE id=?",
+                (int(session_id),),
+            )
+            row = await cursor.fetchone()
+        return dict(row) if row else None
+
+    async def get_active_session(self) -> Optional[Dict[str, Any]]:
+        """Return the currently active session, or None."""
+        async with self._lock:
+            cursor = await self._db.execute(
+                "SELECT id, name, description, is_active, turn_count, created_at "
+                "FROM sessions WHERE is_active=1 LIMIT 1"
+            )
+            row = await cursor.fetchone()
+        return dict(row) if row else None
+
+    async def deactivate_all_sessions(self) -> None:
+        """Set all sessions to inactive."""
+        async with self._lock:
+            await self._db.execute("UPDATE sessions SET is_active=0, updated_at=CURRENT_TIMESTAMP")
+            await self._db.commit()
+
+    async def list_sessions(self) -> List[Dict[str, Any]]:
+        """Return all sessions, active one first, then by descending id."""
+        async with self._lock:
+            cursor = await self._db.execute(
+                "SELECT id, name, description, is_active, turn_count, created_at "
+                "FROM sessions ORDER BY is_active DESC, id DESC"
+            )
+            rows = await cursor.fetchall()
+        return [dict(r) for r in rows]
+
+    async def get_session(self, session_id: int) -> Optional[Dict[str, Any]]:
+        """Return a single session row by id."""
+        async with self._lock:
+            cursor = await self._db.execute(
+                "SELECT id, name, description, is_active, turn_count, created_at FROM sessions WHERE id=?",
+                (int(session_id),),
+            )
+            row = await cursor.fetchone()
+        return dict(row) if row else None
+
+    async def increment_session_turn_count(self, session_id: int) -> None:
+        """Increment the turn counter for the given session."""
+        async with self._lock:
+            await self._db.execute(
+                "UPDATE sessions SET turn_count=turn_count+1, updated_at=CURRENT_TIMESTAMP WHERE id=?",
+                (int(session_id),),
+            )
+            await self._db.commit()
+
+    async def save_chat_turn_with_session(
+        self,
+        user_id: str,
+        role: str,
+        content: str,
+        *,
+        session_id: Optional[int] = None,
+    ) -> None:
+        """Persist one conversational turn optionally scoped to a session."""
+        if role not in ("user", "assistant"):
+            raise ValueError("role must be 'user' or 'assistant'")
+        async with self._lock:
+            await self._db.execute(
+                "INSERT INTO chat_history (user_id, role, content, session_id) VALUES (?, ?, ?, ?)",
+                (user_id, role, content, session_id),
+            )
+            await self._db.commit()
+
+    async def get_session_chat_history(
+        self,
+        user_id: str,
+        session_id: int,
+        limit: int = 100,
+    ) -> List[Dict[str, str]]:
+        """Return chat turns scoped to a specific session in chronological order."""
+        async with self._lock:
+            cursor = await self._db.execute(
+                "SELECT role, content FROM ("
+                "  SELECT id, role, content FROM chat_history "
+                "  WHERE user_id = ? AND session_id = ? ORDER BY id DESC LIMIT ?"
+                ") ORDER BY id ASC",
+                (user_id, int(session_id), limit),
+            )
+            rows = await cursor.fetchall()
+        return [{"role": r["role"], "content": r["content"]} for r in rows]
+
+    # ─────────────────────────────────────────────────────────────
+    # Moral Audit helpers
+    # ─────────────────────────────────────────────────────────────
+
+    async def get_recent_moral_rejections(
+        self,
+        user_id: str,
+        limit: int = 3,
+    ) -> List[Dict[str, Any]]:
+        """Return up to *limit* most recent moral audit entries where is_approved is False."""
+        async with self._lock:
+            cursor = await self._db.execute(
+                "SELECT moral_decision_json FROM moral_audit_log "
+                "WHERE user_id = ? ORDER BY created_at DESC, id DESC LIMIT ?",
+                (user_id, limit * 5),
+            )
+            rows = await cursor.fetchall()
+        rejections: List[Dict[str, Any]] = []
+        for row in rows:
+            if len(rejections) >= limit:
+                break
+            try:
+                decision = json.loads(row["moral_decision_json"])
+            except Exception:
+                continue
+            if not decision.get("is_approved"):
+                rejections.append(decision)
+        return rejections
+
+    # ─────────────────────────────────────────────────────────────
+    # Synthesis helpers
+    # ─────────────────────────────────────────────────────────────
+
+    async def count_synthesis_failures_fuzzy(
+        self,
+        tool_name: str,
+        *,
+        window_hours: int = 24,
+    ) -> int:
+        """Count synthesis runs in terminal failure states whose tool name fuzzy-matches
+        *tool_name* (token overlap on underscore-split tokens ≥ 3 chars) within the given
+        time window."""
+        query_tokens = {t.lower() for t in tool_name.split("_") if len(t) >= _MIN_FUZZY_TOKEN_LENGTH}
+        if not query_tokens:
+            return 0
+        async with self._lock:
+            cursor = await self._db.execute(
+                "SELECT suggested_tool_name FROM synthesis_runs "
+                "WHERE status IN ('blocked', 'rejected', 'failed') "
+                "AND created_at >= datetime('now', ? || ' hours')",
+                (f"-{int(window_hours)}",),
+            )
+            rows = await cursor.fetchall()
+        count = 0
+        for row in rows:
+            run_tokens = {t.lower() for t in str(row["suggested_tool_name"] or "").split("_") if len(t) >= _MIN_FUZZY_TOKEN_LENGTH}
+            if query_tokens & run_tokens:
+                count += 1
+        return count
+
+    async def count_synthesis_runs_in_window(
+        self,
+        user_id: str,
+        *,
+        hours: int = 1,
+    ) -> int:
+        """Return the number of synthesis runs started by *user_id* within the given hours window."""
+        async with self._lock:
+            cursor = await self._db.execute(
+                "SELECT COUNT(*) AS cnt FROM synthesis_runs "
+                "WHERE user_id = ? AND created_at >= datetime('now', ? || ' hours')",
+                (user_id, f"-{int(hours)}"),
+            )
+            row = await cursor.fetchone()
+        return int(row["cnt"] or 0) if row else 0
+
+    async def retire_tools(self, tool_names: List[str]) -> int:
+        """Set status='retired' for each named tool that is currently approved. Returns count updated."""
+        if not tool_names:
+            return 0
+        count = 0
+        async with self._lock:
+            for name in tool_names:
+                cursor = await self._db.execute(
+                    "UPDATE tool_registry SET status='retired' WHERE name=? AND status='approved'",
+                    (str(name),),
+                )
+                count += cursor.rowcount
+            await self._db.commit()
+        return count
+
+    async def get_system_states_by_prefix(self, prefix: str) -> Dict[str, str]:
+        """Return all system_state rows whose key starts with *prefix* as a {key: value} dict."""
+        async with self._lock:
+            cursor = await self._db.execute(
+                "SELECT key, value FROM system_state WHERE key LIKE ?",
+                (f"{prefix}%",),
+            )
+            rows = await cursor.fetchall()
+        return {row["key"]: row["value"] for row in rows}
