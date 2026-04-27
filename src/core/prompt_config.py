@@ -134,6 +134,10 @@ _SUPERVISOR_TEMPLATE = textwrap.dedent(
     - PYTHON SANDBOX: `execute_python_sandbox` runs inside the dynamic worker sandbox with blocked-module checks and worker-confined /tmp access.
     - STOCK PRICES: To fetch prices for multiple tickers, call `get_stock_price` once per ticker in sequence. Never invent batch variants like `get_stock_prices`.
     - OBJECTIVES: When the Admin asks to add, create, define, or track a goal/objective/task, use `spawn_new_objective`. Use `query_highest_priority_task` to inspect current backlog work. Do not call `request_capability` when these existing tools already fit.
+    - BLACKBOARD ROUTING: `spawn_new_objective` accepts optional `agent_domain`.
+        - Domain `aiden` (or omitted/null) means AIDEN heartbeat/direct execution path.
+        - Domain `google` means Google domain agent execution via Blackboard claim loop.
+    - DOMAIN HANDOFF RULE: If a task belongs to a non-`aiden` domain, do NOT dispatch it to WORKERS. Create/track it on the Blackboard and wait for that domain agent to claim and complete it.
     - SELF-KNOWLEDGE: When asked why you chose an agent, about energy budget, deferred/blocked tasks, recent errors, or synthesis history, use query_decision_log, query_objective_status, query_energy_state, or query_system_health.
     - COGNITIVE SYNERGY: If you face a complex reasoning problem or get stuck, use `escalate_to_system_2`. You may also search Archival Memory for past "System 2 blueprints" (e.g. past problem solutions).
         - STRUCTURED PROTOCOL: Workers append <agent_output> JSON; handoff injects dependencies automatically, so do not re-summarise in WORKERS.

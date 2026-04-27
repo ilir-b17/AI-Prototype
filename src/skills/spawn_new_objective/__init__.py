@@ -5,7 +5,13 @@ logger = logging.getLogger(__name__)
 
 import json
 
-async def spawn_new_objective(tier: str, title: str, estimated_energy: int) -> str:
+
+async def spawn_new_objective(
+    tier: str,
+    title: str,
+    estimated_energy: int,
+    agent_domain: str | None = None,
+) -> str:
     logger.info(f"spawn_new_objective: [{tier}] {title}")
 
     if not isinstance(title, str) or not title.strip():
@@ -36,7 +42,9 @@ async def spawn_new_objective(tier: str, title: str, estimated_energy: int) -> s
             owns_connection = True
         obj_id = await ledger.add_objective(
             tier=tier, title=title,
-            estimated_energy=estimated_energy, origin="System"
+            estimated_energy=estimated_energy,
+            origin="System",
+            agent_domain=agent_domain,
         )
         return json.dumps({
             "status": "success",
@@ -44,7 +52,8 @@ async def spawn_new_objective(tier: str, title: str, estimated_energy: int) -> s
             "data": {
                 "id": obj_id,
                 "tier": tier,
-                "title": title
+                "title": title,
+                "agent_domain": (agent_domain.strip() if isinstance(agent_domain, str) else None),
             }
         }, indent=2)
     except Exception as exc:

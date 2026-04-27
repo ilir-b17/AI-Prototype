@@ -80,6 +80,13 @@ async def test_deferred_heartbeat_task_with_unmet_dependency_is_not_selected(tmp
             estimated_energy=1,
             priority=2,
         )
+        domain_id = await ledger.add_objective(
+            tier="Task",
+            title="Google domain task",
+            estimated_energy=1,
+            priority=1,
+            agent_domain="google",
+        )
         await ledger.update_objective_status(blocked_id, "deferred_due_to_energy")
         async with ledger._lock:
             await ledger._db.execute(
@@ -99,6 +106,7 @@ async def test_deferred_heartbeat_task_with_unmet_dependency_is_not_selected(tmp
 
         assert blocked_id not in candidate_ids
         assert ready_id in candidate_ids
+        assert domain_id not in candidate_ids
     finally:
         await ledger.close()
 

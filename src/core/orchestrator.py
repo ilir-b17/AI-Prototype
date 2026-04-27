@@ -160,6 +160,8 @@ _GOAL_PLANNER_COMPLEXITY_THRESHOLD = int(os.getenv("GOAL_PLANNER_COMPLEXITY_THRE
 _HEARTBEAT_FAILURE_STRIKES = int(os.getenv("HEARTBEAT_FAILURE_STRIKES", "3"))
 _HEARTBEAT_FAILURE_STATE_KEY = "heartbeat_task_failure_counts"
 HEARTBEAT_TASK_PREFIX_FMT = "[HEARTBEAT TASK #{task_id}]"
+_NOTIFIABLE_DOMAIN_RESULTS = {"google"}
+_DOMAIN_RESULT_SUMMARY_MAX_LENGTH = 220
 _ERROR_RESPONSE_PREFIXES = (
     "Supervisor encountered an error",
     "Both local and cloud reasoning failed",
@@ -3236,6 +3238,9 @@ class Orchestrator:
         executable: List[Dict[str, Any]] = []
         for candidate in candidates:
             task = dict(candidate.get("task") or {})
+            domain = str(task.get("agent_domain") or "").strip().lower()
+            if domain not in {"", "aiden"}:
+                continue
             if self._is_executable_heartbeat_task_candidate(task, unresolved_task_ids, parent_ids):
                 executable.append(candidate)
 
@@ -3254,6 +3259,87 @@ class Orchestrator:
         if not candidates:
             return None
         return dict(candidates[0].get("task") or {})
+
+    @staticmethod
+    def _summarize_domain_task_result(result_payload: Dict[str, Any]) -> str:
+        for key in ("summary", "result_summary", "final_answer", "message", "result", "content"):
+            value = result_payload.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip()[:_DOMAIN_RESULT_SUMMARY_MAX_LENGTH]
+        compact = json.dumps(result_payload, ensure_ascii=False)
+        return compact[:_DOMAIN_RESULT_SUMMARY_MAX_LENGTH] if compact else "No summary provided"
+
+    @staticmethod
+    def _extract_domain_task_error(result_payload: Dict[str, Any]) -> str:
+        for key in ("error", "message", "details", "reason"):
+            value = result_payload.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip()[:_DOMAIN_RESULT_SUMMARY_MAX_LENGTH]
+        compact = json.dumps(result_payload, ensure_ascii=False)
+        return compact[:_DOMAIN_RESULT_SUMMARY_MAX_LENGTH] if compact else "Unknown error"
+
+    async def _notify_completed_domain_tasks(self) -> None:
+        query_pending = getattr(self.ledger_memory, "get_completed_tasks_pending_notification", None)
+        if not callable(query_pending):
+            return
+        try:
+            pending = await query_pending(limit=25)
+        except Exception as exc:
+            logger.warning("Domain result monitor: query failed: %s", exc, exc_info=True)
+            return
+
+        if not pending:
+            return
+
+        notified_ids: List[int] = []
+        for task in pending:
+            task_id = int(task.get("id") or 0)
+            if task_id <= 0:
+                continue
+            domain = str(task.get("agent_domain") or "").strip().lower()
+            if domain not in _NOTIFIABLE_DOMAIN_RESULTS:
+                logger.debug(
+                    "Domain result monitor: skipping task #%s for non-notifiable domain '%s'.",
+                    task_id,
+                    domain,
+                )
+                continue
+
+            title = str(task.get("title") or "").strip() or f"Task #{task_id}"
+            status = str(task.get("status") or "").strip().lower()
+            get_task_result = getattr(self.ledger_memory, "get_task_result", None)
+            if callable(get_task_result):
+                result_payload = await get_task_result(task_id) or {}
+            else:
+                result_payload = {}
+
+            try:
+                if status == "completed":
+                    summary = self._summarize_domain_task_result(result_payload)
+                    await self._notify_admin(f"Google Agent completed: {title} — {summary}")
+                    notified_ids.append(task_id)
+                elif status in {"failed", "blocked"}:
+                    error = self._extract_domain_task_error(result_payload)
+                    await self._notify_admin(
+                        f"Google Agent blocked: {title} — {error}. Reply to investigate."
+                    )
+                    notified_ids.append(task_id)
+            except Exception as exc:
+                logger.warning(
+                    "Domain result monitor: notification failed for task #%s: %s",
+                    task_id,
+                    exc,
+                    exc_info=True,
+                )
+
+        if notified_ids:
+            mark_notified = getattr(self.ledger_memory, "mark_tasks_admin_notified", None)
+            if not callable(mark_notified):
+                return
+            try:
+                await mark_notified(notified_ids)
+            except Exception as exc:
+                logger.warning("Domain result monitor: failed to mark notified tasks: %s", exc, exc_info=True)
 
     async def _handle_heartbeat_task_failure(
         self,
@@ -3379,6 +3465,7 @@ class Orchestrator:
         logger.info("Heartbeat: Task #%s completed.", task_id)
 
     async def _run_heartbeat_cycle(self) -> None:
+        await self._notify_completed_domain_tasks()
         logger.info("Heartbeat: Querying objective backlog for executable Tasks...")
         candidate_contexts = await self._select_executable_heartbeat_tasks()
 

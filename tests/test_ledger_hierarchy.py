@@ -43,6 +43,7 @@ async def test_objective_backlog_schema_migrates_legacy_tables(tmp_path: Path):
         assert "claimed_at" in columns
         assert "result_json" in columns
         assert "result_written_at" in columns
+        assert "admin_notified" in columns
 
         epic_id = await ledger.add_objective(tier="Epic", title="Migration test epic")
         story_id = await ledger.add_objective(
@@ -154,6 +155,32 @@ async def test_write_task_result_rejects_non_dict_payload(tmp_path: Path):
         task_id = await ledger.add_objective(tier="Task", title="Domain task", parent_id=story_id)
         with pytest.raises(ValueError):
             await ledger.write_task_result(task_id, None)  # type: ignore[arg-type]
+    finally:
+        await ledger.close()
+
+
+@pytest.mark.asyncio
+async def test_completed_tasks_pending_notification_tracks_terminal_domain_tasks(tmp_path: Path):
+    ledger = LedgerMemory(db_path=str(tmp_path / "blackboard_notifications_ledger.db"))
+    await ledger.initialize()
+    try:
+        google_task = await ledger.add_objective(tier="Task", title="Google done", agent_domain="google")
+        google_failed = await ledger.add_objective(tier="Task", title="Google failed", agent_domain="google")
+        aiden_task = await ledger.add_objective(tier="Task", title="Aiden done", agent_domain="aiden")
+
+        await ledger.write_task_result(google_task, {"summary": "sent"})
+        await ledger.write_task_failure(google_failed, {"error": "auth failure"})
+        await ledger.write_task_result(aiden_task, {"summary": "internal"})
+
+        pending = await ledger.get_completed_tasks_pending_notification(limit=10)
+        pending_ids = {row["id"] for row in pending}
+        assert google_task in pending_ids
+        assert google_failed in pending_ids
+        assert aiden_task not in pending_ids
+
+        await ledger.mark_tasks_admin_notified([google_task, google_failed])
+        pending_after = await ledger.get_completed_tasks_pending_notification(limit=10)
+        assert {row["id"] for row in pending_after} == set()
     finally:
         await ledger.close()
 

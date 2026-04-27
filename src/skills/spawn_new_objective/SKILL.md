@@ -24,6 +24,10 @@ potentially executed autonomously by the heartbeat loop.
       "estimated_energy": {
         "type": "integer",
         "description": "Estimated cognitive energy cost (5-50)."
+      },
+      "agent_domain": {
+        "type": "string",
+        "description": "Optional execution domain. Use 'aiden' (or omit) for heartbeat/AIDEN execution, or a domain like 'google' for Blackboard domain agents."
       }
     },
     "required": ["tier", "title", "estimated_energy"]
