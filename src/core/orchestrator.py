@@ -31,6 +31,7 @@ except ImportError:
 from src.memory.vector_db import VectorMemory
 from src.memory.ledger_db import LedgerMemory
 from src.memory.core_memory import CoreMemory
+from src.skills.read_inbox import read_inbox
 from src.core.agent_definition import AgentDefinition
 from src.core.agent_registry import AgentRegistry
 from src.core.llm_router import CognitiveRouter, RouterResult, RequiresHITLError
@@ -69,6 +70,7 @@ ENERGY_COST_WORKER = 15
 ENERGY_COST_CRITIC = 10
 ENERGY_COST_TOOL = 5
 HEARTBEAT_INTERVAL = int(os.getenv("HEARTBEAT_INTERVAL_SECONDS", "1800"))  # default 30 minutes
+EMAIL_POLL_INTERVAL = int(os.getenv("AIDEN_EMAIL_POLL_INTERVAL_SECONDS", "300"))  # default 5 minutes
 MEMORY_SAVE_THRESHOLD = int(os.getenv("MEMORY_SAVE_THRESHOLD", "120"))
 MEMORY_CONSOLIDATION_INTERVAL = int(os.getenv("MEMORY_CONSOLIDATION_INTERVAL", "21600"))  # 6 hours
 # UTC timestamp format shared with VectorMemory.add_memory / prune_old_memories so that
@@ -296,6 +298,8 @@ class Orchestrator:
             self._user_locks_lock: asyncio.Lock = asyncio.Lock()
             self._compiled_graph = None
             self._heartbeat_failure_counts: Dict[int, int] = {}
+            self._email_poll_last_run_at: Optional[datetime] = None
+            self._email_processed_timestamps: List[float] = []
             self._refresh_sensory_state()
 
             logger.info("Orchestrator __init__ complete — call async_init() to finish setup")
@@ -3473,6 +3477,104 @@ class Orchestrator:
                     await self._run_heartbeat_cycle()
                 except Exception as e:
                     logger.error(f"Heartbeat error: {e}", exc_info=True)
+
+    def _prune_email_processed_history(self, now_ts: Optional[float] = None) -> None:
+        cutoff = float(now_ts if now_ts is not None else time.time()) - 86400.0
+        self._email_processed_timestamps = [
+            ts for ts in (self._email_processed_timestamps or []) if ts >= cutoff
+        ]
+
+    async def _run_email_poll_cycle(self) -> None:
+        self._email_poll_last_run_at = datetime.now()
+        self._prune_email_processed_history()
+        try:
+            raw_result = await read_inbox()
+        except Exception as exc:
+            logger.warning("Email poll: read_inbox failed: %s", exc, exc_info=True)
+            return
+
+        try:
+            result = json.loads(str(raw_result or ""))
+        except Exception as exc:
+            logger.warning("Email poll: read_inbox returned invalid JSON: %s", exc, exc_info=True)
+            return
+
+        if str(result.get("status") or "").strip().lower() != "success":
+            logger.warning(
+                "Email poll: inbox read failed: %s",
+                str(result.get("message") or "unknown error"),
+            )
+            return
+
+        emails = result.get("emails") or []
+        if not isinstance(emails, list):
+            logger.warning("Email poll: invalid inbox payload type for emails: %s", type(emails).__name__)
+            return
+
+        for item in emails:
+            if not isinstance(item, dict):
+                continue
+            try:
+                sender = str(item.get("sender") or "unknown sender").strip() or "unknown sender"
+                subject = str(item.get("subject") or "(no subject)").strip() or "(no subject)"
+                body = str(item.get("body") or "")
+                attachment_paths_raw = item.get("attachment_paths") or []
+                attachment_paths = (
+                    [str(path) for path in attachment_paths_raw]
+                    if isinstance(attachment_paths_raw, list)
+                    else []
+                )
+                acceptance_payload = {
+                    "sender": sender,
+                    "subject": subject,
+                    "date": str(item.get("date") or ""),
+                    "message_id": str(item.get("message_id") or ""),
+                    "body": body,
+                    "attachment_paths": attachment_paths,
+                }
+                title = f"Process email request: {subject} from {sender}"
+                objective_id = await self.ledger_memory.add_objective(
+                    tier="Task",
+                    title=title,
+                    estimated_energy=20,
+                    origin="email",
+                    acceptance_criteria=json.dumps(acceptance_payload, ensure_ascii=False),
+                )
+                await self.ledger_memory.set_task_agent_domain(objective_id, "google")
+                self._email_processed_timestamps.append(time.time())
+                logger.info("Email poll: created task #%s for new email: %s", objective_id, title)
+            except Exception as exc:
+                logger.warning("Email poll: failed to create objective from email: %s", exc, exc_info=True)
+
+        self._prune_email_processed_history()
+
+    async def _email_poll_loop(self) -> None:
+        logger.info("Email poll loop started.")
+        _email_poll_lock = asyncio.Lock()
+        while True:
+            await asyncio.sleep(EMAIL_POLL_INTERVAL)
+            if _email_poll_lock.locked():
+                logger.warning("Email poll: Previous run still in progress. Skipping this cycle.")
+                continue
+            async with _email_poll_lock:
+                try:
+                    await self._run_email_poll_cycle()
+                except Exception as exc:
+                    logger.warning("Email poll loop error: %s", exc, exc_info=True)
+
+    async def get_email_poll_status(self) -> Dict[str, Any]:
+        self._prune_email_processed_history()
+        last_poll_text = (
+            self._email_poll_last_run_at.strftime("%Y-%m-%d %H:%M:%S")
+            if self._email_poll_last_run_at is not None
+            else "never"
+        )
+        pending_google_tasks = await self.ledger_memory.get_pending_tasks_for_domain("google", limit=10000)
+        return {
+            "last_poll_time": last_poll_text,
+            "emails_processed_last_24h": len(self._email_processed_timestamps or []),
+            "pending_google_tasks": len(pending_google_tasks or []),
+        }
 
     async def _memory_consolidation_loop(self) -> None:
         """Background task: periodically consolidate chat history into long-term memory."""

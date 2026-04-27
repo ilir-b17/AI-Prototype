@@ -650,6 +650,33 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(text)
 
 
+async def emailstatus(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/emailstatus — report email polling health and queue metrics."""
+    if not is_authorized(update.effective_user.id):
+        await update.message.reply_text(_UNAUTHORIZED_MSG)
+        return
+
+    orchestrator_inst = context.bot_data.get("orchestrator") if context is not None else orchestrator
+    if orchestrator_inst is None:
+        await update.message.reply_text(_SERVICE_UNAVAILABLE_MSG)
+        return
+
+    try:
+        stats = await orchestrator_inst.get_email_poll_status()
+    except Exception as exc:
+        logger.warning("/emailstatus failed: %s", exc, exc_info=True)
+        await update.message.reply_text("Email status unavailable right now.")
+        return
+
+    text = (
+        "AIDEN email status\n"
+        f"Last poll time: {stats.get('last_poll_time', 'unknown')}\n"
+        f"Emails processed (last 24h): {stats.get('emails_processed_last_24h', 0)}\n"
+        f"Pending google-domain tasks: {stats.get('pending_google_tasks', 0)}"
+    )
+    await update.message.reply_text(text)
+
+
 async def retire_unused_tools(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """/retire_unused_tools [confirm] — retire approved tools that have never been used recently."""
     if not is_authorized(update.effective_user.id):
@@ -847,14 +874,17 @@ async def _async_run(application: Application, orchestrator_inst: "Orchestrator"
             )
 
         _heartbeat_task = asyncio.create_task(orchestrator_inst._heartbeat_loop())
-        _sensory_task   = asyncio.create_task(orchestrator_inst._sensory_update_loop())
-        _drain_task     = asyncio.create_task(_drain_outbound_queue(application.bot, outbound_queue))
-        _memory_task    = asyncio.create_task(orchestrator_inst._memory_consolidation_loop())
-        _bg_tasks.extend([_heartbeat_task, _sensory_task, _drain_task, _memory_task])
+        _sensory_task = asyncio.create_task(orchestrator_inst._sensory_update_loop())
+        _email_poll_task = asyncio.create_task(orchestrator_inst._email_poll_loop())
+        _drain_task = asyncio.create_task(_drain_outbound_queue(application.bot, outbound_queue))
+        _memory_task = asyncio.create_task(orchestrator_inst._memory_consolidation_loop())
+        _bg_tasks.extend([_heartbeat_task, _sensory_task, _email_poll_task, _drain_task, _memory_task])
         logger.info(
-            "Orchestrator async_init, heartbeat loop, sensory update loop, memory consolidation loop, "
+            "Orchestrator async_init, heartbeat loop, sensory update loop, email poll loop, memory consolidation loop, "
             "and outbound queue drainer started. "
-            f"Tasks: {_heartbeat_task.get_name()}, {_sensory_task.get_name()}, {_memory_task.get_name()}, {_drain_task.get_name()}"
+            "Tasks: "
+            f"{_heartbeat_task.get_name()}, {_sensory_task.get_name()}, {_email_poll_task.get_name()}, "
+            f"{_memory_task.get_name()}, {_drain_task.get_name()}"
         )
 
         # Start polling and the PTB application
@@ -970,6 +1000,7 @@ def main() -> None:
         application.add_handler(CommandHandler("goals", goals))
         application.add_handler(CommandHandler("addgoal", addgoal))
         application.add_handler(CommandHandler("status", status))
+        application.add_handler(CommandHandler("emailstatus", emailstatus))
         application.add_handler(CommandHandler("retire_unused_tools", retire_unused_tools))
         application.add_handler(CommandHandler("shutdown", shutdown))
         application.add_handler(CommandHandler("restart", restart))
