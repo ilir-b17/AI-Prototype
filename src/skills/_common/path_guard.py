@@ -36,9 +36,19 @@ def _parse_extra_roots(raw_extra_roots: str) -> List[str]:
 def get_default_allowed_roots() -> List[str]:
     downloads_root = os.getenv("AIDEN_DOWNLOADS_DIR", _DEFAULT_DOWNLOADS_DIR)
     extra_roots = _parse_extra_roots(os.getenv("AIDEN_EXTRA_ALLOWED_ROOTS", ""))
+    allow_project_root = os.getenv("AIDEN_ALLOW_PROJECT_ROOT_FS", "false").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
 
     roots: List[str] = []
-    for candidate in [downloads_root, _PROJECT_ROOT, *extra_roots]:
+    candidates = [downloads_root, *extra_roots]
+    if allow_project_root:
+        candidates.append(_PROJECT_ROOT)
+
+    for candidate in candidates:
         try:
             resolved = _normalize_root(candidate)
         except PermissionError:
