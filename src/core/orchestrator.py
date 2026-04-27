@@ -5064,7 +5064,13 @@ class Orchestrator:
         caps = core.get("known_capabilities", "")
         await self.core_memory.update("known_capabilities", f"{caps}, {tool_name}".lstrip(", "))
         logger.info("Tool '%s' approved, registered, and logged to core memory", tool_name)
-        retry = await self.process_message(original_state["user_input"], user_id)
+        retry_input = str(original_state["user_input"])
+        await self._get_user_lock(user_id)
+        retry = await self._run_user_turn_locked(
+            user_id=user_id,
+            user_message=retry_input,
+            user_prompt=self._coerce_user_prompt_payload(retry_input),
+        )
         return f"✅ Tool '{tool_name}' deployed.\n\n{retry}"
 
     async def _handle_synthesized_tool_deploy_failure(
@@ -5363,7 +5369,13 @@ class Orchestrator:
             follow_up_input = getattr(outcome, "follow_up_input", None)
             if follow_up_input is None:
                 return reply_text
-            follow_up_response = await self.process_message(follow_up_input, user_id)
+            follow_up_text = str(follow_up_input or "").strip()
+            await self._get_user_lock(user_id)
+            follow_up_response = await self._run_user_turn_locked(
+                user_id=user_id,
+                user_message=follow_up_text,
+                user_prompt=self._coerce_user_prompt_payload(follow_up_text),
+            )
             return f"{reply_text}\n\n{follow_up_response}".strip()
         return await self._try_resume_tool_approval(user_id, user_message)
 
