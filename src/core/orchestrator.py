@@ -234,6 +234,7 @@ class Orchestrator:
            (the Telegram bot's ``post_init`` hook) to open the aiosqlite
            connection and seed initial goals.
     """
+    _deprecated_energy_replenish_turn_warning_logged = False
 
     def __init__(
         self,
@@ -1036,6 +1037,28 @@ class Orchestrator:
         )
 
     @staticmethod
+    def _is_introspection_query(user_message: str) -> bool:
+        lowered = (user_message or "").lower()
+        markers = (
+            "why did you", "why did that", "what happened", "last turn",
+            "deferred", "blocked task", "energy budget", "system error",
+            "recent errors", "moral audit", "task backlog", "objectives",
+            "system health", "synthesis history", "what went wrong",
+        )
+        return any(marker in lowered for marker in markers)
+
+    @staticmethod
+    def _classify_introspection_type(user_message: str) -> str:
+        lowered = (user_message or "").lower()
+        if any(term in lowered for term in ("why did", "what happened", "last turn")):
+            return "decision"
+        if any(term in lowered for term in ("backlog", "objective", "pending", "blocked task")):
+            return "backlog"
+        if any(term in lowered for term in ("deferred", "energy")):
+            return "energy"
+        return "health"
+
+    @staticmethod
     def _summarize_chat_history(chat_history: List[Dict[str, str]]) -> Optional[str]:
         user_turns = []
         for turn in chat_history:
@@ -1205,6 +1228,17 @@ class Orchestrator:
 
         capability_response = self._build_capability_response(user_message)
         if capability_response:
+            classifier = getattr(self, "_route_to_system_1", None)
+            if callable(classifier):
+                try:
+                    await classifier(
+                        [{"role": "user", "content": user_message}],
+                        allowed_tools=[],
+                        deadline_seconds=30.0,
+                        context="capability_query",
+                    )
+                except Exception:
+                    logger.debug("Capability-query local classification skipped.", exc_info=True)
             return capability_response
 
         profile_response = await self._build_profile_response(state)
@@ -1794,9 +1828,7 @@ class Orchestrator:
 
     def _energy_gate_available(self) -> bool:
         return (
-            getattr(self, "energy_judge", None) is not None
-            and getattr(self, "energy_roi_engine", None) is not None
-            and getattr(self, "_predictive_energy_budget_lock", None) is not None
+            getattr(self, "_predictive_energy_budget_lock", None) is not None
             and hasattr(self, "_predictive_energy_budget_remaining")
         )
 
@@ -1805,6 +1837,73 @@ class Orchestrator:
             return max(0, int(os.getenv("INITIAL_ENERGY_BUDGET", "100")))
         async with self._predictive_energy_budget_lock:
             return max(0, int(self._predictive_energy_budget_remaining))
+
+    @staticmethod
+    def _resolve_energy_replenish_per_hour() -> float:
+        raw_rate = str(os.getenv("ENERGY_REPLENISH_PER_HOUR", "30") or "").strip()
+        try:
+            rate = float(raw_rate)
+        except ValueError:
+            logger.warning("Invalid ENERGY_REPLENISH_PER_HOUR=%r. Falling back to 30.", raw_rate)
+            rate = 30.0
+        return max(0.0, rate)
+
+    @staticmethod
+    def _resolve_energy_replenish_per_heartbeat() -> int:
+        raw_value = str(os.getenv("ENERGY_REPLENISH_PER_HEARTBEAT", "5") or "").strip()
+        try:
+            amount = int(raw_value)
+        except ValueError:
+            logger.warning("Invalid ENERGY_REPLENISH_PER_HEARTBEAT=%r. Falling back to 5.", raw_value)
+            amount = 5
+        return max(0, amount)
+
+    @classmethod
+    def _warn_deprecated_energy_replenish_turn_env_once(cls) -> None:
+        if cls._deprecated_energy_replenish_turn_warning_logged:
+            return
+        raw_deprecated = str(os.getenv("ENERGY_REPLENISH_PER_TURN", "") or "").strip()
+        if not raw_deprecated:
+            return
+        logger.warning(
+            "ENERGY_REPLENISH_PER_TURN is deprecated and ignored. "
+            "Use ENERGY_REPLENISH_PER_HOUR for wall-clock replenishment instead."
+        )
+        cls._deprecated_energy_replenish_turn_warning_logged = True
+
+    def _compute_predictive_energy_replenishment_points_wallclock_locked(self, *, now: Optional[float] = None) -> int:
+        current_time = float(time.time() if now is None else now)
+        last_replenished_at = float(
+            getattr(self, "_predictive_energy_budget_last_replenished_at", current_time)
+        )
+        if current_time <= last_replenished_at:
+            return 0
+        replenish_per_hour = self._resolve_energy_replenish_per_hour()
+        if replenish_per_hour <= 0:
+            self._predictive_energy_budget_last_replenished_at = current_time
+            return 0
+        elapsed_seconds = current_time - last_replenished_at
+        points = int((elapsed_seconds / 3600.0) * replenish_per_hour)
+        if points <= 0:
+            return 0
+        consumed_seconds = (float(points) / replenish_per_hour) * 3600.0
+        self._predictive_energy_budget_last_replenished_at = last_replenished_at + consumed_seconds
+        return points
+
+    def _apply_predictive_energy_tick_locked(self, amount: int) -> int:
+        if amount <= 0:
+            return 0
+        cap = max(0, int(os.getenv("INITIAL_ENERGY_BUDGET", "100")))
+        before = max(0, int(getattr(self, "_predictive_energy_budget_remaining", 0)))
+        self._predictive_energy_budget_remaining = min(cap, before + int(amount))
+        if hasattr(self, "_energy_budget"):
+            self._energy_budget = self._predictive_energy_budget_remaining
+        return int(self._predictive_energy_budget_remaining) - before
+
+    def _replenish_predictive_energy_budget_wallclock_locked(self, *, now: Optional[float] = None) -> int:
+        self._warn_deprecated_energy_replenish_turn_env_once()
+        points = self._compute_predictive_energy_replenishment_points_wallclock_locked(now=now)
+        return self._apply_predictive_energy_tick_locked(points)
 
     async def _refund_predictive_energy_budget(self, amount: int, reason: str) -> None:
         amount = max(0, int(amount))
@@ -1817,6 +1916,8 @@ class Orchestrator:
             self._predictive_energy_budget_remaining = min(
                 cap, self._predictive_energy_budget_remaining + amount
             )
+            if hasattr(self, "_energy_budget"):
+                self._energy_budget = self._predictive_energy_budget_remaining
         logger.info(
             "Energy budget refunded: +%s (%s). Remaining=%s",
             amount,
@@ -1849,6 +1950,8 @@ class Orchestrator:
             if remaining - cost < reserve:
                 return False
             self._predictive_energy_budget_remaining = remaining - cost
+            if hasattr(self, "_energy_budget"):
+                self._energy_budget = self._predictive_energy_budget_remaining
             logger.info(
                 "Predictive energy budget reserved: -%s (%s). Remaining=%s",
                 cost,
@@ -2869,6 +2972,25 @@ class Orchestrator:
 
         blocked_result = None
         for (agent_def, _task_packet), result in zip(batch, results):
+            if isinstance(result, RequiresHITLError):
+                logger.warning("Parallel agent %s requested HITL: %s", agent_def.name, result)
+                raise result
+            if not isinstance(result, Exception) and result.get(_BLOCKED_KEY) and blocked_result is None:
+                blocked_result = result[_BLOCKED_KEY]
+
+        if blocked_result is not None:
+            unused_energy = sum(
+                agent_def.energy_cost
+                for (agent_def, _task_packet), result in zip(batch, results)
+                if not isinstance(result, Exception) and not result.get(_BLOCKED_KEY)
+            )
+            if unused_energy > 0:
+                state = self._refund_energy(state, unused_energy, "parallel_agents_blocked_unused")
+                await self._refund_predictive_energy_budget(unused_energy, "parallel_agents_blocked_unused")
+            state[_BLOCKED_KEY] = blocked_result
+            return state
+
+        for (agent_def, _task_packet), result in zip(batch, results):
             if isinstance(result, Exception):
                 logger.error("Parallel agent %s failed with exception: %s", agent_def.name, result, exc_info=True)
                 state["worker_outputs"][agent_def.name] = f"Error: {agent_def.name} failed with exception: {result}"
@@ -2877,13 +2999,6 @@ class Orchestrator:
             agent_output = dict(result.get("worker_outputs", {}) or {}).get(agent_def.name)
             if agent_output is not None:
                 state["worker_outputs"][agent_def.name] = agent_output
-
-            if blocked_result is None and result.get(_BLOCKED_KEY):
-                blocked_result = result[_BLOCKED_KEY]
-
-        if blocked_result is not None:
-            state[_BLOCKED_KEY] = blocked_result
-
         return state
 
     async def _try_route_agent_system_1(
@@ -4988,6 +5103,8 @@ class Orchestrator:
                 # Fall through to fresh state below
             else:
                 state = normalize_state(self.pending_hitl_state.pop(user_id))
+                previous_iteration_count = int(state.get("iteration_count", 0) or 0)
+                previous_critic_feedback = state.get("critic_feedback")
                 # Clear the persisted DB record now that we've resumed (ISSUE-013)
                 try:
                     await self.ledger_memory.clear_hitl_state(user_id)
@@ -5005,8 +5122,12 @@ class Orchestrator:
                 # ensures a perpetually failing task eventually becomes unrecoverable
                 # rather than cycling indefinitely at full energy (ISSUE-005).
                 state["energy_remaining"] = min(state.get("energy_remaining", 0) + 50, 75)
-                # If the admin has guided this task 3+ times without success, abandon it
-                if state["hitl_count"] >= 3:
+                # If the admin has guided this task 3+ times or the critic
+                # already exhausted its retry budget, abandon it.
+                if state["hitl_count"] >= 3 or (
+                    previous_iteration_count >= 3
+                    and previous_critic_feedback != "PASS"
+                ):
                     logger.warning(
                         f"HITL cycle limit (3) reached for user {user_id}. "
                         f"Abandoning task: {state.get('user_input', '')[:80]}"
@@ -5203,13 +5324,28 @@ class Orchestrator:
                 return await self._finalize_user_response(user_id, user_message, reply)
 
         try:
-            return await self._run_graph_loop(state, user_id, user_message)
+            response = await self._run_graph_loop(state, user_id, user_message)
+            heartbeat_task_id = state.get("_heartbeat_origin_task_id")
+            if heartbeat_task_id is not None and not self._is_error_response(str(response)):
+                try:
+                    await self.ledger_memory.update_objective_status(int(heartbeat_task_id), "completed")
+                except Exception as e:
+                    logger.warning("Failed to mark heartbeat task %s completed: %s", heartbeat_task_id, e)
+            return response
         except RequiresHITLError as hitl_err:
             state["_hitl_question"] = str(hitl_err)
             state["_hitl_created_at"] = time.time()
+            pending_owner_id = str(getattr(self, "_admin_user_id", "") or user_id)
+            if user_id == "heartbeat" and pending_owner_id == "heartbeat":
+                pending_owner_id = str(os.getenv("ADMIN_USER_ID", "heartbeat"))
+            heartbeat_task_id = self._extract_heartbeat_task_id(str(state.get("user_input") or ""))
+            if heartbeat_task_id is not None:
+                state["_heartbeat_origin_task_id"] = heartbeat_task_id
             pending_state = self._strip_audio_bytes_for_persistence(state)
-            self.pending_hitl_state[user_id] = pending_state
-            self._fire_and_forget(self.ledger_memory.save_hitl_state(user_id, pending_state))
+            self.pending_hitl_state[pending_owner_id] = pending_state
+            self._fire_and_forget(self.ledger_memory.save_hitl_state(pending_owner_id, pending_state))
+            if user_id == "heartbeat" and self.outbound_queue is not None:
+                await self.outbound_queue.put(str(hitl_err))
             return str(hitl_err)
         except Exception as e:
             logger.error(f"Graph execution failed: {e}", exc_info=True)

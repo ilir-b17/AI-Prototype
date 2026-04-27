@@ -1168,7 +1168,17 @@ class CognitiveRouter:
         if not text:
             return None
 
-        for raw in CognitiveRouter._find_json_blobs(text):
+        candidate_text = str(text or "").strip()
+        if candidate_text.startswith("```"):
+            candidate_text = re.sub(r"^```(?:json)?\s*", "", candidate_text, flags=re.IGNORECASE)
+            candidate_text = re.sub(r"\s*```$", "", candidate_text).strip()
+
+        if not (candidate_text.startswith("{") and candidate_text.endswith("}")):
+            return None
+
+        for raw in CognitiveRouter._find_json_blobs(candidate_text):
+            if raw.strip() != candidate_text:
+                continue
             try:
                 obj = json.loads(raw)
             except ValueError:
@@ -1799,13 +1809,20 @@ class CognitiveRouter:
 
         inline_tc = self._extract_inline_tool_call(result)
         if inline_tc:
+            if getattr(self, "_inline_tool_call_streak", 0) >= 1:
+                self._last_inline_tool_executed = False
+                logger.warning("Inline tool call hard cap reached; returning content as text.")
+                return RouterResult(status="ok", content=result)
             inline_name, inline_args = inline_tc
             logger.info(f"System 1 in-text tool call detected: {inline_name}")
+            self._inline_tool_call_streak = getattr(self, "_inline_tool_call_streak", 0) + 1
+            self._last_inline_tool_executed = True
             exec_result = await self._execute_tool(inline_name, inline_args)
             if exec_result.status != "ok":
                 return exec_result
             return RouterResult(status="ok", content=exec_result.content)
 
+        self._last_inline_tool_executed = False
         logger.info(f"System 1 response received ({len(result)} chars)")
         return RouterResult(status="ok", content=result)
 
@@ -1843,7 +1860,18 @@ class CognitiveRouter:
                         active_tools,
                     )
 
-                return await self._handle_text_response(message)
+                self._inline_tool_call_streak = 0
+                text_result = await self._handle_text_response(message)
+                if getattr(self, "_last_inline_tool_executed", False):
+                    follow_up = await self._chat_with_ollama(
+                        client,
+                        available_model,
+                        list(prepared_messages),
+                        tools=active_tools,
+                    )
+                    if follow_up and "message" in follow_up:
+                        text_result = await self._handle_text_response(follow_up["message"])
+                return text_result
 
         except asyncio.TimeoutError:
             error_msg = (
@@ -2680,7 +2708,10 @@ Rules:
         match = re.search(r"try again in (\d+)m(\d+(?:\.\d+)?)s", err_text)
         if match:
             cooldown_seconds = int(match.group(1)) * 60 + int(float(match.group(2)))
-        self._system2_cooldown_until = time.time() + cooldown_seconds
+        self._system2_cooldown_until = max(
+            float(getattr(self, "_system2_cooldown_until", 0.0) or 0.0),
+            time.time() + cooldown_seconds,
+        )
         # Persist cooldown so it survives a bot restart
         if self._persist_cooldown_cb is not None:
             import asyncio as _asyncio
@@ -2923,6 +2954,9 @@ Rules:
     ) -> RouterResult:
         """Route to Groq API (llama-3.3-70b or configured model) with full tool calling."""
         logger.info(f"Routing to System 2 (Groq/{self.groq_model})")
+        if getattr(self, "_system2_cooldown_until", 0.0) and time.time() < self._system2_cooldown_until:
+            msg = self._format_cooldown_message() or "Rate limited. Please try again later."
+            return RouterResult(status="ok", content=f"[System 2 - Error]: {msg}")
         try:
             response = await self._create_groq_completion(messages, allowed_tools=allowed_tools)
             choice = response.choices[0]
