@@ -8,6 +8,9 @@ from src.agents.base_domain_agent import BaseAgent
 from src.core.runtime_context import set_runtime_context
 from src.memory.ledger_db import LedgerMemory
 
+_RUN_POLL_SLEEP_SECONDS = 0.05
+_RUN_POLL_ATTEMPTS = 20
+
 
 class _SuccessDomainAgent(BaseAgent):
     allowed_tool_names = ["web_search"]
@@ -31,11 +34,7 @@ async def _seed_domain_task(ledger: LedgerMemory, *, domain: str, title: str) ->
     epic_id = await ledger.add_objective(tier="Epic", title=f"{domain} epic")
     story_id = await ledger.add_objective(tier="Story", title=f"{domain} story", parent_id=epic_id)
     task_id = await ledger.add_objective(tier="Task", title=title, parent_id=story_id)
-    await ledger._db.execute(
-        "UPDATE objective_backlog SET agent_domain = ? WHERE id = ?",
-        (domain, task_id),
-    )
-    await ledger._db.commit()
+    await ledger.set_task_agent_domain(task_id, domain)
     return task_id
 
 
@@ -58,11 +57,8 @@ async def test_poll_and_execute_completes_task_and_writes_result(tmp_path: Path)
         worked = await agent.poll_and_execute()
 
         assert worked is True
-        row_cursor = await ledger._db.execute(
-            "SELECT status, result_json FROM objective_backlog WHERE id = ?",
-            (task_id,),
-        )
-        row = await row_cursor.fetchone()
+        row = await ledger.get_task_row(task_id)
+        assert row is not None
 
         assert str(row["status"]) == "completed"
         payload = json.loads(str(row["result_json"]))
@@ -87,11 +83,8 @@ async def test_poll_and_execute_marks_failed_and_persists_error_payload(tmp_path
         worked = await agent.poll_and_execute()
 
         assert worked is True
-        row_cursor = await ledger._db.execute(
-            "SELECT status, result_json, result_written_at FROM objective_backlog WHERE id = ?",
-            (task_id,),
-        )
-        row = await row_cursor.fetchone()
+        row = await ledger.get_task_row(task_id)
+        assert row is not None
 
         assert str(row["status"]) == "failed"
         assert row["result_written_at"] is not None
@@ -120,24 +113,17 @@ async def test_run_can_start_as_background_task_and_stop(tmp_path: Path) -> None
         )
         runner = asyncio.create_task(agent.run())
 
-        for _ in range(20):
-            row_cursor = await ledger._db.execute(
-                "SELECT status FROM objective_backlog WHERE id = ?",
-                (task_id,),
-            )
-            row = await row_cursor.fetchone()
-            if str(row["status"]) == "completed":
+        for _ in range(_RUN_POLL_ATTEMPTS):
+            row = await ledger.get_task_row(task_id)
+            if row and str(row["status"]) == "completed":
                 break
-            await asyncio.sleep(0.05)
+            await asyncio.sleep(_RUN_POLL_SLEEP_SECONDS)
 
         agent.stop()
         await asyncio.wait_for(runner, timeout=2)
 
-        row_cursor = await ledger._db.execute(
-            "SELECT status FROM objective_backlog WHERE id = ?",
-            (task_id,),
-        )
-        row = await row_cursor.fetchone()
+        row = await ledger.get_task_row(task_id)
+        assert row is not None
         assert str(row["status"]) == "completed"
     finally:
         set_runtime_context(None, None, None, None)

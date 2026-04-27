@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import abc
 import asyncio
-import json
 import logging
 import time
 from typing import Any, Dict, List, Optional
@@ -45,7 +44,12 @@ class BaseAgent(abc.ABC):
         declared_tools = (
             allowed_tool_names if allowed_tool_names is not None else self.allowed_tool_names
         )
-        self.allowed_tool_names = list(dict.fromkeys(str(name).strip() for name in (declared_tools or []) if str(name).strip()))
+        clean_tool_names: List[str] = []
+        for name in declared_tools or []:
+            clean_name = str(name).strip()
+            if clean_name:
+                clean_tool_names.append(clean_name)
+        self.allowed_tool_names = list(dict.fromkeys(clean_tool_names))
         self.agent_domain = resolved_domain
         self.agent_name = str(agent_name or f"{self.__class__.__name__}:{self.agent_domain}")
 
@@ -80,17 +84,10 @@ class BaseAgent(abc.ABC):
 
     def _scope_registry_to_allowed_tools(self) -> None:
         allowed = set(self.allowed_tool_names)
-        original_skills = dict(self.skill_registry._skills)
-        original_manifests = dict(self.skill_registry._manifests)
+        available = set(self.skill_registry.get_skill_names())
+        self.skill_registry.restrict_to(self.allowed_tool_names)
 
-        self.skill_registry._skills = {
-            name: data for name, data in original_skills.items() if name in allowed
-        }
-        self.skill_registry._manifests = {
-            name: data for name, data in original_manifests.items() if name in allowed
-        }
-
-        missing = sorted(name for name in allowed if name not in original_skills)
+        missing = sorted(name for name in allowed if name not in available)
         if missing:
             logger.warning(
                 "[%s] %s: declared tools not found in SkillRegistry: %s",
@@ -106,10 +103,10 @@ class BaseAgent(abc.ABC):
             return
 
         ticks = int(elapsed // self.energy_replenish_interval_seconds)
-        if ticks <= 0:
-            return
-
-        self._energy_budget = min(self._max_energy_budget, self._energy_budget + ticks)
+        self._energy_budget = min(
+            self._max_energy_budget,
+            max(0, self._energy_budget) + ticks,
+        )
         self._last_energy_replenish_at += ticks * self.energy_replenish_interval_seconds
 
     def _try_consume_energy(self, amount: int = 1) -> bool:
@@ -125,22 +122,21 @@ class BaseAgent(abc.ABC):
         self._energy_budget = min(self._max_energy_budget, self._energy_budget + amount)
 
     async def execute_tool(self, tool_name: str, arguments: Optional[Dict[str, Any]] = None) -> str:
+        """Execute an allowed tool through this agent's scoped SkillRegistry."""
         if tool_name not in self.allowed_tool_names:
             return f"Error: Tool '{tool_name}' is not allowed for {self.agent_name}."
         return await self.skill_registry.execute(tool_name, arguments or {})
 
     async def _write_failed_result(self, ledger: LedgerMemory, task_id: int, payload: Dict[str, Any]) -> None:
-        async with ledger._lock:
-            await ledger._db.execute(
-                "UPDATE objective_backlog "
-                "SET result_json = ?, result_written_at = CURRENT_TIMESTAMP, "
-                "status = 'failed', updated_at = CURRENT_TIMESTAMP "
-                "WHERE id = ? AND tier = 'Task'",
-                (json.dumps(payload, sort_keys=True), task_id),
-            )
-            await ledger._db.commit()
+        """Persist a task failure payload to the shared blackboard."""
+        await ledger.write_task_failure(task_id, payload)
 
     async def poll_and_execute(self) -> bool:
+        """Poll one domain task, claim it, execute it, and persist the result.
+
+        Returns:
+            True when a task was claimed/handled, False when no eligible work ran.
+        """
         ledger = await self._resolve_ledger()
         pending = await ledger.get_pending_tasks_for_domain(self.agent_domain, limit=1)
         if not pending:
@@ -199,6 +195,7 @@ class BaseAgent(abc.ABC):
             return True
 
     async def run(self) -> None:
+        """Run the continuous poll loop until ``stop()`` is called."""
         logger.info("[%s] %s: domain agent loop started", self.agent_domain, self.agent_name)
         while not self._stop_event.is_set():
             try:

@@ -1264,6 +1264,67 @@ class LedgerMemory:
         if updated:
             await self.reduce_goal_state_from_task_completion(task_id)
 
+    async def write_task_failure(self, task_id: int, result: dict) -> None:
+        """Persist task failure payload and mark the Task as failed.
+
+        Args:
+            task_id: Objective backlog Task id.
+            result: Failure payload to serialize into ``result_json``.
+        """
+        if not isinstance(result, dict):
+            raise ValueError("result must be a dict")
+        result_json = json.dumps(result, sort_keys=True)
+        async with self._lock:
+            await self._db.execute(
+                "UPDATE objective_backlog "
+                "SET result_json = ?, result_written_at = CURRENT_TIMESTAMP, "
+                "status = 'failed', updated_at = CURRENT_TIMESTAMP "
+                "WHERE id = ? AND tier = 'Task'",
+                (result_json, task_id),
+            )
+            await self._db.commit()
+
+    async def set_task_agent_domain(self, task_id: int, agent_domain: str) -> None:
+        """Assign or update the agent_domain for a Task row.
+
+        Args:
+            task_id: Objective backlog Task id.
+            agent_domain: Domain label used by domain agents for filtering.
+        """
+        async with self._lock:
+            await self._db.execute(
+                "UPDATE objective_backlog "
+                "SET agent_domain = ?, updated_at = CURRENT_TIMESTAMP "
+                "WHERE id = ? AND tier = 'Task'",
+                (str(agent_domain or "").strip(), task_id),
+            )
+            await self._db.commit()
+
+    async def get_task_row(self, task_id: int) -> Optional[Dict[str, Any]]:
+        """Return a normalized Task row by id, or None when not found.
+
+        Args:
+            task_id: Objective backlog Task id.
+
+        Returns:
+            A normalized task dict containing status, claim, and result fields,
+            or ``None`` when no matching Task exists.
+        """
+        async with self._lock:
+            cursor = await self._db.execute(
+                "SELECT id, tier, title, status, priority, estimated_energy, "
+                "origin, parent_id, depends_on_ids, acceptance_criteria, "
+                "defer_count, last_energy_eval_at, next_eligible_at, last_energy_eval_json, "
+                "agent_domain, claimed_by, claimed_at, result_json, result_written_at, "
+                "created_at, updated_at "
+                "FROM objective_backlog "
+                "WHERE id = ? AND tier = 'Task' "
+                "LIMIT 1",
+                (task_id,),
+            )
+            row = await cursor.fetchone()
+        return self._normalize_objective_row(row) if row else None
+
     async def get_pending_tasks_for_domain(self, agent_domain: str, limit: int = 50) -> List[Dict[str, Any]]:
         """Return unclaimed pending Tasks for a domain, respecting next_eligible_at."""
         domain = str(agent_domain or "").strip()
