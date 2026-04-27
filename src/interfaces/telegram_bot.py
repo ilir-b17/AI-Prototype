@@ -127,11 +127,39 @@ async def _drain_outbound_queue(bot, queue: asyncio.Queue) -> None:
     """
     Background task: drains the orchestrator's outbound queue and sends
     messages to the admin via Telegram. Used by the Proactive Heartbeat.
+
+    The queue may contain either a plain string or a dict produced by
+    tool_synthesis_node when the code body exceeds 3 500 chars:
+        {"text": str, "document_path": str}
+    In the dict case the code is sent as a Telegram document and the
+    temporary file is always deleted afterwards to prevent disk leaks.
     """
     while True:
         try:
             message = await queue.get()
-            await bot.send_message(chat_id=ADMIN_USER_ID, text=message[:4096])  # Telegram max length
+            if isinstance(message, dict):
+                text = str(message.get("text") or "")[:4096]
+                document_path: str | None = message.get("document_path")
+                await bot.send_message(chat_id=ADMIN_USER_ID, text=text)
+                if document_path and os.path.isfile(document_path):
+                    try:
+                        with open(document_path, "rb") as doc_file:
+                            await bot.send_document(
+                                chat_id=ADMIN_USER_ID,
+                                document=doc_file,
+                                filename=os.path.basename(document_path),
+                            )
+                    finally:
+                        try:
+                            os.unlink(document_path)
+                        except OSError as unlink_err:
+                            logger.warning(
+                                "Could not delete synthesis temp file %s: %s",
+                                document_path,
+                                unlink_err,
+                            )
+            else:
+                await bot.send_message(chat_id=ADMIN_USER_ID, text=str(message)[:4096])
             queue.task_done()
         except Exception as e:
             logger.error(f"Failed to send admin notification: {e}", exc_info=True)

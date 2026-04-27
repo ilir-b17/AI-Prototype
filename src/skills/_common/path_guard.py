@@ -8,6 +8,8 @@ _DEFAULT_DOWNLOADS_DIR = os.path.join(_PROJECT_ROOT, "downloads")
 _PROJECT_DENY_PATHS = (
     os.path.realpath(os.path.join(_PROJECT_ROOT, "data")),
     os.path.realpath(os.path.join(_PROJECT_ROOT, ".env")),
+    os.path.realpath(os.path.join(_PROJECT_ROOT, ".git")),
+    os.path.realpath(os.path.join(_PROJECT_ROOT, ".github")),
     os.path.realpath(os.path.join(_PROJECT_ROOT, "logs")),
     os.path.realpath(os.path.join(_PROJECT_ROOT, "src", "skills", "_pending")),
 )

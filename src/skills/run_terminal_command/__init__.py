@@ -3,12 +3,21 @@ import json
 import logging
 import os
 import shlex
-from typing import List
+from typing import List, Optional
+
+from src.skills._common.path_guard import get_default_allowed_roots, resolve_confined_path
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_ALLOWLIST = "git status,ls,dir,wc,echo,cat,type,pwd,hostname"
+# 'cat' and 'type' are removed from the default allowlist because they can read
+# arbitrary files (SSH keys, /etc/passwd, etc.).  File reading is handled by the
+# manage_file_system skill which applies path_guard confinement.
+DEFAULT_ALLOWLIST = "git status,ls,dir,wc,echo,pwd,hostname"
 SHELL_METACHARACTERS = set(";&|<>`$")
+
+# Commands that accept a filesystem path argument must have that path confined to
+# the configured allowed roots so they cannot list/stat sensitive directories.
+_PATH_ARGUMENT_COMMANDS: frozenset = frozenset({"ls", "dir", "wc"})
 
 
 def _get_timeout_seconds() -> float:
@@ -77,6 +86,29 @@ def _is_allowlisted_command(argv: List[str]) -> bool:
     lowered = [str(token).strip().lower() for token in argv]
     return any(lowered[:len(prefix)] == prefix for prefix in _allowlisted_prefixes())
 
+
+def _check_path_argument(argv: List[str]) -> Optional[str]:
+    """
+    For commands that accept a filesystem path argument (ls, dir, wc), verify
+    that every non-flag argument resolves within the configured allowed roots.
+    Returns an error string on a path violation, or None if the arguments are safe.
+    """
+    cmd = argv[0].lower() if argv else ""
+    if cmd not in _PATH_ARGUMENT_COMMANDS:
+        return None
+    path_args = [arg for arg in argv[1:] if not arg.startswith("-")]
+    if not path_args:
+        # No explicit path — command operates on CWD (project root), which is safe.
+        return None
+    allowed_roots = get_default_allowed_roots()
+    for path_arg in path_args:
+        try:
+            resolve_confined_path(path_arg, allowed_roots)
+        except (PermissionError, ValueError, OSError):
+            return f"Path argument '{path_arg}' is outside the allowed roots."
+    return None
+
+
 async def run_terminal_command(command: str) -> str:
     """
     Execute allowlisted terminal commands without invoking a shell.
@@ -85,6 +117,8 @@ async def run_terminal_command(command: str) -> str:
     - Reject shell metacharacters outside quoted strings.
     - Parse into argv and execute with create_subprocess_exec (no shell).
     - Enforce first-token allowlist from AIDEN_TERMINAL_ALLOWLIST.
+    - For commands that accept path arguments (ls, dir, wc), confine those
+      paths to the configured allowed roots via path_guard.
     """
     logger.info(f"run_terminal_command called with command: {command}")
 
@@ -112,6 +146,10 @@ async def run_terminal_command(command: str) -> str:
         return _security_error(
             f"Command '{' '.join(argv[:2])}' is not in the allowlist."
         )
+
+    path_err = _check_path_argument(argv)
+    if path_err:
+        return _security_error(path_err)
 
     timeout_seconds = _get_timeout_seconds()
 
