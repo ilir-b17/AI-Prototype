@@ -3074,7 +3074,7 @@ class Orchestrator:
 
     @staticmethod
     def _is_error_response(response: str) -> bool:
-        return any(str(response or '').startswith(prefix) for prefix in _ERROR_RESPONSE_PREFIXES)
+        return any(str(response or "").startswith(prefix) for prefix in _ERROR_RESPONSE_PREFIXES)
 
     async def _persist_chat_turns(
         self,
