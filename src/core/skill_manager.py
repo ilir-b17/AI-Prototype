@@ -307,6 +307,65 @@ class SkillRegistry:
         """All loaded tool schemas, ready to pass to Ollama / Groq."""
         return [s["schema"] for s in self._skills.values()]
 
+    @classmethod
+    def _normalize_json_schema(cls, schema: Any) -> Dict[str, Any]:
+        if not isinstance(schema, dict):
+            return {"type": "object", "properties": {}}
+
+        normalized = dict(schema)
+        schema_type = str(normalized.get("type") or "").strip()
+        if not schema_type:
+            schema_type = "object"
+            normalized["type"] = schema_type
+
+        properties = normalized.get("properties")
+        if schema_type == "object":
+            if not isinstance(properties, dict):
+                properties = {}
+            normalized["properties"] = properties
+            required = normalized.get("required")
+            if not isinstance(required, list):
+                required = []
+            invalid_required = [item for item in required if isinstance(item, str) and item not in properties]
+            if invalid_required:
+                logger.debug(
+                    "Dropping invalid required field(s) not present in properties: %s",
+                    ", ".join(sorted(set(invalid_required))),
+                )
+            valid_required = [str(item) for item in required if isinstance(item, str) and item in properties]
+            normalized["required"] = valid_required
+            if "additionalProperties" not in normalized:
+                normalized["additionalProperties"] = False
+
+        if isinstance(properties, dict):
+            normalized["properties"] = {
+                key: cls._normalize_json_schema(value) if isinstance(value, dict) else value
+                for key, value in properties.items()
+            }
+        return normalized
+
+    def get_native_function_schemas(self) -> List[Dict[str, Any]]:
+        """Tool schemas normalized for native LLM function calling."""
+        native_schemas: List[Dict[str, Any]] = []
+        for skill in self._skills.values():
+            schema = dict(skill.get("schema") or {})
+            tool_name = str(schema.get("name") or "").strip()
+            if not tool_name:
+                continue
+            description = str(schema.get("description") or "").strip()
+            parameters = self._normalize_json_schema(schema.get("parameters"))
+            native_schemas.append(
+                {
+                    "type": "function",
+                    "function": {
+                        "name": tool_name,
+                        "description": description,
+                        "parameters": parameters,
+                    },
+                }
+            )
+        return native_schemas
+
     def get_load_errors(self) -> List[Tuple[str, str]]:
         """Return skill folders that failed to load and their error messages."""
         return list(self._load_errors)

@@ -4073,23 +4073,27 @@ class Orchestrator:
         )
 
     async def _run_graph_loop(self, state: Dict[str, Any], user_id: str, user_message: str) -> str:
-        """Execute the supervisor → workers → critic loop. Returns the final sanitized response."""
-        return await graph_runner.run_graph_loop(
-            state,
-            user_id,
-            user_message,
-            deps=graph_runner.GraphLoopDeps(
-                normalize_state=normalize_state,
-                consume_blocked_result=self._consume_blocked_result,
-                apply_critic_retry_instructions=self._apply_critic_retry_instructions,
-                run_graph_pass=self._run_graph_pass,
-                reset_after_critic_rejection=self._reset_after_critic_rejection,
-                ensure_final_response=self._ensure_final_response,
-                finalize_user_response=self._finalize_user_response,
-                sanitizer=self.cognitive_router.sanitize_response,
-                log=logger,
-            ),
-        )
+        """Execute the flattened ReAct tool-calling loop and finalize the response."""
+        state = normalize_state(state)
+        compiled_graph = getattr(self, "_compiled_graph", None)
+        if compiled_graph is None:
+            compiled_graph = build_orchestrator_graph(self)
+            self._compiled_graph = compiled_graph
+
+        if compiled_graph is None:
+            return await self._finalize_user_response(
+                user_id,
+                user_message,
+                "No valid response could be generated.",
+            )
+
+        state = await compiled_graph.ainvoke(state)
+        blocked_response = await self._consume_blocked_result(state, user_id)
+        if blocked_response is not None:
+            return blocked_response
+
+        final_response = str(state.get("final_response") or "No valid response could be generated.")
+        return await self._finalize_user_response(user_id, user_message, final_response)
 
     async def _try_resume_tool_approval_compat(self, user_id: str, user_message: str) -> Optional[Any]:
         return await pending_state.try_resume_tool_approval_compat(
