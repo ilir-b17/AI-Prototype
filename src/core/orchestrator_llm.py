@@ -3,7 +3,6 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import re
 import time
 from typing import Any, Dict, List, Optional
 
@@ -77,6 +76,8 @@ class _LLMGatewayMixin:
         allowed_tools: Optional[List[str]] = None,
         purpose: str = "system_2",
         allow_sensitive_context: bool = False,
+        response_schema: Optional[Dict[str, Any]] = None,
+        response_schema_name: str = "structured_output",
     ) -> RouterResult:
         minimized_messages = cloud_redaction.redact_messages_for_cloud(
             messages,
@@ -95,9 +96,19 @@ class _LLMGatewayMixin:
             allow_sensitive_context=allow_sensitive_context,
             payload_sha256=cloud_redaction.compute_payload_sha256(minimized_messages, allowed_tools),
         )
+        route_kwargs: Dict[str, Any] = {"allowed_tools": allowed_tools}
+        if response_schema is not None:
+            route_kwargs["response_format"] = {
+                "type": "json_schema",
+                "json_schema": {
+                    "name": response_schema_name,
+                    "schema": response_schema,
+                    "strict": True,
+                },
+            }
         return await self.cognitive_router.route_to_system_2(
             minimized_messages,
-            allowed_tools=allowed_tools,
+            **route_kwargs,
         )
 
     def _get_system_1_gate_metrics(self) -> Dict[str, Any]:
@@ -148,11 +159,22 @@ class _LLMGatewayMixin:
         deadline_seconds: Optional[float] = None,
         context: str = "orchestrator",
         max_output_tokens: Optional[int] = None,
+        response_schema: Optional[Dict[str, Any]] = None,
+        response_schema_name: str = "structured_output",
     ) -> RouterResult:
         before_metrics = self._get_system_1_gate_metrics()
         route_kwargs: Dict[str, Any] = {"allowed_tools": allowed_tools}
         if max_output_tokens is not None:
             route_kwargs["max_output_tokens"] = max_output_tokens
+        if response_schema is not None:
+            route_kwargs["response_format"] = {
+                "type": "json_schema",
+                "json_schema": {
+                    "name": response_schema_name,
+                    "schema": response_schema,
+                    "strict": True,
+                },
+            }
         route_call = self.cognitive_router.route_to_system_1(messages, **route_kwargs)
         try:
             if deadline_seconds is None:
@@ -425,26 +447,43 @@ class _LLMGatewayMixin:
             f"Problem Description: {escalation_problem}\n\n"
             f"Context Scratchpad: {escalation_context}\n\n"
             "Please provide a direct solution to the user's problem. "
-            "Additionally, generate a brief 'Reasoning Blueprint' on how to solve this class of problem. "
-            "You MUST format your output strictly using XML tags:\n"
-            "<solution> The actual answer to the user's problem... </solution>\n"
-            "<blueprint> How to solve this problem: Step 1, Step 2... </blueprint>"
+            "Additionally, generate a brief 'Reasoning Blueprint' on how to solve this class of problem."
         )
 
         messages = [{"role": "user", "content": prompt}]
+        response_schema = {
+            "type": "object",
+            "properties": {
+                "solution": {"type": "string"},
+                "blueprint": {"type": "string"},
+            },
+            "required": ["solution", "blueprint"],
+            "additionalProperties": False,
+        }
         sys2_result = await self._route_to_system_2_redacted(
             messages,
             purpose="cognitive_escalation",
             allow_sensitive_context=False,
+            response_schema=response_schema,
+            response_schema_name="cognitive_escalation_response",
         )
 
-        content = sys2_result.content if sys2_result.status == "ok" else "[System 2 - Error]: Escalation failed."
+        if sys2_result.status != "ok":
+            return "[System 2 - Error]: Escalation failed."
 
-        solution_match = re.search(r"<solution>(.*?)</solution>", content, flags=re.DOTALL | re.IGNORECASE)
-        blueprint_match = re.search(r"<blueprint>(.*?)</blueprint>", content, flags=re.DOTALL | re.IGNORECASE)
+        content = sys2_result.content
+        if not isinstance(content, dict):
+            return "[System 2 - Error]: Escalation failed."
 
-        solution_text = solution_match.group(1).strip() if solution_match else content.strip()
-        blueprint_text = blueprint_match.group(1).strip() if blueprint_match else None
+        solution_text = str(content.get("solution") or "").strip()
+        blueprint_text = content.get("blueprint")
+        if isinstance(blueprint_text, str):
+            blueprint_text = blueprint_text.strip()
+        else:
+            blueprint_text = None
+
+        if not solution_text:
+            solution_text = "[System 2 - Error]: Escalation failed."
 
         if blueprint_text:
             # Inject into current turn so downstream nodes can use it.
