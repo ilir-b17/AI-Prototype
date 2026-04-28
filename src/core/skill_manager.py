@@ -326,6 +326,12 @@ class SkillRegistry:
             required = normalized.get("required")
             if not isinstance(required, list):
                 required = []
+            invalid_required = [item for item in required if isinstance(item, str) and item not in properties]
+            if invalid_required:
+                logger.debug(
+                    "Dropping invalid required field(s) not present in properties: %s",
+                    ", ".join(sorted(set(invalid_required))),
+                )
             valid_required = [str(item) for item in required if isinstance(item, str) and item in properties]
             normalized["required"] = valid_required
             if "additionalProperties" not in normalized:

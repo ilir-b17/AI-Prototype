@@ -18,6 +18,7 @@ class ReActWorkflow:
     def __init__(self, orchestrator: "Orchestrator") -> None:
         self.orchestrator = orchestrator
         self.max_iterations = 12
+        self.llm_deadline_seconds = 150.0
 
     async def ainvoke(self, state: Dict[str, Any]) -> Dict[str, Any]:
         state = dict(state or {})
@@ -29,9 +30,8 @@ class ReActWorkflow:
             return state
 
         messages = await self._build_messages(state, user_input)
-        tool_schemas, allowed_tools = self._resolve_tooling()
-
         for _ in range(self.max_iterations):
+            tool_schemas, allowed_tools = self._resolve_tooling()
             router_result = await self._call_llm(messages, tool_schemas, allowed_tools)
             if str(getattr(router_result, "status", "ok")) != "ok":
                 state["_blocked_result"] = router_result
@@ -142,7 +142,7 @@ class ReActWorkflow:
             messages.append({"role": "user", "content": user_input})
         return messages
 
-    def _resolve_tooling(self) -> tuple[List[Dict[str, Any]], List[str]]:
+    def _resolve_tooling(self) -> Tuple[List[Dict[str, Any]], List[str]]:
         registry = getattr(getattr(self.orchestrator, "cognitive_router", None), "registry", None)
         if registry is None:
             return [], []
@@ -170,7 +170,10 @@ class ReActWorkflow:
         allowed_tools: List[str],
     ) -> Any:
         route = getattr(self.orchestrator, "_route_to_system_1", None)
-        kwargs: Dict[str, Any] = {"context": "react_loop", "deadline_seconds": 150.0}
+        kwargs: Dict[str, Any] = {
+            "context": "react_loop",
+            "deadline_seconds": self.llm_deadline_seconds,
+        }
         if callable(route):
             params = inspect.signature(route).parameters
             if "allowed_tools" in params:
@@ -184,12 +187,19 @@ class ReActWorkflow:
             return {"status": "ok", "content": "No router available."}
 
         params = inspect.signature(route).parameters
-        kwargs = {}
+        router_kwargs = {
+            "context": "react_loop",
+            "deadline_seconds": self.llm_deadline_seconds,
+        }
+        if "context" not in params:
+            router_kwargs.pop("context", None)
+        if "deadline_seconds" not in params:
+            router_kwargs.pop("deadline_seconds", None)
         if "allowed_tools" in params:
-            kwargs["allowed_tools"] = allowed_tools
+            router_kwargs["allowed_tools"] = allowed_tools
         if "tools" in params:
-            kwargs["tools"] = tool_schemas
-        return await route(messages, **kwargs)
+            router_kwargs["tools"] = tool_schemas
+        return await route(messages, **router_kwargs)
 
     @staticmethod
     def _extract_payload(router_result: Any) -> Any:
