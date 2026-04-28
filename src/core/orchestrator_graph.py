@@ -1760,15 +1760,6 @@ class _GraphNodesMixin:
                     state=state,
                 )
 
-            reply = await self._try_fast_path_response(state)
-            if reply is not None:
-                return await self._call_finalize_user_response(
-                    effective_user_id,
-                    user_message,
-                    reply,
-                    state=state,
-                )
-
         try:
             response = await self._run_graph_loop(state, effective_user_id, user_message)
             if bool(state.get("_resumed_from_hitl")) and heartbeat_task_id is not None:
