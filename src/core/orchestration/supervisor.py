@@ -33,7 +33,7 @@ class SupervisorNodeDeps:
     build_user_prompt_message: Callable[[Dict[str, Any]], Dict[str, Any]]
     route_supervisor_request: Callable[[List[Dict[str, Any]]], Awaitable[Optional[Any]]]
     handle_cognitive_escalation: Callable[[Dict[str, Any], Any], Awaitable[str]]
-    parse_supervisor_response: Callable[[str, Dict[str, Any]], Dict[str, Any]]
+    parse_supervisor_response: Optional[Callable[[Any, Dict[str, Any]], Dict[str, Any]]]
     build_supervisor_prompt: Callable[..., str]
     charter_text: str
     prompt_config: Any
@@ -155,9 +155,9 @@ async def _apply_supervisor_router_result(
         state[deps.blocked_key] = router_result
         return state
 
-    response = router_result.content if router_result else None
-    if not response or response.startswith(deps.system_1_error_prefix) or response.startswith("[System 2"):
-        deps.log.warning("Supervisor received error or no response: %r", response)
+    response_payload = router_result.content if router_result else None
+    if not isinstance(response_payload, dict):
+        deps.log.warning("Supervisor received non-structured payload: %r", response_payload)
         state["current_plan"] = []
         if not deps.cognitive_router.get_system_2_available():
             state["final_response"] = (
@@ -170,7 +170,29 @@ async def _apply_supervisor_router_result(
             state["final_response"] = "Both local and cloud reasoning failed on this request. Please try rephrasing or simplifying the task."
         return state
 
-    return deps.parse_supervisor_response(response, state)
+    plan = response_payload.get("workers")
+    if not isinstance(plan, list):
+        plan = response_payload.get("current_plan")
+
+    if isinstance(plan, list):
+        state["current_plan"] = plan
+    else:
+        state["current_plan"] = []
+
+    supervisor_context = response_payload.get("supervisor_context")
+    if isinstance(supervisor_context, str) and supervisor_context.strip():
+        state["worker_outputs"]["supervisor_context"] = supervisor_context.strip()
+
+    final_response = response_payload.get("final_response")
+    if not isinstance(final_response, str):
+        final_response = response_payload.get("answer")
+    if isinstance(final_response, str):
+        final_response = final_response.strip()
+
+    if not state["current_plan"]:
+        state["final_response"] = final_response or "No valid response could be generated."
+
+    return state
 
 
 async def supervisor_node(state: Dict[str, Any], *, deps: SupervisorNodeDeps) -> Dict[str, Any]:
