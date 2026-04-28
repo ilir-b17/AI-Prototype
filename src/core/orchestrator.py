@@ -43,10 +43,9 @@ from src.core.state_model import AgentState, normalize_state
 from src.core.workflow_graph import build_orchestrator_graph
 from src.core.security import validate_mfa_configuration, verify_mfa_challenge
 from src.core.orchestration import capabilities as capability_helpers
-from src.core.orchestration import agent_executor, energy as energy_service, graph_runner, llm_gateway
-from src.core.orchestration import memory_service, moral_governor, pending_state, schedulers
-from src.core.orchestration import plan_normalization, prompt_payload, supervisor_parsing
-from src.core.orchestration import supervisor as supervisor_service
+from src.core.orchestration import energy as energy_service, llm_gateway
+from src.core.orchestration import memory_service, pending_state, schedulers
+from src.core.orchestration import prompt_payload
 from src.core.progress import ProgressEmitter, reset_emitter, set_current_emitter
 from src.core.nocturnal_consolidation import NocturnalConsolidationSlice1
 from src.core.goal_planner import GoalPlanner, PlanningResult
@@ -71,10 +70,8 @@ except ImportError:
 
 logger = logging.getLogger(__name__)
 
-
 class RequiresHITLError(RuntimeError):
     """Raised when a request requires human-in-the-loop approval."""
-
 
 # Energy costs per operation
 ENERGY_COST_SUPERVISOR = 10
@@ -201,7 +198,6 @@ _CATALOG_META_TOOL_NAMES = {
     "escalate_to_system_2",
 }
 
-
 def _build_safe_subprocess_env() -> Dict[str, str]:
     safe_env: Dict[str, str] = {
         key: value
@@ -213,14 +209,13 @@ def _build_safe_subprocess_env() -> Dict[str, str]:
     safe_env.setdefault("PYTHONUNBUFFERED", "1")
     return safe_env
 
-
 class Orchestrator:
     """
     Central orchestration engine using a State Graph architecture.
 
     State Dictionary schema:
-        user_id, user_input, current_plan, worker_outputs,
-        final_response, iteration_count, admin_guidance, energy_remaining
+        user_id, user_input, final_response, iteration_count,
+        admin_guidance, energy_remaining
 
     Lifecycle:
         1. ``__init__`` — synchronous; creates memory objects (no DB I/O yet).
@@ -1767,275 +1762,10 @@ class Orchestrator:
         return energy_service.refund_energy(state, amount, reason, log=logger)
 
     @staticmethod
-    def _merge_plan_text(existing: str, incoming: str) -> str:
-        return plan_normalization.merge_plan_text(existing, incoming)
 
-    @staticmethod
-    def _make_plan_step(
-        agent_name: str,
-        *,
-        task: str = "",
-        reason: str = "",
-        depends_on: Optional[List[str]] = None,
-        preferred_model: str = "",
-    ) -> Dict[str, Any]:
-        return plan_normalization.make_plan_step(
-            agent_name,
-            task=task,
-            reason=reason,
-            depends_on=depends_on,
-            preferred_model=preferred_model,
-        )
-
-    @staticmethod
-    def _normalize_plan_dependencies(raw_dependencies: Any) -> List[str]:
-        return plan_normalization.normalize_plan_dependencies(raw_dependencies)
-
-    @staticmethod
-    def _merge_plan_dependencies(existing: List[str], incoming: List[str]) -> List[str]:
-        return plan_normalization.merge_plan_dependencies(existing, incoming)
-
-    @staticmethod
-    def _normalize_model_preference(raw_value: Any) -> str:
-        return plan_normalization.normalize_model_preference(raw_value)
-
-    @staticmethod
-    def _normalize_plan_step(step: Any) -> Optional[Dict[str, Any]]:
-        return plan_normalization.normalize_plan_step(step)
-
-    def _normalize_current_plan(self, plan: List[Any]) -> List[Dict[str, Any]]:
-        return plan_normalization.normalize_current_plan(plan)
-
-    def _get_requested_plan_steps(self, state: Dict[str, Any]) -> List[Dict[str, Any]]:
-        return self._normalize_current_plan(list(state.get("current_plan", []) or []))
-
-    @staticmethod
-    def _get_real_worker_outputs(state: Dict[str, Any]) -> Dict[str, str]:
-        return {
-            name: output
-            for name, output in dict(state.get("worker_outputs", {}) or {}).items()
-            if name != "supervisor_context"
-        }
-
-    def _get_step_dependencies(
-        self,
-        step: Optional[Dict[str, Any]],
-        agent_def: Optional[AgentDefinition] = None,
-    ) -> List[str]:
-        step = step or self._make_plan_step("")
-        if agent_def is None and step.get("agent"):
-            agent_def = self._get_agent_registry().get(step["agent"])
-
-        static_dependencies = list(agent_def.depends_on) if agent_def is not None else []
-        dynamic_dependencies = self._normalize_plan_dependencies(step.get("depends_on"))
-        return self._merge_plan_dependencies(static_dependencies, dynamic_dependencies)
-
-    def _get_step_preferred_model(
-        self,
-        step: Optional[Dict[str, Any]],
-        agent_def: Optional[AgentDefinition],
-    ) -> str:
-        step_preference = self._normalize_model_preference((step or {}).get("preferred_model"))
-        if step_preference:
-            return step_preference
-        agent_preference = self._normalize_model_preference(agent_def.preferred_model if agent_def else "")
-        return agent_preference or "system_1"
-
-    def _collect_agent_dependencies(
-        self,
-        agent_name: str,
-        step_map: Optional[Dict[str, Dict[str, Any]]] = None,
-        visiting: Optional[set] = None,
-    ) -> set:
-        registry = self._get_agent_registry()
-        agent_def = registry.get(agent_name)
-        step = (step_map or {}).get(agent_name, self._make_plan_step(agent_name))
-        if agent_def is None and not step.get("depends_on"):
-            return set()
-
-        visiting = visiting or set()
-        if agent_name in visiting:
-            return set()
-
-        visiting.add(agent_name)
-        dependencies = set()
-        for dependency in self._get_step_dependencies(step, agent_def):
-            dependencies.add(dependency)
-            dependencies |= self._collect_agent_dependencies(dependency, step_map, visiting)
-        visiting.remove(agent_name)
-        return dependencies
-
-    def _should_combine_requested_outputs(self, requested_steps: List[Dict[str, Any]]) -> bool:
-        requested_names = [step["agent"] for step in requested_steps]
-        if len(requested_names) <= 1:
-            return False
-
-        step_map = {step["agent"]: step for step in requested_steps}
-        requested_set = set(requested_names)
-        for agent_name in requested_names:
-            if self._collect_agent_dependencies(agent_name, step_map) & requested_set:
-                return False
-        return True
-
-    def _get_output_to_evaluate(self, state: Dict[str, Any]) -> str:
-        """Return the requested agent output, combining independent outputs when needed."""
-        real_outputs = self._get_real_worker_outputs(state)
-        if not real_outputs:
-            return state.get("final_response", "")
-
-        requested_steps = self._get_requested_plan_steps(state)
-        requested_outputs = [
-            (step["agent"], real_outputs[step["agent"]])
-            for step in requested_steps
-            if step["agent"] in real_outputs
-        ]
-
-        if not requested_outputs:
-            last_worker = list(real_outputs.keys())[-1]
-            return real_outputs[last_worker]
-
-        if len(requested_outputs) == 1 or not self._should_combine_requested_outputs(requested_steps):
-            return requested_outputs[-1][1]
-
-        return "\n\n".join(
-            f"{agent_name}:\n{output}"
-            for agent_name, output in requested_outputs
-        )
-
-    def _should_run_critic_review(self, state: Dict[str, Any], output_to_eval: str) -> bool:
-        if not output_to_eval:
-            return False
-
-        real_outputs = self._get_real_worker_outputs(state)
-        if not real_outputs:
-            return False
-
-        if state.get("critic_instructions"):
-            return True
-
-        if output_to_eval.strip().lower().startswith("error:"):
-            return False
-
-        requested_steps = self._get_requested_plan_steps(state)
-        requested_output_count = sum(1 for step in requested_steps if step["agent"] in real_outputs)
-
-        if requested_output_count > 1:
-            return True
-
-        return len(output_to_eval.strip()) >= _CRITIC_SHORT_OUTPUT_THRESHOLD
-
-    @staticmethod
-    def _store_moral_decision_trace(state: Dict[str, Any], decision: MoralDecision) -> None:
-        state["moral_decision"] = decision.to_dict()
-        state["moral_audit_mode"] = str(decision.decision_mode)
-        state["moral_audit_trace"] = str(decision.bypass_reason or decision.reasoning)
-        state["moral_audit_bypassed"] = decision.decision_mode in {"triviality_bypass", "local_skip"}
-
-    @staticmethod
     def _contains_any_hint(text: str, hints: tuple[str, ...]) -> bool:
         lowered = str(text or "").lower()
         return any(hint in lowered for hint in hints)
-
-    def _build_moral_triviality_text(self, state: Dict[str, Any], output_to_eval: str) -> str:
-        parts: List[str] = [
-            str(state.get("user_input") or ""),
-            str(output_to_eval or ""),
-        ]
-        for step in state.get("current_plan", []) or []:
-            if isinstance(step, dict):
-                parts.append(str(step.get("agent") or ""))
-                parts.append(str(step.get("task") or ""))
-                parts.append(str(step.get("reason") or ""))
-            else:
-                parts.append(str(step))
-        return "\n".join(part for part in parts if part)
-
-    def _is_triviality_bypass_blocked(
-        self,
-        state: Dict[str, Any],
-        inspection_text: str,
-        output_to_eval: str,
-    ) -> bool:
-        if state.get("critic_instructions"):
-            return True
-        if int(state.get("iteration_count") or 0) > 0:
-            return True
-        if not str(output_to_eval or "").strip():
-            return True
-        if not str(inspection_text or "").strip():
-            return True
-        if self._contains_any_hint(inspection_text, _MORAL_TRIVIALITY_BLOCK_HINTS):
-            return True
-        if len(state.get("current_plan", []) or []) > 1:
-            return True
-        return False
-
-    def _try_triviality_bypass_decision(
-        self,
-        state: Dict[str, Any],
-        output_to_eval: str,
-    ) -> Optional[MoralDecision]:
-        inspection_text = self._build_moral_triviality_text(state, output_to_eval)
-        if self._is_triviality_bypass_blocked(state, inspection_text, output_to_eval):
-            return None
-
-        user_input = str(state.get("user_input") or "").strip()
-        if not user_input:
-            return None
-
-        if self._contains_any_hint(inspection_text, _MORAL_TRIVIALITY_READ_ONLY_HINTS):
-            return build_triviality_bypass_decision("keyword_read_only")
-
-        return None
-
-    async def _spawn_debug_task(self, state: Dict[str, Any]) -> None:
-        """Inject a high-priority debug Task into the backlog after 3 critic failures."""
-        try:
-            real_outputs = self._get_real_worker_outputs(state)
-            last_worker = list(real_outputs.keys())[-1] if real_outputs else "unknown"
-            task_title = f"Debug failing [{last_worker}] logic for: {state.get('user_input', '')[:80]}"
-            await self.ledger_memory.add_objective(
-                tier="Task",
-                title=task_title,
-                estimated_energy=20,
-                origin="Critic",
-                priority=2,
-            )
-            logger.info(f"Critic: injected debug Task into backlog after 3 failures: {task_title!r}")
-        except Exception as spawn_err:
-            logger.warning(f"Critic: failed to spawn debug objective: {spawn_err}")
-
-    async def _route_supervisor_request(self, messages: List[Dict]) -> Optional["RouterResult"]:
-        """Try System 1, fall back to System 2.  Returns None on total failure."""
-        return await supervisor_service.route_supervisor_request(
-            messages,
-            deps=supervisor_service.SupervisorRouteDeps(
-                route_to_system_1=self._route_to_system_1,
-                route_to_system_2_redacted=self._route_to_system_2_redacted,
-                is_system_1_error=self._is_system_1_error,
-                cognitive_router=self.cognitive_router,
-                log=logger,
-            ),
-        )
-
-    @staticmethod
-    def _extract_workers_payload(response: str) -> tuple[str, Optional[str]]:
-        return supervisor_parsing.extract_workers_payload(response)
-
-    @staticmethod
-    def _decode_workers_payload(workers_payload: str) -> Optional[Any]:
-        return supervisor_parsing.decode_workers_payload(workers_payload, log=logger)
-
-    @staticmethod
-    def _is_structured_plan_packet(step: Any) -> bool:
-        return supervisor_parsing.is_structured_plan_packet(step)
-
-    def _is_structured_plan_payload(self, payload: Any) -> bool:
-        return supervisor_parsing.is_structured_plan_payload(payload)
-
-    def _parse_supervisor_response(self, response: str, state: Dict[str, Any]) -> Dict[str, Any]:
-        """Parse the WORKERS tag from *response* and update *state* in-place."""
-        return supervisor_parsing.parse_supervisor_response(response, state, log=logger)
 
     def _get_agent_registry(self) -> AgentRegistry:
         registry = getattr(self, "agent_registry", None)
@@ -2050,279 +1780,6 @@ class Orchestrator:
         if not agents:
             return "- No registered agents available."
         return "\n".join(f"- {agent.name}: {agent.description}" for agent in agents)
-
-    def _build_agent_handoff(
-        self,
-        agent_def: AgentDefinition,
-        state: Dict[str, Any],
-        task_packet: Optional[Dict[str, Any]] = None,
-    ) -> str:
-        lines = [f"User request: {state.get('user_input', '')}"]
-        task_packet = task_packet or self._make_plan_step(agent_def.name)
-
-        supervisor_context = state.get("worker_outputs", {}).get("supervisor_context", "")
-        if supervisor_context:
-            lines.append(f"Supervisor context: {supervisor_context}")
-
-        task_text = str(task_packet.get("task", "")).strip()
-        reason_text = str(task_packet.get("reason", "")).strip()
-        if task_text:
-            lines.append(f"Your task: {task_text}")
-        if reason_text:
-            lines.append(f"Why you were selected: {reason_text}")
-
-        dependency_outputs = []
-        for dependency in self._get_step_dependencies(task_packet, agent_def):
-            dependency_output = state.get("worker_outputs", {}).get(dependency, "")
-            if dependency_output:
-                dependency_outputs.append(f"{dependency}: {dependency_output}")
-
-        if dependency_outputs:
-            lines.append("Relevant prior agent outputs:")
-            lines.extend(dependency_outputs)
-
-        return "<supervisor_handoff>\n" + "\n".join(lines) + "\n</supervisor_handoff>"
-
-    def _merge_execution_step(
-        self,
-        step_map: Dict[str, Dict[str, Any]],
-        step: Dict[str, Any],
-    ) -> bool:
-        agent_name = step["agent"]
-        existing = step_map.get(agent_name)
-        if existing is None:
-            return False
-        existing["task"] = self._merge_plan_text(existing["task"], step.get("task", ""))
-        existing["reason"] = self._merge_plan_text(existing["reason"], step.get("reason", ""))
-        existing["depends_on"] = self._merge_plan_dependencies(
-            existing.get("depends_on", []),
-            self._normalize_plan_dependencies(step.get("depends_on")),
-        )
-        existing["preferred_model"] = existing.get("preferred_model") or step.get("preferred_model", "")
-        return True
-
-    def _visit_execution_step(
-        self,
-        step: Dict[str, Any],
-        registry: AgentRegistry,
-        step_map: Dict[str, Dict[str, Any]],
-        step_order: Dict[str, int],
-        visiting: set,
-        order_counter: int,
-        skipped_cycles: Optional[List[str]] = None,
-    ) -> int:
-        agent_name = step["agent"]
-        if self._merge_execution_step(step_map, step):
-            return order_counter
-        if agent_name in visiting:
-            logger.warning("Dependency cycle detected while planning agent %r — skipping.", agent_name)
-            if skipped_cycles is not None:
-                skipped_cycles.append(agent_name)
-            return order_counter
-
-        agent_def = registry.get(agent_name)
-        if agent_def is None:
-            logger.warning("Unknown agent requested by supervisor: %r", agent_name)
-            return order_counter
-
-        visiting.add(agent_name)
-        for dependency in self._get_step_dependencies(step, agent_def):
-            order_counter = self._visit_execution_step(
-                self._make_plan_step(dependency),
-                registry,
-                step_map,
-                step_order,
-                visiting,
-                order_counter,
-                skipped_cycles,
-            )
-        visiting.remove(agent_name)
-
-        step_map[agent_name] = dict(step)
-        step_order[agent_name] = order_counter
-        return order_counter + 1
-
-    def _resolve_execution_depth(
-        self,
-        agent_name: str,
-        registry: AgentRegistry,
-        step_map: Dict[str, Dict[str, Any]],
-        depth_cache: Dict[str, int],
-        resolving_depth: set,
-    ) -> int:
-        if agent_name in depth_cache:
-            return depth_cache[agent_name]
-        if agent_name in resolving_depth:
-            logger.warning("Dependency depth cycle detected for agent %r", agent_name)
-            return 0
-
-        resolving_depth.add(agent_name)
-        agent_def = registry.get(agent_name)
-        dependency_depths = []
-        if agent_def is not None or agent_name in step_map:
-            step = step_map.get(agent_name, self._make_plan_step(agent_name))
-            dependency_depths = [
-                self._resolve_execution_depth(dependency, registry, step_map, depth_cache, resolving_depth)
-                for dependency in self._get_step_dependencies(step, agent_def)
-                if dependency in step_map
-            ]
-        resolving_depth.remove(agent_name)
-
-        depth = (max(dependency_depths) + 1) if dependency_depths else 0
-        depth_cache[agent_name] = depth
-        return depth
-
-    @staticmethod
-    def _group_execution_batches(
-        batched: Dict[int, List[tuple[AgentDefinition, Dict[str, Any]]]],
-        step_order: Dict[str, int],
-    ) -> List[List[tuple[AgentDefinition, Dict[str, Any]]]]:
-        return [
-            sorted(batch, key=lambda item: step_order[item[0].name])
-            for _, batch in sorted(batched.items(), key=lambda item: item[0])
-        ]
-
-    def _build_execution_batches(
-        self,
-        plan_steps: List[Dict[str, Any]],
-    ) -> tuple:
-        """Return (batches, skipped_cycles) where batches is a list of dependency-aware execution
-        batches and skipped_cycles lists agents dropped due to cyclic dependencies."""
-        registry = self._get_agent_registry()
-        normalized_steps = self._normalize_current_plan(plan_steps)
-        step_map: Dict[str, Dict[str, Any]] = {}
-        step_order: Dict[str, int] = {}
-        order_counter = 0
-        visiting = set()
-        resolving_depth = set()
-        skipped_cycles: List[str] = []
-
-        for step in normalized_steps:
-            order_counter = self._visit_execution_step(
-                step,
-                registry,
-                step_map,
-                step_order,
-                visiting,
-                order_counter,
-                skipped_cycles,
-            )
-
-        depth_cache: Dict[str, int] = {}
-
-        batched: Dict[int, List[tuple[AgentDefinition, Dict[str, Any]]]] = {}
-        for agent_name, step in step_map.items():
-            agent_def = registry.get(agent_name)
-            if agent_def is None:
-                continue
-            depth = self._resolve_execution_depth(
-                agent_name,
-                registry,
-                step_map,
-                depth_cache,
-                resolving_depth,
-            )
-            batched.setdefault(depth, []).append((agent_def, step))
-
-        return self._group_execution_batches(batched, step_order), skipped_cycles
-
-    def _agent_executor_deps(self) -> agent_executor.AgentExecutorDeps:
-        return agent_executor.AgentExecutorDeps(
-            normalize_state=normalize_state,
-            deduct_energy=self._deduct_energy,
-            refund_energy=self._refund_energy,
-            refund_predictive_energy_budget=self._refund_predictive_energy_budget,
-            build_agent_state_snapshot=self._build_agent_state_snapshot,
-            run_agent=self._run_agent,
-            build_execution_batches=self._build_execution_batches,
-            get_requested_plan_steps=self._get_requested_plan_steps,
-            build_agent_handoff=self._build_agent_handoff,
-            route_agent_request=self._route_agent_request,
-            route_to_system_1=self._route_to_system_1,
-            route_to_system_2_redacted=self._route_to_system_2_redacted,
-            is_system_1_error=self._is_system_1_error,
-            is_system_2_error=self._is_system_2_error,
-            handle_cognitive_escalation=self._handle_cognitive_escalation,
-            get_capabilities_string=self._get_capabilities_string,
-            get_step_preferred_model=self._get_step_preferred_model,
-            core_memory=getattr(self, "core_memory", None),
-            cognitive_router=getattr(self, "cognitive_router", None),
-            charter_text=getattr(self, "charter_text", ""),
-            blocked_key=_BLOCKED_KEY,
-            hitl_error_type=RequiresHITLError,
-            log=logger,
-        )
-
-    @staticmethod
-    def _build_agent_state_snapshot(state: Dict[str, Any]) -> Dict[str, Any]:
-        return agent_executor.build_agent_state_snapshot(state)
-
-    async def _run_parallel_agent_batch(
-        self,
-        batch: List[tuple[AgentDefinition, Dict[str, Any]]],
-        state: Dict[str, Any],
-    ) -> Dict[str, Any]:
-        return await agent_executor.run_parallel_agent_batch(
-            batch,
-            state,
-            deps=self._agent_executor_deps(),
-        )
-
-    async def _try_route_agent_system_1(
-        self,
-        messages: List[Dict[str, str]],
-        agent_def: AgentDefinition,
-    ) -> Optional[RouterResult]:
-        return await agent_executor.try_route_agent_system_1(
-            messages,
-            agent_def,
-            deps=self._agent_executor_deps(),
-        )
-
-    async def _try_route_agent_system_2(
-        self,
-        messages: List[Dict[str, str]],
-        agent_def: AgentDefinition,
-        *,
-        task_packet: Optional[Dict[str, Any]] = None,
-        state: Optional[Dict[str, Any]] = None,
-    ) -> Optional[RouterResult]:
-        return await agent_executor.try_route_agent_system_2(
-            messages,
-            agent_def,
-            deps=self._agent_executor_deps(),
-        )
-
-    async def _route_agent_request(
-        self,
-        messages: List[Dict[str, str]],
-        agent_def: AgentDefinition,
-        task_packet: Optional[Dict[str, Any]] = None,
-        *,
-        state: Optional[Dict[str, Any]] = None,
-    ) -> tuple[Optional[RouterResult], bool]:
-        return await agent_executor.route_agent_request(
-            messages,
-            agent_def,
-            task_packet=task_packet,
-            deps=self._agent_executor_deps(),
-        )
-
-    async def _run_agent(
-        self,
-        agent_def: AgentDefinition,
-        state: Dict[str, Any],
-        *,
-        task_packet: Optional[Dict[str, Any]] = None,
-        deduct_energy: bool = True,
-    ) -> Dict[str, Any]:
-        return await agent_executor.run_agent(
-            agent_def,
-            state,
-            task_packet=task_packet,
-            deduct_energy=deduct_energy,
-            deps=self._agent_executor_deps(),
-        )
 
     async def _notify_admin(self, message: str) -> None:
         """Send a message to the admin via the outbound queue (used by heartbeat)."""
@@ -3368,68 +2825,6 @@ class Orchestrator:
             return result.content
         return None
 
-    async def supervisor_node(self, state: Dict[str, Any]) -> Dict[str, Any]:
-        """Plans execution. Tries System 1 (local) first per Directive 1.3; escalates to System 2 only on failure."""
-        return await supervisor_service.supervisor_node(
-            state,
-            deps=supervisor_service.SupervisorNodeDeps(
-                normalize_state=normalize_state,
-                try_ad_hoc_dispatch_energy_gate=self._try_ad_hoc_dispatch_energy_gate,
-                deduct_energy=self._deduct_energy,
-                refund_energy=self._refund_energy,
-                core_memory=self.core_memory,
-                get_archival_context=self._get_archival_context,
-                get_capabilities_string=self._get_capabilities_string,
-                get_agent_descriptions=self._get_agent_descriptions,
-                get_sensory_context=self._get_sensory_context,
-                build_user_prompt_message=self._build_user_prompt_message,
-                route_supervisor_request=self._route_supervisor_request,
-                handle_cognitive_escalation=self._handle_cognitive_escalation,
-                parse_supervisor_response=self._parse_supervisor_response,
-                build_supervisor_prompt=build_supervisor_prompt,
-                charter_text=self.charter_text,
-                prompt_config=self.prompt_config,
-                sensory_state=self.sensory_state,
-                system_1_error_prefix=_SYSTEM_1_ERROR_PREFIX,
-                blocked_key=_BLOCKED_KEY,
-                energy_cost_supervisor=ENERGY_COST_SUPERVISOR,
-                cognitive_router=self.cognitive_router,
-                hitl_error_type=RequiresHITLError,
-                log=logger,
-            ),
-        )
-
-    async def execute_workers_node(self, state: Dict[str, Any]) -> Dict[str, Any]:
-        """LangGraph worker-execution node: runs all workers declared in current_plan."""
-        return await agent_executor.execute_workers_node(
-            state,
-            deps=self._agent_executor_deps(),
-        )
-
-    async def research_agent(self, state: Dict[str, Any]) -> Dict[str, Any]:
-        """Compatibility wrapper for the built-in research agent."""
-        agent_def = self._get_agent_registry().get("research_agent")
-        if agent_def is None:
-            return normalize_state(state)
-        return await self._run_agent(agent_def, state)
-
-    async def coder_agent(self, state: Dict[str, Any]) -> Dict[str, Any]:
-        """Compatibility wrapper for the built-in coder agent."""
-        agent_def = self._get_agent_registry().get("coder_agent")
-        if agent_def is None:
-            return normalize_state(state)
-        return await self._run_agent(agent_def, state)
-
-    @staticmethod
-    def _finalize_critic_pass(state: Dict[str, Any], output_to_eval: str) -> Dict[str, Any]:
-        state["critic_feedback"] = "PASS"
-        state["moral_remediation_constraints"] = []
-        state["moral_halt_required"] = False
-        state["moral_halt_summary"] = ""
-        if not state.get("final_response"):
-            state["final_response"] = output_to_eval
-        return state
-
     def _extract_charter_tier_block(self, charter_text: str, tier_tag: Optional[str] = None) -> str:
         if tier_tag is None:
             tier_tag = str(charter_text)
@@ -3453,203 +2848,7 @@ class Orchestrator:
         return re.sub(r"\n{3,}", "\n\n", match.group(1).strip())
 
     @staticmethod
-    def _summarize_plan_for_moral_audit(state: Dict[str, Any]) -> str:
-        plan = list(state.get("current_plan", []) or [])
-        if not plan:
-            return "[NO_EXPLICIT_PLAN]"
 
-        lines: List[str] = []
-        for idx, step in enumerate(plan[:6], start=1):
-            if isinstance(step, dict):
-                agent = str(step.get("agent") or "").strip()
-                task = str(step.get("task") or "").strip()
-                reason = str(step.get("reason") or "").strip()
-                lines.append(f"{idx}. agent={agent}; task={task}; reason={reason}")
-            else:
-                lines.append(f"{idx}. {str(step).strip()}")
-        return "\n".join(lines) if lines else "[NO_EXPLICIT_PLAN]"
-
-    @staticmethod
-    def _build_moral_json_schema_example() -> Dict[str, Any]:
-        return {
-            "rubric_version": MORAL_RUBRIC_VERSION,
-            "scores": dict.fromkeys(MORAL_DIMENSIONS, 1),
-            "reasoning": "concise rationale that cites the strongest risk/constraint",
-            "is_approved": False,
-            "decision_mode": "system2_audit",
-            "bypass_reason": "",
-            "remediation_constraints": [
-                "constraint to satisfy before retry"
-            ],
-            "violated_tiers": ["tier_2"],
-            "security_conflict": False,
-        }
-
-    def _build_critic_messages(self, state: Dict[str, Any], output_to_eval: str) -> List[Dict[str, str]]:
-        tier_1 = self._extract_charter_tier_block(self.charter_text, "Tier_1_Axioms")
-        tier_2 = self._extract_charter_tier_block(self.charter_text, "Tier_2_Strategic")
-        tier_3 = self._extract_charter_tier_block(self.charter_text, "Tier_3_Operational")
-
-        redacted_user_input = self._redact_text_for_cloud(
-            str(state.get("user_input") or ""),
-            allow_sensitive_context=False,
-            max_chars=1600,
-        )
-        redacted_plan = self._redact_text_for_cloud(
-            self._summarize_plan_for_moral_audit(state),
-            allow_sensitive_context=False,
-            max_chars=1200,
-        )
-        redacted_output = self._redact_text_for_cloud(
-            str(output_to_eval or ""),
-            allow_sensitive_context=False,
-            max_chars=2200,
-        )
-        redacted_critic_instructions = self._redact_text_for_cloud(
-            str(state.get("critic_instructions") or ""),
-            allow_sensitive_context=False,
-            max_chars=600,
-        )
-
-        schema_example = json.dumps(self._build_moral_json_schema_example(), indent=2)
-        system_prompt = (
-            "You are the Hierarchical Moral Evaluator for the Critic. "
-            "Evaluate the candidate action/output against the charter with explicit tier grounding.\n\n"
-            "Tier mapping requirements:\n"
-            "- Tier 1 (absolute axioms): harm_reduction, data_privacy, admin_authority_security, data_sovereignty_local_priority\n"
-            "- Tier 2 (strategic objectives): epistemic_humility, transparency_logging, alignment_with_user_intent\n"
-            "- Tier 3 (operational preferences): output_cleanliness\n"
-            "If Tier 1 conflicts with Tier 2/3, Tier 1 takes precedence.\n\n"
-            "Return ONLY strict JSON, no markdown, no prose, no extra keys.\n"
-            "The JSON must match this exact schema shape and key names:\n"
-            f"{schema_example}\n\n"
-            "Scoring rules:\n"
-            "- Every score must be an integer from 1 to 5.\n"
-            "- Set rubric_version exactly to moral_ledger_v1.\n"
-            "- Set decision_mode exactly to system2_audit and bypass_reason to an empty string.\n"
-            "- is_approved must be false if any Tier 1 directive is materially violated.\n"
-            "- If is_approved is false and remediation is possible, include remediation_constraints as concise actionable constraints.\n"
-            "- If this is a Tier 1/security violation, include violated_tiers with tier_1 and set security_conflict=true when applicable.\n"
-            "- reasoning must cite the most important charter-grounded reason.\n\n"
-            "Charter grounding excerpts:\n"
-            f"<Tier_1_Axioms>\n{tier_1 or '[MISSING_TIER_1]'}\n</Tier_1_Axioms>\n"
-            f"<Tier_2_Strategic>\n{tier_2 or '[MISSING_TIER_2]'}\n</Tier_2_Strategic>\n"
-            f"<Tier_3_Operational>\n{tier_3 or '[MISSING_TIER_3]'}\n</Tier_3_Operational>"
-        )
-
-        user_payload = {
-            "user_request_redacted": redacted_user_input,
-            "proposed_plan_redacted": redacted_plan,
-            "candidate_output_redacted": redacted_output,
-            "critic_instructions_redacted": redacted_critic_instructions,
-            "iteration_count": int(state.get("iteration_count") or 0),
-        }
-
-        return [
-            {
-                "role": "system",
-                "content": system_prompt,
-            },
-            {"role": "user", "content": json.dumps(user_payload, indent=2)},
-        ]
-
-    async def _persist_moral_audit_log(self, state: Dict[str, Any], output_to_eval: str) -> None:
-        ledger = getattr(self, "ledger_memory", None)
-        append_fn = getattr(ledger, "append_moral_audit_log", None)
-        if not callable(append_fn):
-            return
-
-        decision = dict(state.get("moral_decision", {}) or {})
-        if not decision:
-            return
-
-        try:
-            await append_fn(
-                user_id=str(state.get("user_id") or ""),
-                audit_mode=str(state.get("moral_audit_mode") or decision.get("decision_mode") or ""),
-                audit_trace=str(state.get("moral_audit_trace") or decision.get("reasoning") or ""),
-                critic_feedback=str(state.get("critic_feedback") or ""),
-                moral_decision=decision,
-                request_redacted=self._redact_text_for_cloud(
-                    str(state.get("user_input") or ""),
-                    allow_sensitive_context=False,
-                    max_chars=1600,
-                ),
-                output_redacted=self._redact_text_for_cloud(
-                    str(output_to_eval or ""),
-                    allow_sensitive_context=False,
-                    max_chars=2200,
-                ),
-            )
-        except Exception as e:
-            logger.warning("Failed to persist moral audit log entry: %s", e)
-
-    async def _route_critic_request(self, messages: List[Dict[str, str]]) -> RouterResult:
-        if self.cognitive_router.get_system_2_available():
-            logger.info("Routing Critic through System 2 (Gemini)")
-            return await asyncio.wait_for(
-                self._route_to_system_2_redacted(
-                    messages,
-                    allowed_tools=[],
-                    purpose="critic_review",
-                    allow_sensitive_context=False,
-                ),
-                timeout=30.0,
-            )
-        return await self._route_to_system_1(
-            messages,
-            allowed_tools=[],
-            deadline_seconds=60.0,
-            context="critic",
-        )
-
-    @staticmethod
-    def _contains_security_conflict_language(text: str) -> bool:
-        lowered = str(text or "").lower()
-        indicators = (
-            "security conflict",
-            "tier 1 violation",
-            "admin authority conflict",
-            "unauthorized write",
-            "unauthorized modify",
-            "unauthorized delete",
-            "mfa required",
-            "data exfiltration",
-        )
-        return any(indicator in lowered for indicator in indicators)
-
-    @staticmethod
-    def _decision_has_tier_1_violation(decision: MoralDecision) -> bool:
-        normalized_tiers = {
-            str(tier).strip().lower().replace("-", "_")
-            for tier in tuple(decision.violated_tiers or ())
-        }
-        if "tier_1" in normalized_tiers or "tier1" in normalized_tiers:
-            return True
-
-        for dimension in MORAL_TIER_1_DIMENSIONS:
-            try:
-                score = int(decision.scores.get(dimension, 5))
-            except Exception:
-                score = 5
-            if score <= 2:
-                return True
-        return False
-
-    def _classify_moral_rejection(self, decision: MoralDecision) -> tuple[str, str]:
-        if (
-            bool(decision.security_conflict)
-            or self._decision_has_tier_1_violation(decision)
-            or self._contains_security_conflict_language(decision.reasoning)
-        ):
-            return "severe", f"Tier 1/security conflict: {decision.reasoning}".strip()
-
-        if tuple(decision.remediation_constraints or ()):
-            return "moderate", str(decision.reasoning or "Moderate moral risk; retry with constraints.").strip()
-
-        return "standard", str(decision.reasoning or "Moral review rejected output.").strip()
-
-    @staticmethod
     def _extract_heartbeat_task_id(user_input: str) -> Optional[int]:
         match = re.search(r"\[HEARTBEAT TASK #(\d+)\]", str(user_input or ""))
         if not match:
@@ -3675,91 +2874,6 @@ class Orchestrator:
         except Exception as e:
             logger.warning("Could not suspend heartbeat task %s after moral halt: %s", task_id, e)
             return None
-
-    def _apply_critic_response(
-        self,
-        state: Dict[str, Any],
-        output_to_eval: str,
-        response: str,
-    ) -> Dict[str, Any]:
-        decision = parse_moral_decision_response(response)
-        if decision.decision_mode == "validation_failure":
-            response_text = str(response or "")
-            if "FAIL" in response_text.upper():
-                decision = build_legacy_binary_decision(
-                    is_approved=False,
-                    reasoning=response_text.strip() or "Legacy critic rejected output.",
-                )
-            elif "PASS" in response_text.upper():
-                decision = build_legacy_binary_decision(
-                    is_approved=True,
-                    reasoning="Legacy critic approved output.",
-                )
-
-        self._store_moral_decision_trace(state, decision)
-        state["moral_halt_required"] = False
-        state["moral_halt_summary"] = ""
-        state["moral_remediation_constraints"] = []
-
-        if not decision.is_approved:
-            state["iteration_count"] += 1
-            severity, summary = self._classify_moral_rejection(decision)
-            if severity == "severe":
-                state["moral_halt_required"] = True
-                state["moral_halt_summary"] = summary
-                state["critic_feedback"] = f"FAIL: {summary}"
-                return state
-
-            remediation_constraints = [
-                str(item).strip()
-                for item in tuple(decision.remediation_constraints or ())
-                if str(item).strip()
-            ]
-            if remediation_constraints:
-                state["moral_remediation_constraints"] = remediation_constraints
-                constraints_text = " | ".join(remediation_constraints[:6])
-                state["critic_feedback"] = (
-                    f"FAIL: {summary} Remediation constraints: {constraints_text}"
-                )
-                return state
-
-            state["critic_feedback"] = f"FAIL: {summary}"
-            return state
-        return self._finalize_critic_pass(state, output_to_eval)
-
-    def _critic_node_deps(self) -> moral_governor.CriticNodeDeps:
-        return moral_governor.CriticNodeDeps(
-            normalize_state=normalize_state,
-            get_output_to_evaluate=self._get_output_to_evaluate,
-            store_moral_decision_trace=self._store_moral_decision_trace,
-            build_local_skip_decision=build_local_skip_decision,
-            try_triviality_bypass_decision=self._try_triviality_bypass_decision,
-            should_run_critic_review=self._should_run_critic_review,
-            deduct_energy=self._deduct_energy,
-            refund_energy=self._refund_energy,
-            build_critic_messages=self._build_critic_messages,
-            route_critic_request=self._route_critic_request,
-            handle_cognitive_escalation=self._handle_cognitive_escalation,
-            apply_critic_response=self._apply_critic_response,
-            persist_moral_audit_log=self._persist_moral_audit_log,
-            finalize_critic_pass=self._finalize_critic_pass,
-            suspend_task_for_moral_halt=self._suspend_task_for_moral_halt,
-            notify_admin=self._notify_admin,
-            spawn_debug_task=self._spawn_debug_task,
-            charter_text=getattr(self, "charter_text", ""),
-            charter_fallback=self._CHARTER_FALLBACK,
-            energy_cost_critic=ENERGY_COST_CRITIC,
-            blocked_key=_BLOCKED_KEY,
-            hitl_error_type=RequiresHITLError,
-            log=logger,
-        )
-
-    async def critic_node(self, state: Dict[str, Any]) -> Dict[str, Any]:
-        """Checks worker output against the charter. Skipped for direct supervisor responses."""
-        return await moral_governor.critic_node(
-            state,
-            deps=self._critic_node_deps(),
-        )
 
     async def _consolidate_memory(self, user_id: str) -> None:
         """Run deep nocturnal consolidation pipeline (extract -> filter -> score -> write-back)."""
@@ -3952,60 +3066,15 @@ class Orchestrator:
             log=logger,
         )
 
-    @staticmethod
-    def _has_ready_final_response(state: Dict[str, Any]) -> bool:
-        return graph_runner.has_ready_final_response(state)
-
     async def _consume_blocked_result(self, state: Dict[str, Any], user_id: str) -> Optional[str]:
-        return await graph_runner.consume_blocked_result(
-            state,
-            user_id,
-            blocked_key=_BLOCKED_KEY,
-            handle_blocked_result=self._handle_blocked_result,
-        )
-
-    @staticmethod
-    def _apply_critic_retry_instructions(state: Dict[str, Any]) -> None:
-        graph_runner.apply_critic_retry_instructions(state)
-
-    async def _run_manual_graph_pass(
-        self,
-        state: Dict[str, Any],
-        user_id: str,
-    ) -> tuple[Dict[str, Any], Optional[str]]:
-        return await graph_runner.run_manual_graph_pass(
-            state=state,
-            user_id=user_id,
-            supervisor_node=self.supervisor_node,
-            execute_workers_node=self.execute_workers_node,
-            critic_node=self.critic_node,
-            consume_blocked_result=self._consume_blocked_result,
-        )
-
-    async def _run_graph_pass(
-        self,
-        state: Dict[str, Any],
-        user_id: str,
-    ) -> tuple[Dict[str, Any], Optional[str]]:
-        return await graph_runner.run_graph_pass(
-            state=state,
-            user_id=user_id,
-            compiled_graph=getattr(self, "_compiled_graph", None),
-            consume_blocked_result=self._consume_blocked_result,
-            run_manual_graph_pass=self._run_manual_graph_pass,
-        )
-
-    @staticmethod
-    def _reset_after_critic_rejection(state: Dict[str, Any]) -> None:
-        graph_runner.reset_after_critic_rejection(state)
-
-    @staticmethod
-    def _ensure_final_response(state: Dict[str, Any], max_iterations: int) -> None:
-        graph_runner.ensure_final_response(state, max_iterations)
+        blocked_result = state.pop(_BLOCKED_KEY, None)
+        if blocked_result is None:
+            return None
+        return await self._handle_blocked_result(blocked_result, user_id, state)
 
     @staticmethod
     def _is_error_response(response: str) -> bool:
-        return graph_runner.is_error_response(response, _ERROR_RESPONSE_PREFIXES)
+        return any(str(response or '').startswith(prefix) for prefix in _ERROR_RESPONSE_PREFIXES)
 
     async def _persist_chat_turns(
         self,
@@ -4130,28 +3199,54 @@ class Orchestrator:
         user_message: str,
         user_prompt: Dict[str, Any],
     ) -> str:
-        return await graph_runner.run_user_turn_locked(
-            user_id=user_id,
-            user_message=user_message,
+        has_audio_prompt = bool(self._extract_audio_bytes(user_prompt))
+
+        state = await self._load_state(
+            user_id,
+            user_message,
             user_prompt=user_prompt,
-            deps=graph_runner.UserTurnDeps(
-                extract_audio_bytes=self._extract_audio_bytes,
-                load_state=self._load_state,
-                sanitizer=self.cognitive_router.sanitize_response,
-                remember_user_profile=self._remember_user_profile,
-                remember_assistant_identity=self._remember_assistant_identity,
-                vector_memory=getattr(self, "vector_memory", None),
-                try_goal_planning_response=self._try_goal_planning_response,
-                try_fast_path_response=self._try_fast_path_response,
-                finalize_user_response=self._finalize_user_response,
-                run_graph_loop=self._run_graph_loop,
-                is_error_response=self._is_error_response,
-                ledger_memory=self.ledger_memory,
-                persist_hitl_state_from_error=self._persist_hitl_state_from_error,
-                hitl_error_type=RequiresHITLError,
-                log=logger,
-            ),
         )
+        if state.get("final_response"):
+            return self.cognitive_router.sanitize_response(state["final_response"])
+
+        if not has_audio_prompt:
+            profile_updated = await self._remember_user_profile(user_id, user_message)
+            await self._remember_assistant_identity(user_message)
+            lowered_message = user_message.lower()
+            explicit_memory_request = any(
+                marker in lowered_message
+                for marker in ("remember that", "please remember", "remember i ", "remember my ")
+            )
+            if explicit_memory_request and not profile_updated and getattr(self, "vector_memory", None) is not None:
+                await self.vector_memory.add_memory_async(
+                    text=user_message,
+                    metadata={"type": "explicit_memory", "source": "user_request"},
+                )
+
+            reply = await self._try_goal_planning_response(state)
+            if reply is not None:
+                return await self._finalize_user_response(user_id, user_message, reply)
+
+            reply = await self._try_fast_path_response(state)
+            if reply is not None:
+                return await self._finalize_user_response(user_id, user_message, reply)
+        else:
+            logger.info("Audio prompt detected for %s; bypassing text-only fast-path memory hooks.", user_id)
+
+        try:
+            response = await self._run_graph_loop(state, user_id, user_message)
+            heartbeat_task_id = state.get("_heartbeat_origin_task_id")
+            if heartbeat_task_id is not None and not self._is_error_response(str(response)):
+                try:
+                    await self.ledger_memory.update_objective_status(int(heartbeat_task_id), "completed")
+                except Exception as exc:
+                    logger.warning("Failed to mark heartbeat task %s completed: %s", heartbeat_task_id, exc)
+            return response
+        except RequiresHITLError as hitl_err:
+            return await self._persist_hitl_state_from_error(state, hitl_err, user_id)
+        except Exception as exc:
+            logger.error("Graph execution failed: %s", exc, exc_info=True)
+            return "An internal error occurred."
 
     async def process_message(
         self,

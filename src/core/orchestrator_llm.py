@@ -21,7 +21,6 @@ from src.core.orchestrator_constants import (
 
 logger = logging.getLogger(__name__)
 
-
 class _LLMGatewayMixin:
     """LLM routing methods. Mixed into Orchestrator."""
 
@@ -223,49 +222,6 @@ class _LLMGatewayMixin:
             context="energy_judge",
         )
 
-    async def _route_supervisor_request(self, messages: List[Dict]) -> Optional["RouterResult"]:
-        """Try System 1, fall back to System 2.  Returns None on total failure."""
-        router_result: Optional[RouterResult] = None
-        try:
-            logger.info("Routing Supervisor through System 1 (Local Model)")
-            router_result = await self._route_to_system_1(
-                messages,
-                allowed_tools=[],
-                deadline_seconds=150.0,
-                context="supervisor",
-            )
-            if self._is_system_1_error(router_result):
-                logger.warning("System 1 returned an error payload in supervisor; escalating to System 2.")
-                router_result = None
-        except asyncio.TimeoutError:
-            logger.error("System 1 timed out in supervisor (150 s). Escalating to System 2.", exc_info=True)
-        except Exception as s1_err:
-            logger.error(f"System 1 raised an exception in supervisor: {s1_err!r}. Escalating.", exc_info=True)
-
-        if router_result is not None:
-            return router_result
-
-        if not self.cognitive_router.get_system_2_available():
-            return None
-
-        try:
-            logger.info("Escalating Supervisor to System 2")
-            router_result = await asyncio.wait_for(
-                self._route_to_system_2_redacted(
-                    messages,
-                    allowed_tools=[],
-                    purpose="supervisor_fallback",
-                    allow_sensitive_context=False,
-                ),
-                timeout=60.0,
-            )
-            return router_result
-        except asyncio.TimeoutError:
-            logger.error("System 2 timed out in supervisor (60 s).", exc_info=True)
-        except Exception as s2_err:
-            logger.error(f"System 2 raised an exception in supervisor: {s2_err!r}.", exc_info=True)
-        return None
-
     async def _try_route_agent_system_1(
         self,
         messages: List[Dict[str, str]],
@@ -385,25 +341,6 @@ class _LLMGatewayMixin:
         if result.status == "ok":
             return result.content
         return None
-
-    async def _route_critic_request(self, messages: List[Dict[str, str]]) -> RouterResult:
-        if self.cognitive_router.get_system_2_available():
-            logger.info("Routing Critic through System 2 (Gemini)")
-            return await asyncio.wait_for(
-                self._route_to_system_2_redacted(
-                    messages,
-                    allowed_tools=[],
-                    purpose="critic_review",
-                    allow_sensitive_context=False,
-                ),
-                timeout=30.0,
-            )
-        return await self._route_to_system_1(
-            messages,
-            allowed_tools=[],
-            deadline_seconds=60.0,
-            context="critic",
-        )
 
     @staticmethod
     def _inject_in_turn_s2_blueprint(
