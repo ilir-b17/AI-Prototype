@@ -71,6 +71,11 @@ except ImportError:
 
 logger = logging.getLogger(__name__)
 
+
+class RequiresHITLError(RuntimeError):
+    """Raised when a request requires human-in-the-loop approval."""
+
+
 # Energy costs per operation
 ENERGY_COST_SUPERVISOR = 10
 ENERGY_COST_WORKER = 15
@@ -239,7 +244,12 @@ class Orchestrator:
             self.vector_memory = VectorMemory(persist_dir=vector_db_path)
             self.ledger_memory = LedgerMemory(db_path=ledger_db_path)
             self.core_memory = CoreMemory(memory_file_path=core_memory_path)
-            self.cognitive_router = CognitiveRouter(model_name=gemini_model, local_model=local_model)
+            router_factory = getattr(llm_gateway, "CognitiveRouter", None)
+            if not callable(router_factory):
+                raise RuntimeError(
+                    "CognitiveRouter is unavailable. Configure LLM gateway wiring before initializing Orchestrator."
+                )
+            self.cognitive_router = router_factory(model_name=gemini_model, local_model=local_model)
             self._enable_local_skill_discovery_gate = (
                 str(os.getenv("ENABLE_LOCAL_SKILL_DISCOVERY_GATE", "true")).strip().lower()
                 in {"1", "true", "yes", "on"}
