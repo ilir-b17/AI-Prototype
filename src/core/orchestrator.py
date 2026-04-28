@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 """
 Orchestrator Module - Implements State Graph Architecture (Sprint 6)
 
@@ -35,7 +37,6 @@ from src.memory.core_memory import CoreMemory
 from src.skills.read_inbox import read_inbox
 from src.core.agent_definition import AgentDefinition
 from src.core.agent_registry import AgentRegistry
-from src.core.llm_router import CognitiveRouter, RouterResult, RequiresHITLError
 from src.core.prompt_config import load_prompt_config, build_supervisor_prompt
 from src.core.runtime_context import set_runtime_context
 from src.core.state_model import AgentState, normalize_state
@@ -91,7 +92,6 @@ _CONSOLIDATION_TURN_COUNTS_MAX_SIZE_DEFAULT = 100
 _SYNTHESIS_LOCKOUT_TTL_SECONDS = int(os.getenv("SYNTHESIS_LOCKOUT_TTL_SECONDS", "600"))
 _MAX_SYNTHESIS_FAILURES_BEFORE_MANUAL_INTERVENTION = 2
 _MAX_SKILL_DESCRIPTION_LENGTH = 70
-_INTENT_CLASSIFICATION_MAX_TOKENS = 60
 _SAFE_SUBPROCESS_ENV_KEYS = {
     "PATH",
     "SYSTEMROOT",
@@ -106,42 +106,6 @@ _SAFE_SUBPROCESS_ENV_KEYS = {
 }
 _BLOCKED_ENV_PREFIXES = ("TELEGRAM_", "GROQ_", "GEMINI_", "ANTHROPIC_", "OPENAI_", "OLLAMA_CLOUD_", "ADMIN_")
 _SYSTEM_1_ERROR_PREFIX = "[System 1 - Error]"
-_ROUTING_STOPWORDS = {
-    "a", "an", "and", "are", "at", "be", "can", "could", "do", "for", "from",
-    "hello", "hey", "hi", "i", "in", "is", "it", "me", "my", "now", "of",
-    "on", "or", "please", "right", "tell", "the", "this", "to", "today", "what",
-    "would", "you", "your",
-    # Generic action verbs — too common to discriminate between tools
-    "get", "give", "find", "show", "fetch", "list", "like", "have", "has",
-    "want", "need", "also", "just", "did", "how",
-    # Common discourse words that appear in tool descriptions but carry no routing signal
-    "that", "which", "where", "when", "there", "then", "them", "they",
-    "these", "those", "with", "been", "will", "from", "use", "not",
-}
-_NON_UTILITY_TOOL_PREFIXES = ("update_", "request_", "spawn_", "run_", "execute_")
-_NON_UTILITY_TOOL_NAMES = {
-    "ask_admin_for_guidance",
-    "consolidate_memory",
-    "manage_file_system",
-    "query_highest_priority_task",
-    # Archival memory search requires supervisor-level reasoning about WHEN to use it;
-    # auto-selecting it in fast-path on any message with 'memory' or 'information' is wrong.
-    "search_archival_memory",
-}
-_ROUTING_TOKEN_RE = r"[a-z0-9]+"
-_DIRECT_ROUTE_MAX_COMPLEXITY = 0
-_SINGLE_TOOL_MAX_COMPLEXITY = 2
-_SINGLE_TOOL_MIN_SCORE = 1.5
-_SINGLE_TOOL_MIN_MARGIN = 0.75
-_FAST_PATH_DIRECT_MAX_TOKENS = 12
-_FAST_PATH_SINGLE_TOOL_MAX_TOKENS = 14
-_FAST_PATH_SINGLE_TOOL_ALLOWLIST = frozenset({
-    "get_system_info",
-    "get_stock_price",
-    "web_search",
-    "weather_current",
-    "unit_converter",
-})
 _MORAL_TRIVIALITY_READ_ONLY_HINTS = (
     "time",
     "date",
@@ -172,7 +136,6 @@ _RECENT_CHAT_HISTORY_LIMIT = 12
 _CRITIC_SHORT_OUTPUT_THRESHOLD = 220
 _SYSTEM_2_ERROR_PREFIX = "[System 2 - Error]"
 _SYSTEM_2_EMPTY_PREFIX = "[System 2 - No Response]"
-_GOAL_PLANNER_COMPLEXITY_THRESHOLD = int(os.getenv("GOAL_PLANNER_COMPLEXITY_THRESHOLD", "4"))
 _HEARTBEAT_FAILURE_STRIKES = int(os.getenv("HEARTBEAT_FAILURE_STRIKES", "3"))
 _HEARTBEAT_FAILURE_STATE_KEY = "heartbeat_task_failure_counts"
 HEARTBEAT_TASK_PREFIX_FMT = "[HEARTBEAT TASK #{task_id}]"
@@ -547,370 +510,6 @@ class Orchestrator:
         )
 
     @staticmethod
-    def _routing_keywords(text: str) -> set:
-        return {
-            token for token in re.findall(_ROUTING_TOKEN_RE, (text or "").lower())
-            if len(token) > 2 and token not in _ROUTING_STOPWORDS
-        }
-
-    def _estimate_request_complexity(self, text: str) -> int:
-        lowered = (text or "").lower()
-        tokens = re.findall(_ROUTING_TOKEN_RE, lowered)
-        score = 0
-
-        if len(tokens) > 12:
-            score += 1
-        if len(tokens) > 24:
-            score += 1
-        if len(re.findall(r"[?.!]", text or "")) > 1:
-            score += 1
-        if any(marker in (text or "") for marker in ("\n", "```", ":", ";")):
-            score += 1
-        if re.search(r"\b(and|then|after|before|also|plus|compare|step|steps|plan)\b", lowered):
-            score += 1
-        if re.search(
-            r"\b(build|create|implement|debug|fix|refactor|analyze|analyse|review|modify|update|delete|write|open|extract|read|summari[sz]e|code)\b",
-            lowered,
-        ):
-            score += 1
-
-        return score
-
-    @staticmethod
-    def _is_utility_tool_schema(schema: Dict[str, Any]) -> bool:
-        name = schema.get("name", "")
-        if not name or name in _NON_UTILITY_TOOL_NAMES or name.startswith(_NON_UTILITY_TOOL_PREFIXES):
-            return False
-        params = schema.get("parameters", {}) or {}
-        required = list(params.get("required", []) or [])
-        if len(required) > 1:
-            return False
-        if not required:
-            return True
-        # "ticker" is also handled by _prepare_utility_tool_arguments
-        return required[0] in {"query", "url", "ticker"}
-
-    @staticmethod
-    def _tool_schema_keywords(schema: Dict[str, Any]) -> Dict[str, set]:
-        params = (schema.get("parameters") or {}).get("properties", {}) or {}
-        name_tokens = Orchestrator._routing_keywords(schema.get("name", "").replace("_", " "))
-        desc_tokens = Orchestrator._routing_keywords(schema.get("description", ""))
-        param_tokens = set()
-        for param_name, param_schema in params.items():
-            param_tokens |= Orchestrator._routing_keywords(param_name.replace("_", " "))
-            param_tokens |= Orchestrator._routing_keywords(param_schema.get("description", ""))
-        return {
-            "name": name_tokens,
-            "description": desc_tokens,
-            "parameters": param_tokens,
-        }
-
-    # Uppercase tokens that are common words, not ticker symbols.
-    _TICKER_STOPWORDS: frozenset = frozenset({
-        "A", "I", "AN", "AT", "BE", "BY", "DO", "GO", "IF", "IN", "IS", "IT",
-        "ME", "MY", "NO", "OF", "OK", "ON", "OR", "SO", "TO", "UP", "WE",
-        "AND", "ARE", "BUT", "CAN", "FOR", "GET", "HAS", "HIM", "HIS", "HOW",
-        "ITS", "MAY", "NOT", "NOW", "OFF", "OLD", "OUR", "OUT", "OWN", "THE",
-        "TOO", "TWO", "USE", "WAS", "WHO", "WHY", "YES", "YET", "YOU",
-        "ALSO", "BEEN", "BOTH", "DOES", "DONE", "EACH", "FROM", "GIVE",
-        "GOOD", "HAVE", "HERE", "HIGH", "JUST", "KNOW", "LAST", "LIKE", "LIVE",
-        "LONG", "LOOK", "MAKE", "MANY", "MORE", "MOST", "MUCH", "NEED", "NEXT",
-        "ONCE", "ONLY", "OPEN", "OVER", "PAST", "REAL", "SAME", "SEND", "SHOW",
-        "SOME", "SUCH", "SURE", "TAKE", "TELL", "THAN", "THAT", "THEM", "THEN",
-        "THEY", "THIS", "TIME", "TOLD", "VERY", "WANT", "WELL", "WERE", "WHAT",
-        "WHEN", "WITH", "WORK", "YEAR", "YOUR",
-    })
-
-    @staticmethod
-    def _extract_multiple_tickers(user_message: str) -> List[str]:
-        """Return valid uppercase ticker symbols only when 2+ are found with finance context,
-        or when 3+ are found regardless of context (strong multi-ticker signal)."""
-        _FINANCE_KEYWORDS = {
-            "price", "prices", "stock", "stocks", "shares", "ticker",
-            "market", "quote", "trading", "trade", "invest",
-        }
-        tickers = [
-            tok for tok in re.findall(r'\b([A-Z]{1,5})\b', user_message)
-            if tok not in Orchestrator._TICKER_STOPWORDS
-        ]
-        if len(tickers) >= 3:
-            return tickers
-        lowered = (user_message or "").lower()
-        if len(tickers) >= 2 and any(kw in lowered for kw in _FINANCE_KEYWORDS):
-            return tickers
-        return []
-
-    @staticmethod
-    def _strip_optional_tool_fallback_clause(user_message: str) -> str:
-        text = (user_message or "").strip()
-        stripped = re.sub(
-            r"(?:[,.!?]\s*|\s+)(?:please\s+)?(?:search|browse|check|look(?:\s+up)?|find|get|use)\s+(?:the\s+)?(?:web|internet|online)\b[^.?!]*?\bif\s+(?:you\s+)?(?:must|need(?:\s+to)?|have\s+to|required|necessary)\b.*$",
-            "",
-            text,
-            flags=re.IGNORECASE,
-        ).strip(" ,.!?;")
-        return stripped or text
-
-    def _prepare_utility_tool_arguments(
-        self,
-        schema: Dict[str, Any],
-        user_message: str,
-        chat_history: Optional[List[Dict[str, str]]] = None,
-    ) -> Optional[Dict[str, Any]]:
-        params = schema.get("parameters", {}) or {}
-        properties = params.get("properties", {}) or {}
-        required = list(params.get("required", []) or [])
-
-        if not required:
-            return {}
-
-        if len(required) != 1:
-            return None
-
-        field_name = required[0]
-        if field_name == "query":
-            cleaned = re.sub(
-                r"^(can|could|would|please|hey|hi|hello|nice|ok|okay|what about)\b[\s,]*",
-                "",
-                user_message.strip(),
-                flags=re.IGNORECASE,
-            ).strip(" ?!.,")
-            # Strip residual "you [action-verb] [for/about]?" prefix left after removing
-            # polite openers. e.g. "Can you search for X" → "you search for X" → "X"
-            cleaned = re.sub(
-                r"^you\s+(?:search|look|find|browse|check|tell|get|show|fetch|look up|search for)\s+(?:for\s+|about\s+|up\s+)?",
-                "",
-                cleaned,
-                flags=re.IGNORECASE,
-            ).strip(" ?!.,")
-            if not cleaned:
-                cleaned = user_message.strip()
-            # If reduced to a bare action verb (e.g. "Please search" → "search"),
-            # look back at the last substantive user turn for the real topic.
-            _bare_verbs = {"search", "find", "look", "do", "go", "try", "run", "proceed", "continue"}
-            if cleaned.lower() in _bare_verbs and chat_history:
-                for turn in reversed(chat_history):
-                    if turn.get("role") == "user":
-                        prev = turn.get("content", "").strip()
-                        if len(prev) > 15:
-                            cleaned = prev
-                            break
-            args = {"query": cleaned}
-            if "max_results" in properties:
-                args["max_results"] = 3
-            return args
-
-        if field_name == "url":
-            url_match = re.search(r"https?://\S+", user_message)
-            if not url_match:
-                return None
-            return {"url": url_match.group(0)}
-
-        if field_name == "ticker":
-            # Extract uppercase ticker symbols (1–5 chars), excluding common words.
-            candidates = [
-                tok for tok in re.findall(r'\b([A-Z]{1,5})\b', user_message)
-                if tok not in Orchestrator._TICKER_STOPWORDS
-            ]
-            if len(candidates) == 1:
-                return {"ticker": candidates[0]}
-            # Zero or multiple tickers: let the supervisor handle it.
-            return None
-
-        return None
-
-    def _score_tool_for_request(self, user_message: str, schema: Dict[str, Any]) -> float:
-        query_keywords = self._routing_keywords(user_message)
-        if not query_keywords:
-            return 0.0
-        schema_keywords = self._tool_schema_keywords(schema)
-        score = 0.0
-        score += 2.5 * len(query_keywords & schema_keywords["name"])
-        score += 1.5 * len(query_keywords & schema_keywords["description"])
-        score += 0.75 * len(query_keywords & schema_keywords["parameters"])
-        if not (schema.get("parameters", {}) or {}).get("required"):
-            score += 0.25
-        # Tool-specific pattern bonuses to ensure clear intent outweighs broad-description tools.
-        tool_name = schema.get("name", "")
-        lowered = (user_message or "").lower()
-        if tool_name == "get_system_info" and re.search(
-            r"\b(time|date|timezone|cpu|memory|ram|disk|os|platform|system info)\b", lowered
-        ):
-            score += 2.0
-        elif tool_name == "get_stock_price" and re.search(
-            r"\b(stock|price|quote|ticker|market|trading|trade)\b", lowered
-        ):
-            # Symbol-centric stock questions can have little lexical overlap with
-            # the schema description (e.g. "How is NVDA trading today?").
-            score += 2.0
-            if len([
-                tok for tok in re.findall(r"\b([A-Z]{1,5})\b", user_message)
-                if tok not in Orchestrator._TICKER_STOPWORDS
-            ]) == 1:
-                score += 0.75
-        elif tool_name == "weather_current" and re.search(
-            r"\b(weather|temperature|forecast|rain|raining|cold|hot|warm|sunny|cloudy|snow|snowing|wind|humid)\b",
-            lowered,
-        ):
-            # Explanatory weather questions should still route through graph mode.
-            if not re.search(r"\b(cause|causes|pattern|patterns|climate|science|why)\b", lowered):
-                score += 2.0
-        elif tool_name == "unit_converter" and re.search(
-            r"\b(convert|km|miles|kg|pounds|fahrenheit|celsius|bytes|gb|mb|kb|ounce|ounces|litre|liter|gallon)\b",
-            lowered,
-        ):
-            score += 2.0
-        elif tool_name == "web_search" and re.search(
-            r"\b(news|headline|headlines|breaking|trending"
-            r"|scores?|results?|standings|fixtures?|match(?:es)?|league)\b",
-            lowered,
-        ):
-            score += 2.5
-        return score
-
-    @staticmethod
-    def _is_trivial_direct_intent(user_message: str) -> bool:
-        lowered = (user_message or "").strip().lower()
-        if not lowered:
-            return False
-
-        if re.fullmatch(
-            r"(?:hi|hello|hey)(?:\s+[a-z0-9]{1,20})?[!.? ]*|(?:thanks|thank you|ok|okay|good morning|good evening|good night)[!.? ]*",
-            lowered,
-        ):
-            return True
-
-        # Finance queries with no valid ticker should fall through to graph, not direct.
-        if re.search(r"\b(stock|ticker|share|equity|portfolio)\b", lowered) and re.search(
-            r"\b(price|quote|market|trading|value)\b", lowered
-        ):
-            return False
-
-        token_count = len(re.findall(_ROUTING_TOKEN_RE, lowered))
-        if token_count > _FAST_PATH_DIRECT_MAX_TOKENS:
-            return False
-
-        # Bare action verbs after stripping polite openers are underspecified → direct.
-        _bare_verbs = frozenset({
-            "search", "find", "look", "do", "go", "try", "run", "help",
-            "continue", "start", "proceed", "check",
-        })
-        stripped = re.sub(
-            r"^(?:please|can you|could you|would you|hey|hi|okay|ok|so|well)\s*,?\s*",
-            "",
-            lowered,
-        ).strip(" ?!.,")
-        if stripped in _bare_verbs:
-            return True
-
-        return bool(re.search(r"\b(what is|what's|who is|define|meaning of)\b", lowered))
-
-    @staticmethod
-    def _is_trivial_single_tool_intent(tool_name: str, user_message: str, complexity: int) -> bool:
-        if tool_name not in _FAST_PATH_SINGLE_TOOL_ALLOWLIST:
-            return False
-        if complexity > _SINGLE_TOOL_MAX_COMPLEXITY:
-            return False
-
-        lowered = (user_message or "").lower()
-        token_count = len(re.findall(_ROUTING_TOKEN_RE, lowered))
-        if token_count > _FAST_PATH_SINGLE_TOOL_MAX_TOKENS:
-            return False
-
-        if re.search(
-            r"\b(and then|then|after|before|also|plus|compare|step|steps|plan"
-            r"|pipeline|screening|workflow|alert|alerts)\b",
-            lowered,
-        ):
-            return False
-
-        if tool_name == "get_system_info":
-            return bool(re.search(r"\b(time|date|timezone|system info|system information|platform|cpu|memory|os)\b", lowered))
-        if tool_name == "get_stock_price":
-            return bool(re.search(r"\b(stock|price|quote|ticker|market|trading|trade)\b", lowered))
-        if tool_name == "web_search":
-            return bool(re.search(
-                r"\b(weather|news|latest|current|today|now|headline|headlines"
-                r"|scores?|results?|standings|fixtures?|match(?:es)?|league)\b",
-                lowered,
-            ))
-        if tool_name == "weather_current":
-            if re.search(r"\b(cause|causes|pattern|patterns|climate|science|why)\b", lowered):
-                return False
-            return bool(re.search(r"\b(weather|temperature|forecast|rain|raining|cold|hot|warm|sunny|cloudy|snow|snowing|wind|humid)\b", lowered))
-        if tool_name == "unit_converter":
-            return bool(re.search(r"\b(convert|km|miles|kg|pounds|fahrenheit|celsius|bytes|gb|mb|kb|ounce|ounces|litre|liter|gallon)\b", lowered))
-
-        return False
-
-    def _assess_request_route(
-        self,
-        user_message: str,
-        chat_history: Optional[List[Dict[str, str]]] = None,
-    ) -> Dict[str, Any]:
-        routing_message = self._strip_optional_tool_fallback_clause(user_message)
-        complexity = self._estimate_request_complexity(routing_message)
-
-        # Multi-ticker: two or more valid stock symbols → sequential get_stock_price calls.
-        # Checked before general scoring so the supervisor never sees this pattern.
-        tickers = self._extract_multiple_tickers(routing_message)
-        if len(tickers) >= 2:
-            return {
-                "mode": "multi_ticker",
-                "tickers": tickers,
-                "complexity": complexity,
-            }
-
-        candidates = []
-
-        for schema in self.cognitive_router.registry.get_schemas():
-            if not self._is_utility_tool_schema(schema):
-                continue
-            arguments = self._prepare_utility_tool_arguments(schema, routing_message, chat_history)
-            if arguments is None:
-                continue
-            score = self._score_tool_for_request(routing_message, schema)
-            if score <= 0:
-                continue
-            candidates.append({
-                "tool_name": schema.get("name", ""),
-                "arguments": arguments,
-                "score": score,
-            })
-
-        candidates.sort(key=lambda item: item["score"], reverse=True)
-        top = candidates[0] if candidates else None
-        next_score = candidates[1]["score"] if len(candidates) > 1 else 0.0
-        trivial_direct = self._is_trivial_direct_intent(routing_message)
-
-        if (
-            top
-            and complexity <= _SINGLE_TOOL_MAX_COMPLEXITY
-            and top["score"] >= _SINGLE_TOOL_MIN_SCORE
-            and (top["score"] - next_score) >= _SINGLE_TOOL_MIN_MARGIN
-            and self._is_trivial_single_tool_intent(top["tool_name"], routing_message, complexity)
-        ):
-            return {
-                "mode": "single_tool",
-                "complexity": complexity,
-                "tool_name": top["tool_name"],
-                "arguments": top["arguments"],
-            }
-
-        if (
-            trivial_direct
-            and complexity <= _DIRECT_ROUTE_MAX_COMPLEXITY
-            and (
-                not top
-                or top["score"] < _SINGLE_TOOL_MIN_SCORE
-                or not self._is_trivial_single_tool_intent(top["tool_name"], routing_message, complexity)
-            )
-        ):
-            return {"mode": "direct", "complexity": complexity}
-
-        return {"mode": "graph", "complexity": complexity}
-
-    @staticmethod
     def _coerce_fast_path_state(
         state_or_user_message: Any,
         state: Optional[Dict[str, Any]] = None,
@@ -1091,9 +690,18 @@ class Orchestrator:
             "check", "current", "live", "information", "data", "must", "need",
             "needed", "available", "have", "use",
         }
+        stopwords = {
+            "a", "an", "and", "are", "at", "be", "can", "could", "do", "for", "from",
+            "hello", "hey", "hi", "i", "in", "is", "it", "me", "my", "now", "of",
+            "on", "or", "please", "right", "tell", "the", "this", "to", "today", "what",
+            "would", "you", "your", "get", "give", "find", "show", "fetch", "list",
+            "like", "has", "want", "also", "just", "did", "how", "that", "which",
+            "where", "when", "there", "then", "them", "they", "these", "those",
+            "with", "been", "will", "not",
+        }
         informative_tokens = {
-            token for token in re.findall(_ROUTING_TOKEN_RE, lowered)
-            if len(token) > 3 and token not in _ROUTING_STOPWORDS and token not in meta_tokens
+            token for token in re.findall(r"[a-z0-9]+", lowered)
+            if len(token) > 3 and token not in stopwords and token not in meta_tokens
         }
         return bool(informative_tokens)
 
@@ -1552,75 +1160,6 @@ class Orchestrator:
         profile = await self._get_user_profile(state.get("user_id", ""))
         return self._format_user_profile_response(lowered, profile)
 
-    # ─────────────────────────────────────────────────────────────
-    # Intent Classification Cache  (LRU, configurable max size)
-    # ─────────────────────────────────────────────────────────────
-
-    _INTENT_CLASSIFIER_CACHE_MAX_SIZE_DEFAULT = 200
-
-    def _cache_user_intent(self, message: str, intent: str) -> None:
-        """Store an intent classification result in the LRU cache."""
-        if not hasattr(self, "_intent_classification_cache"):
-            self._intent_classification_cache: "OrderedDict[str, str]" = OrderedDict()
-        max_size = max(
-            1,
-            int(os.getenv(
-                "INTENT_CLASSIFIER_CACHE_MAX_SIZE",
-                str(self._INTENT_CLASSIFIER_CACHE_MAX_SIZE_DEFAULT),
-            )),
-        )
-        cache = self._intent_classification_cache
-        if message in cache:
-            cache.move_to_end(message)
-        cache[message] = intent
-        while len(cache) > max_size:
-            cache.popitem(last=False)
-
-    def _get_cached_user_intent(self, message: str) -> Optional[str]:
-        """Return a cached intent label or None on cache miss, moving the entry to MRU position."""
-        cache = getattr(self, "_intent_classification_cache", None)
-        if not cache:
-            return None
-        if message not in cache:
-            return None
-        cache.move_to_end(message)
-        return cache[message]
-
-    async def _classify_user_intent(self, user_message: str) -> str:
-        """Classify a user message into a high-level intent string via System 1, with caching.
-
-        Possible intents: 'capability_query', 'task', 'chitchat', etc.
-        Cache keyed on the exact message string; miss → single LLM call.
-        """
-        cached = self._get_cached_user_intent(user_message)
-        if cached is not None:
-            return cached
-
-        prompt = (
-            "Classify the following user message into exactly one intent label. "
-            "Return JSON: {\"intent\": \"<label>\"}\n"
-            "Labels: capability_query, task, chitchat, profile_update, clarification\n\n"
-            f"Message: {user_message}"
-        )
-        intent = "task"
-        try:
-            result = await self._route_to_system_1(
-                [{"role": "user", "content": prompt}],
-                allowed_tools=[],
-                deadline_seconds=10.0,
-                max_output_tokens=_INTENT_CLASSIFICATION_MAX_TOKENS,
-            )
-            if result and result.status == "ok":
-                import json as _json
-                raw = (result.content or "").strip()
-                parsed = _json.loads(raw)
-                intent = str(parsed.get("intent") or "task")
-        except Exception:
-            logger.debug("Intent classification failed; defaulting to 'task'.", exc_info=True)
-
-        self._cache_user_intent(user_message, intent)
-        return intent
-
     async def _try_meta_fast_path_response(self, state: Dict[str, Any]) -> Optional[str]:
         user_message = state.get("user_input", "")
         chat_history = list(state.get("chat_history", []) or [])
@@ -1631,27 +1170,7 @@ class Orchestrator:
 
         capability_response = self._build_capability_response(user_message)
         if capability_response:
-            # Invoke the intent classifier to learn from heuristically-detected capability
-            # queries and keep the cache warm; ignore errors (purely additive).
-            if hasattr(self, "_route_to_system_1"):
-                try:
-                    await self._classify_user_intent(user_message)
-                except Exception:
-                    logger.debug("Capability-query intent classification skipped.", exc_info=True)
             return capability_response
-
-        # For messages with capability-related keywords that the heuristic didn't catch,
-        # use the intent classifier as a fallback.
-        _CAPABILITY_HINTS = ("capabil", "tool", "skill", "internet", "browse", "web")
-        lowered_msg = (user_message or "").lower()
-        if hasattr(self, "_route_to_system_1") and any(h in lowered_msg for h in _CAPABILITY_HINTS):
-            try:
-                intent = await self._classify_user_intent(user_message)
-                if intent == "capability_query":
-                    cap_response = self._build_capability_response(user_message)
-                    return cap_response if cap_response else self._build_compact_skill_list_response()
-            except Exception:
-                logger.debug("Intent classification failed in meta fast path.", exc_info=True)
 
         profile_response = await self._build_profile_response(state)
         if profile_response:
@@ -1681,16 +1200,8 @@ class Orchestrator:
         state_or_user_message: Any,
         state: Optional[Dict[str, Any]] = None,
     ) -> Optional[str]:
-        """Handle low-complexity requests before full orchestration.
-
-        The routing decision is generic: score request complexity and match the
-        query against tool-schema metadata. If a single safe utility tool is a
-        clear fit, execute it and ask System 1 to summarize the result without
-        any further tool calls. Otherwise, either answer directly (tool-free) or
-        fall back to the full supervisor workflow.
-        """
+        """Handle deterministic meta-only responses before full orchestration."""
         state = self._coerce_fast_path_state(state_or_user_message, state)
-        user_message = state.get("user_input", "")
 
         if self._state_has_audio_prompt(state):
             logger.info("Fast path bypassed: multimodal audio prompt detected.")
@@ -1700,155 +1211,7 @@ class Orchestrator:
         if meta_response:
             return meta_response
 
-        assessment = self._assess_request_route(user_message, state.get("chat_history", []))
-        core_mem_str = ""
-        if hasattr(self, "core_memory"):
-            core_mem_str = await self.core_memory.get_context_string()
-        capabilities_str = self._get_capabilities_string()
-        history_msgs = [
-            {"role": turn["role"], "content": turn["content"]}
-            for turn in state.get("chat_history", [])
-            if turn.get("role") in {"user", "assistant"} and turn.get("content")
-        ]
-
-        if assessment["mode"] == "direct":
-            deferred = await self._try_ad_hoc_dispatch_energy_gate(
-                state,
-                dispatch_context="fast_path_direct",
-            )
-            if deferred is not None:
-                return deferred
-            state["_energy_gate_cleared"] = True
-
-            archival_ctx = ""
-            if hasattr(self, "vector_memory"):
-                archival_ctx = await self._get_archival_context(user_message)
-            messages = [
-                {
-                    "role": "system",
-                    "content": (
-                        "You are AIDEN. This request is low complexity. Reply directly in 1-2 concise sentences. "
-                        "Use the recent chat history and core memory when they are relevant. "
-                        "Answer capability questions based on the provided capabilities instead of claiming you have none. "
-                        "IMPORTANT: Do not fabricate time-sensitive data (weather, live prices, current news, live scores). "
-                        "If a request needs real-time data you cannot provide, say so clearly. "
-                        "Do not call tools and do not mention internal routing.\n\n"
-                        f"{core_mem_str}\n\n{capabilities_str}"
-                        + (f"\n\n{archival_ctx}" if archival_ctx else "")
-                    ),
-                },
-                *history_msgs,
-                {"role": "user", "content": user_message},
-            ]
-            result = await self._route_to_system_1(
-                messages,
-                allowed_tools=[],
-                context="fast_path_direct",
-            )
-            if (
-                result.status == "ok"
-                and result.content
-                and not result.content.startswith(_SYSTEM_1_ERROR_PREFIX)
-            ):
-                return result.content.strip()
-            return None
-
-        if assessment["mode"] == "multi_ticker":
-            deferred = await self._try_ad_hoc_dispatch_energy_gate(
-                state,
-                dispatch_context="fast_path_multi_ticker",
-            )
-            if deferred is not None:
-                return deferred
-            state["_energy_gate_cleared"] = True
-
-            tickers = assessment["tickers"]
-            ticker_results = []
-            for ticker in tickers:
-                tr = await self.cognitive_router._execute_tool(
-                    "get_stock_price", {"ticker": ticker}
-                )
-                if tr.status == "ok":
-                    ticker_results.append(f"[{ticker}]\n{tr.content}")
-            if not ticker_results:
-                return None
-            combined = "\n\n".join(ticker_results)
-            messages = [
-                {
-                    "role": "system",
-                    "content": (
-                        "You are AIDEN. Multiple stock prices have been fetched. "
-                        "Present each result clearly, one per line, in a human-readable format. "
-                        "Do not call further tools.\n\n"
-                        f"{core_mem_str}"
-                    ),
-                },
-                {
-                    "role": "user",
-                    "content": (
-                        f"User request: {user_message}\n\n"
-                        f"Tool results:\n{combined}"
-                    ),
-                },
-            ]
-            result = await self._route_to_system_1(
-                messages,
-                allowed_tools=[],
-                context="fast_path_multi_ticker",
-            )
-            if result.status == "ok" and result.content and not result.content.startswith(_SYSTEM_1_ERROR_PREFIX):
-                return result.content.strip()
-            return combined
-
-        if assessment["mode"] != "single_tool":
-            return None
-
-        tool_name = assessment["tool_name"]
-        deferred = await self._try_ad_hoc_dispatch_energy_gate(
-            state,
-            dispatch_context=f"fast_path_single_tool:{tool_name}",
-        )
-        if deferred is not None:
-            return deferred
-        state["_energy_gate_cleared"] = True
-
-        tool_result = await self.cognitive_router._execute_tool(tool_name, assessment["arguments"])
-        if tool_result.status != "ok":
-            return None
-        if tool_result.content.strip().lower().startswith("error:"):
-            return tool_result.content.strip()
-
-        messages = [
-            {
-                "role": "system",
-                "content": (
-                    "You are AIDEN. One trusted tool has already been executed. "
-                    "Using only the tool output provided, answer the user's request clearly and concisely. "
-                    "Do not call tools. If the tool output is inconclusive, say so explicitly.\n\n"
-                    f"{core_mem_str}\n\n{capabilities_str}"
-                ),
-            },
-            {
-                "role": "user",
-                "content": (
-                    f"User request: {user_message}\n\n"
-                    f"Tool used: {tool_name}\n"
-                    f"Tool output:\n{tool_result.content}"
-                ),
-            },
-        ]
-        result = await self._route_to_system_1(
-            messages,
-            allowed_tools=[],
-            context="fast_path_single_tool",
-        )
-        if (
-            result.status == "ok"
-            and result.content
-            and not result.content.startswith(_SYSTEM_1_ERROR_PREFIX)
-        ):
-            return result.content.strip()
-        return tool_result.content.strip()
+        return None
 
     _CHARTER_FALLBACK = "Core Directive: Do no harm."
 
@@ -2278,10 +1641,6 @@ class Orchestrator:
         if self._is_explicit_epic_request(text):
             return True
 
-        complexity = self._estimate_request_complexity(text)
-        if complexity < _GOAL_PLANNER_COMPLEXITY_THRESHOLD:
-            return False
-
         lowered = text.lower()
         planning_markers = (
             "plan",
@@ -2601,23 +1960,6 @@ class Orchestrator:
             return True
         return False
 
-    def _try_route_assessment_triviality_bypass(self, user_input: str) -> Optional[MoralDecision]:
-        try:
-            assessment = self._assess_request_route(user_input)
-        except Exception:
-            return None
-
-        mode = str(assessment.get("mode") or "")
-        if mode == "single_tool":
-            tool_name = str(assessment.get("tool_name") or "")
-            if tool_name in _FAST_PATH_SINGLE_TOOL_ALLOWLIST:
-                return build_triviality_bypass_decision(
-                    f"single_tool_read_only:{tool_name}"
-                )
-        if mode == "direct" and self._is_trivial_direct_intent(user_input):
-            return build_triviality_bypass_decision("direct_trivial_read_only")
-        return None
-
     def _try_triviality_bypass_decision(
         self,
         state: Dict[str, Any],
@@ -2630,10 +1972,6 @@ class Orchestrator:
         user_input = str(state.get("user_input") or "").strip()
         if not user_input:
             return None
-
-        route_based_decision = self._try_route_assessment_triviality_bypass(user_input)
-        if route_based_decision is not None:
-            return route_based_decision
 
         if self._contains_any_hint(inspection_text, _MORAL_TRIVIALITY_READ_ONLY_HINTS):
             return build_triviality_bypass_decision("keyword_read_only")
